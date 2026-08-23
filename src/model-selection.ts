@@ -316,14 +316,24 @@ function isQuotaExhausted(quota: ModelSelectionHealth["quota"]): boolean {
 }
 
 function compareCandidates(left: Candidate, right: Candidate): number {
-  const leftHeadroom = left.quota?.known === true ? left.quota.headroom : undefined;
-  const rightHeadroom = right.quota?.known === true ? right.quota.headroom : undefined;
-  if (leftHeadroom !== undefined && rightHeadroom !== undefined && leftHeadroom !== rightHeadroom) return rightHeadroom - leftHeadroom;
+  const quotaOrder = compareQuotaCapacity(left.quota, right.quota);
+  if (quotaOrder !== 0) return quotaOrder;
   if (left.usage.attempts !== right.usage.attempts) return left.usage.attempts - right.usage.attempts;
   if (left.usage.totalTokens !== undefined && right.usage.totalTokens !== undefined && left.usage.totalTokens !== right.usage.totalTokens) return left.usage.totalTokens - right.usage.totalTokens;
   if (left.health.selections !== right.health.selections) return left.health.selections - right.health.selections;
   if ((left.health.lastSelectedAt ?? 0) !== (right.health.lastSelectedAt ?? 0)) return (left.health.lastSelectedAt ?? 0) - (right.health.lastSelectedAt ?? 0);
   return stableOpaqueOrder(modelKey(left.model), modelKey(right.model));
+}
+
+function compareQuotaCapacity(left: ModelSelectionHealth["quota"], right: ModelSelectionHealth["quota"]): number {
+  const leftKnown = left?.known === true;
+  const rightKnown = right?.known === true;
+  if (leftKnown !== rightKnown) return leftKnown ? -1 : 1;
+  if (!leftKnown || !rightKnown) return 0;
+  if (left.headroom !== undefined && right.headroom !== undefined && left.headroom !== right.headroom) return right.headroom - left.headroom;
+  if (left.remainingTokens !== undefined && right.remainingTokens !== undefined && left.remainingTokens !== right.remainingTokens) return right.remainingTokens - left.remainingTokens;
+  if (left.remainingRequests !== undefined && right.remainingRequests !== undefined && left.remainingRequests !== right.remainingRequests) return right.remainingRequests - left.remainingRequests;
+  return 0;
 }
 
 function findDuplicateKeys(models: readonly ModelDescriptor[]): ReadonlySet<string> {

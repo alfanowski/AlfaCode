@@ -82,6 +82,15 @@ describe("AutomaticModelSelector", () => {
     expect((await selector.select([model("lower"), model("higher")])).selected?.id).toBe("higher");
   });
 
+  it("prefers measurable available capacity over unknown quota", async () => {
+    const quota: QuotaReporter = {
+      getQuota: async (candidate) => candidate.id === "measured" ? { known: true, remainingRequests: 4 } : { known: false },
+    };
+    const selector = new AutomaticModelSelector({ quotaReporter: quota });
+
+    expect((await selector.select([model("unknown"), model("measured")])).selected?.id).toBe("measured");
+  });
+
   it("filters incompatible capability contracts and reports no eligible candidate", async () => {
     const noTools = model("no-tools", { capabilities: { ...model("scratch").capabilities, tools: false } });
     const selector = new AutomaticModelSelector();
