@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a reproducible problem in AlfaCode itself.
+title: "bug: "
+labels:
+  - bug
+  - "status: needs-triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve AlfaCode. Search existing issues first and remove every secret or proprietary detail from your report.
+  - type: input
+    id: revision
+    attributes:
+      label: AlfaCode revision
+      description: Paste the output of `git rev-parse --short HEAD` from the AlfaCode checkout.
+      placeholder: 012d234
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, terminal application, shell, and Node.js version.
+      placeholder: macOS 15, Ghostty, zsh, Node.js 24.x
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and model
+      description: Provider type and redacted model ID, or “not provider-specific”.
+      placeholder: Google AI Studio / gemini-…
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence that reproduces the issue.
+      placeholder: |
+        1. Start `alfacode` in an empty test directory
+        2. Run `/model`
+        3. Select …
+        4. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include short, redacted logs only when necessary.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Add relevant output from `alfacode doctor` or a screenshot. Do not paste full environment dumps or request bodies.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed API keys, tokens, private code, prompts, customer data, and other secrets.
+          required: true
+        - label: I verified that this is not an upstream quota, billing, or account-access issue.
+          required: true
+        - label: This report does not disclose a security vulnerability publicly.
+          required: true

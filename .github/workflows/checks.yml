@@ -32,3 +32,12 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+
+      - name: Verify local installer
+        run: |
+          install_root="$(mktemp -d)"
+          trap 'rm -r "$install_root"' EXIT
+          ./scripts/install.sh --skip-build --bin-dir "$install_root/bin"
+          "$install_root/bin/alfacode" --help
+          ./scripts/uninstall.sh --bin-dir "$install_root/bin"
+          test ! -e "$install_root/bin/alfacode"

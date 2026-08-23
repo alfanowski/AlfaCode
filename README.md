@@ -1,148 +1,325 @@
-# AlfaCode
+<div align="center">
+  <img src="docs/assets/hero.svg" alt="AlfaCode multi-provider terminal coding agent" width="100%" />
 
-AlfaCode is an independent terminal coding agent with its own UI, provider manager, and multi-provider gateway. Its execution engine is the pinned Claude Agent SDK/Claude Code runtime, so tools, permissions, sessions, subagents, skills, and project settings retain Claude Code semantics without reusing Claude Code's terminal UI.
+  <p><strong>A polished, multi-provider AI coding agent for the terminal.</strong><br />
+  Keep the Claude Code execution engine. Choose the models and providers.</p>
 
-```text
-AlfaCode TUI -> pinned Claude Code engine -> local gateway -> any configured provider
-```
+  <p>
+    <a href="https://github.com/alfanowski/AlfaCode/actions/workflows/checks.yml"><img src="https://github.com/alfanowski/AlfaCode/actions/workflows/checks.yml/badge.svg" alt="Checks" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-4fd1c5" alt="MIT License" /></a>
+    <img src="https://img.shields.io/badge/Node.js-%E2%89%A524-5fa04e?logo=nodedotjs&amp;logoColor=white" alt="Node.js 24 or newer" />
+    <img src="https://img.shields.io/badge/status-alpha-8b5cf6" alt="Alpha status" />
+  </p>
+</div>
 
-The normal `claude` command and its configuration are left untouched. AlfaCode uses its own Claude config directory, session history, model cache, provider credentials, and gateway process.
-
-> [!WARNING]
-> AlfaCode is an independent, experimental project. It is not affiliated with,
-> endorsed by, or supported by Anthropic, OpenCode, Google, or any model
-> provider. Claude Code, the Claude Agent SDK, and provider APIs remain subject
-> to their respective owners' terms. Gateway compatibility with non-Claude
-> models is not guaranteed by Anthropic.
-
-## Goals
-
-- Launch a fully isolated Claude Code instance with `alfacode`.
-- Aggregate every configured provider in AlfaCode's live `/model` picker.
-- Preserve tool calls, tool results, streaming, usage, and provider reasoning state.
-- Keep provider credentials outside project files and Claude settings.
-- Fail visibly when a provider cannot represent a requested capability.
-
-## Provider support
-
-- Google AI Studio: native Gemini Generate Content adapter, live account discovery, non-inference availability probes, tool/thought-signature replay.
-- OpenCode Zen: live multi-protocol discovery; models without explicit wire metadata stay visible but are never guessed.
-- Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions compatible APIs.
-- A models.dev-backed connector catalog, refreshed automatically, currently covering compatible providers without bundling model IDs.
-
-AlfaCode contains no model allowlist, version table, name-family heuristic, or positional default. Provider catalogs are refreshed at runtime. Newly listed models appear automatically; removed or non-callable models disappear from the Claude picker. Account-visible models without verified text/tool metadata remain diagnostic entries in `alfacode models` but are not auto-selected.
-
-## Development
-
-Requirements:
-
-- Node.js 24 or newer
-- pnpm
-- macOS for native Keychain-backed interactive credential storage
-
-```bash
-pnpm install
-pnpm check
-pnpm build
-pnpm smoke:claude
-```
-
-For this checkout, install a local `alfacode` launcher in a directory already on `PATH`, pointing it at `dist/cli.js`. A packaged installer is intentionally deferred until the release scope is final.
-
-## Configure and launch
-
-On first launch, AlfaCode opens its own provider screen. Credentials are entered in a masked TUI field, saved directly to macOS Keychain, verified, and never sent through a model prompt or transcript. After setup, `alfacode` opens the native AlfaCode chat UI. `/connect`, `/providers`, `/model`, `/usage`, `/agents`, and `/permissions` all stay inside that UI.
-
-OpenCode Zen supports two clearly separated connection modes:
-
-- **Free public models**: no account, billing setup, or API key. AlfaCode uses Zen's public access token and admits only currently listed free models with verified protocol and tool metadata.
-- **Zen API key**: optional account-scoped catalog and billing limits controlled by OpenCode.
-
-All configured providers are active simultaneously. Automatic selection ranks the combined live catalog, records failures and usage locally, and can fail over to another model/provider before output begins. “Preferred provider” only controls an explicit persisted pin; it does not disable the others.
-
-Configure a Google provider explicitly using the macOS Keychain prompt:
-
-```bash
-alfacode connect google --id google-personal
-```
-
-With no credential flag, `alfacode connect` opens the same native connection flow used by `/connect`. Add, reconnect, select, or delete providers from `/providers`; deleting requires confirmation and also removes AlfaCode's matching Keychain record. The key is never written to AlfaCode or Claude configuration and never enters a model transcript. `--id` accepts only a local label; values that look like credentials are rejected before anything is stored.
-
-Or reference an existing environment variable without persisting the key:
-
-```bash
-alfacode connect google --id google-personal --api-key-env GEMINI_API_KEY
-```
-
-Non-interactive environments must use a secret reference rather than a prompt:
-
-```bash
-GEMINI_API_KEY=... alfacode connect google --id ci --api-key-env GEMINI_API_KEY
-alfacode run --non-interactive -- -p "Run the test suite"
-```
-
-Useful outer CLI commands:
+AlfaCode is an independent terminal coding agent with its own native TUI, secure provider manager, dynamic model catalog, usage tracking, and multi-provider gateway. Underneath, it runs an exact-pinned Claude Agent SDK/Claude Code engine so tools, permissions, sessions, subagents, skills, and project settings keep Claude Code semantics.
 
 ```text
-alfacode providers list
-alfacode providers default google-personal
-alfacode providers remove google-personal                 # leaves the Keychain item intact
-alfacode providers remove google-personal --delete-keychain
-alfacode models [provider]
-alfacode default [alfacode-anthropic/provider/model]
-alfacode default auto
-alfacode usage [--provider id] [--model id] [--json]
-alfacode doctor [--json]
+AlfaCode TUI  →  pinned Claude Code engine  →  local secure gateway  →  your providers
 ```
 
-Provider choices are descriptor-driven rather than model-hardcoded:
+Your normal `claude` installation is left untouched. AlfaCode has its own command, configuration, sessions, model state, credential references, and usage ledger.
+
+> [!IMPORTANT]
+> AlfaCode is independent, alpha software. It is not affiliated with, endorsed by, or supported by Anthropic, OpenCode, Google, or any model provider. Compatibility with non-Claude models is implemented by AlfaCode and is not guaranteed by Anthropic.
+
+## Why AlfaCode
+
+| | What you get |
+| --- | --- |
+| **One coding agent, many providers** | Connect Google AI Studio, OpenCode Zen, Anthropic, OpenAI-compatible endpoints, and dynamically discovered compatible providers at the same time. |
+| **No hardcoded model list** | Provider catalogs are refreshed at runtime. New models appear automatically; removed models stop being routed. |
+| **Real tool calling** | Provider-native adapters preserve function calls, tool results, streaming, reasoning state, and continuation metadata instead of flattening everything into text. |
+| **Automatic model selection** | AlfaCode ranks the combined live catalog using provider-reported capacity when available, proven compatibility, local usage, failures, and fair scheduling. |
+| **A native terminal experience** | Markdown, searchable command and model palettes, contextual suggestions, permission cards, interactive questions, token usage, context left, themes, and motion. |
+| **Credentials stay out of chat** | Keys are entered through a masked setup TUI and stored in macOS Keychain, or referenced through environment variables for automation. |
+
+## Product tour
+
+- Type `/` for a filtered command palette without leaving the conversation.
+- Use `/model` to search every currently callable model across every connected provider.
+- Use `/providers` to connect, reconnect, select, inspect, or delete providers.
+- See exact engine context left and locally recorded token usage after each turn.
+- Render terminal-safe Markdown: headings, emphasis, quotes, task lists, links, code fences, line numbers, and responsive tables.
+- Answer tool-driven questions through single choice, multiple choice, previews, custom answers, and consecutive question flows.
+- Watch tool calls and subagents live, with the same structured engine contracts used by Claude Code.
+- Switch between adaptive dark/light themes; animation automatically respects reduced-motion and non-interactive environments.
+
+## Quick start
+
+### Requirements
+
+- **macOS** — the currently supported and tested interactive platform
+- **Node.js 24 or newer** — check with `node --version`
+- **pnpm 10 or newer** — check with `pnpm --version`
+- **Git**
+
+If pnpm is missing and Corepack is available:
 
 ```bash
-alfacode connect google --id personal
-alfacode connect zen                            # choose public access or an API key in the TUI
-alfacode connect anthropic --id anthropic --api-key-env ANTHROPIC_API_KEY
-alfacode connect openai-compatible --id local --base-url http://127.0.0.1:4000/v1 --api-key-env LOCAL_API_KEY
+corepack enable pnpm
 ```
 
-`/model` and `alfacode models` display the dynamically discovered catalog; no model ID is bundled or hardcoded. Automatic selection first uses provider-reported normalized remaining capacity when it exists, then proven compatibility, rolling local usage, failures, and fair scheduling. A 404 removes a model from consideration. A 429 or retryable 5xx applies a cooldown and transparently tries the next eligible model before any response content is emitted. Google AI Studio does not expose exact remaining RPM/TPM/RPD through its model API, so AlfaCode deliberately reports that quota as unknown instead of inventing a number.
+### Install from source
 
-`alfacode` starts the native UI. `alfacode launch` is an explicitly named compatibility escape hatch that opens Anthropic's original terminal UI against the same gateway. `alfacode run` is the non-interactive compatibility alias; use `--` before Claude flags that could otherwise be interpreted by AlfaCode.
+AlfaCode is not published to npm yet. The repository installer builds the exact checkout and creates a small launcher in `~/.local/bin`; it does not use `sudo` or change your shell configuration.
 
-### Configuration migration
+```bash
+git clone https://github.com/alfanowski/AlfaCode.git
+cd AlfaCode
+./scripts/install.sh
+```
 
-If `~/.alfacode/config.json` does not exist, the first AlfaCode command imports compatible metadata from `~/.polycode/config.json`. This migration is non-destructive: it leaves the legacy file untouched and preserves Keychain references such as `service: polycode` without retrieving, copying, or writing secret bytes. Reconnect a provider later if you want a new `alfacode` Keychain item.
-
-Configuration directories and files are owner-only (`0700`/`0600`), written atomically, and rejected when symlinked or group/world-readable.
-
-### Terminal behavior
-
-The native Ink UI uses an adaptive graphite/teal/violet AlfaCode palette, keyboard navigation, searchable live models and engine commands, masked secret entry, explicit permission cards, live tool/subagent events, and a local content-free usage view. Model output is rendered as safe terminal-native Markdown, including headings, emphasis, quotes, task lists, responsive tables, links, and fenced code with line numbers.
-
-The composer supports cursor editing, paste, prompt history, Unix editing shortcuts, multiline prompts, a filtered `/` palette, and Claude Code's engine-generated follow-up suggestions (accept with `Tab`). Its footer refreshes the exact engine context left and local token accounting after every turn. `AskUserQuestion` has a dedicated interactive surface with single choice, multi-select, option previews, custom answers, and consecutive questions; answers are returned through the engine's structured tool contract rather than injected as chat text.
-
-Theme and motion defaults adapt to the terminal. They can be made deterministic with `ALFACODE_THEME=dark|light` and `ALFACODE_REDUCED_MOTION=1`. `CI`, `TERM=dumb`, and reduced-motion mode disable animation automatically. Interactive setup refuses to run outside a TTY; CI keeps the environment-variable workflow.
-
-Launch the isolated runtime:
+Then start it:
 
 ```bash
 alfacode
-alfacode -- --model alfacode-anthropic/google-personal/<model-id>
 ```
 
-Inside the session, `/model` shows only currently callable, tool-capable models discovered from all configured providers.
-Use `alfacode default <model-id>` to persist a manual AlfaCode pin, or `alfacode default auto` to return to automatic selection.
+If your shell cannot find the command, add the local bin directory to `PATH` once:
 
-AlfaCode appends an authoritative runtime identity with the actual provider and model to every request, including requests retried through automatic failover.
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+exec zsh
+```
 
-The Agent SDK and embedded Claude Code binary are exact-pinned together. A normal global `claude` update therefore cannot silently change AlfaCode. AlfaCode upgrades the pin only after its compatibility suite passes; an unexpected engine version is surfaced in the UI instead of being accepted implicitly.
+> [!TIP]
+> Prefer a different launcher directory? Run `./scripts/install.sh --bin-dir /your/directory`. AlfaCode will refuse to overwrite an unrelated command unless you explicitly add `--force`.
 
-## Data and cost warning
+### First launch
 
-Requests contain repository context and are sent to the selected provider. Verify employer and client policy before using external models on work repositories. AlfaCode does not enable billing, but it cannot guarantee that a provider project is unbilled; provider-side billing and quota configuration remains authoritative. `alfacode usage` reads local privacy-preserving token accounting, not a provider billing invoice.
+The first launch opens AlfaCode's provider setup inside the TUI:
 
-## License
+1. Choose a provider.
+2. Choose its access mode.
+3. Paste the API key when required. The field is masked and clearly labelled.
+4. AlfaCode verifies the connection and discovers the live model catalog.
+5. Add more providers at any time with `/connect` or manage them with `/providers`.
 
-AlfaCode's original source code is licensed under the MIT License. Anthropic's
-Claude Code and Claude Agent SDK are proprietary software and are not licensed
-under AlfaCode's MIT License. They remain governed by Anthropic's applicable
-terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+For a zero-key first run, choose **OpenCode Zen → Free public models**. To use Google, create a key in [Google AI Studio](https://aistudio.google.com/apikey), then choose **Google AI Studio** and paste that key into the secure field.
+
+## Providers
+
+| Provider | Authentication | Discovery and transport |
+| --- | --- | --- |
+| **Google AI Studio** | API key | Native Gemini Generate Content adapter, live account discovery, availability probes, tool calls, and thought-signature replay. |
+| **OpenCode Zen** | Free public access or optional Zen API key | Live catalog with explicit per-model protocol metadata. Anonymous access only admits models currently marked free and tool-capable. |
+| **Anthropic** | API key | Native Anthropic Messages transport and account-scoped discovery. |
+| **OpenAI-compatible** | Base URL and API key reference | Dynamic `/models` discovery with OpenAI Chat Completions or Responses transport when capability metadata proves the route. |
+| **models.dev catalog connectors** | Provider-dependent | Provider and protocol metadata refreshed dynamically; no bundled model IDs or credentials. |
+
+All configured providers remain active simultaneously. A preferred provider is only an explicit pin; it does not disable the rest of the catalog.
+
+AlfaCode never guesses a protocol from a model name. Models with incomplete tool or transport metadata remain visible for diagnostics but are not silently auto-selected. A 404 removes a model from consideration; a 429 or retryable 5xx starts a cooldown and can fail over before any response content is emitted.
+
+> [!NOTE]
+> Some providers do not expose exact remaining quota. For example, Google AI Studio's model API does not report remaining RPM/TPM/RPD. AlfaCode reports that capacity as unknown instead of inventing a percentage.
+
+### Non-interactive configuration
+
+Reference an environment variable when running in CI or when you do not want to store a key in Keychain:
+
+```bash
+export GEMINI_API_KEY="your-key"
+alfacode connect google --id google-personal --api-key-env GEMINI_API_KEY
+```
+
+Additional examples:
+
+```bash
+# OpenCode Zen public access; no key or billing setup
+alfacode connect zen
+
+# Anthropic through an environment variable
+alfacode connect anthropic --id anthropic-work --api-key-env ANTHROPIC_API_KEY
+
+# A custom OpenAI-compatible endpoint
+alfacode connect openai-compatible \
+  --id local-gateway \
+  --base-url http://127.0.0.1:4000/v1 \
+  --api-key-env LOCAL_API_KEY
+```
+
+For scripted sessions, put `--` before arguments intended for the engine:
+
+```bash
+alfacode run --non-interactive -- -p "Run the test suite and explain any failures"
+```
+
+## Inside the TUI
+
+| Command | Action |
+| --- | --- |
+| `/model` | Search and switch across the combined live model catalog. |
+| `/providers` | Inspect, select, reconnect, and delete provider connections. |
+| `/connect` | Add another provider without exposing its credential to chat. |
+| `/usage` | Inspect context and locally recorded token usage. |
+| `/agents` | List the subagents exposed by the pinned engine. |
+| `/permissions` | Change the tool permission mode. |
+| `/clear` | Clear the visible transcript. |
+| `/help` | Show commands and keyboard shortcuts. |
+| `/exit` | Close AlfaCode cleanly. |
+
+The composer supports cursor editing, multiline input, paste, prompt history, common Unix editing shortcuts, filtered slash commands, and engine-generated follow-up suggestions accepted with `Tab`.
+
+## CLI reference
+
+```text
+alfacode                              Start the native AlfaCode TUI
+alfacode connect [provider]           Open provider setup
+alfacode providers list               List configured providers
+alfacode providers default <id>       Prefer a provider
+alfacode providers remove <id>        Remove provider metadata
+alfacode models [provider]            Inspect the discovered catalog
+alfacode default [model]              Choose a default interactively
+alfacode default auto                 Restore automatic selection
+alfacode usage [options]              Query the local usage ledger
+alfacode doctor [--json]              Inspect configuration health
+alfacode config path                  Print the active config path
+alfacode launch [-- engine-args]      Open the original compatibility UI
+alfacode run [-- engine-args]         Run the compatibility entry point
+```
+
+Use `alfacode <command> --help` for all flags. `alfacode launch` is an explicit escape hatch that opens Anthropic's original terminal UI against AlfaCode's gateway; the default `alfacode` command always opens the native AlfaCode experience.
+
+## Automatic selection and usage
+
+AlfaCode exposes stable gateway IDs in this form:
+
+```text
+alfacode-anthropic/<provider-id>/<upstream-model-id>
+```
+
+The prefix is a Claude Code gateway compatibility marker, not a claim that the upstream model was made by Anthropic. Human-facing screens always show the real provider and model.
+
+In automatic mode, selection considers:
+
+1. normalized provider-reported remaining capacity, when available;
+2. verified text and tool compatibility;
+3. cooldowns caused by quota, availability, or transient upstream failures;
+4. privacy-preserving local token usage;
+5. fair scheduling between otherwise comparable routes.
+
+Usage records contain counters and routing metadata, not prompt or response bodies. `alfacode usage` is local operational telemetry—not a provider invoice or billing authority.
+
+## Security and privacy
+
+- The gateway binds only to `127.0.0.1` on an ephemeral port.
+- Every process receives a high-entropy ephemeral gateway credential.
+- API keys are stored in macOS Keychain or read from explicitly named environment variables.
+- Config files contain secret references, never secret bytes.
+- Prompt and response bodies are not written to AlfaCode logs or usage records.
+- Configuration files are owner-only, atomically written, and rejected when insecurely permissioned or symlinked.
+- AlfaCode never edits your normal Claude Code configuration directory.
+
+Requests still contain repository context and are sent to the selected provider. Verify employer, client, and data-processing policy before using external models on sensitive code. Provider-side pricing, billing, retention, regional restrictions, and acceptable-use terms remain authoritative.
+
+### Local data
+
+| Path | Purpose |
+| --- | --- |
+| `~/.alfacode/config.json` | Non-secret provider and selection metadata. |
+| `~/.alfacode/claude/` | Isolated engine settings, sessions, and state. |
+| `~/.alfacode/usage/` | Content-free local usage ledger. |
+| `~/.alfacode/catalog/` | Validated dynamic catalog cache. |
+| `~/.alfacode/state/` | Model selection and provider continuation state. |
+| macOS Keychain service `alfacode` | Provider secret bytes entered through the TUI. |
+
+Read [SECURITY.md](SECURITY.md) before reporting a vulnerability. Never put real keys, private source, prompts, or customer data in a public issue.
+
+## Updating
+
+The Claude Agent SDK and its embedded Claude Code engine are exact-pinned. Updating a separate global `claude` installation cannot silently change AlfaCode.
+
+To update AlfaCode:
+
+```bash
+cd /path/to/AlfaCode
+git pull --ff-only
+./scripts/install.sh
+```
+
+Engine pins are upgraded only after the compatibility suite passes. An unexpected engine version is surfaced instead of being accepted implicitly.
+
+## Uninstalling
+
+From the cloned repository:
+
+```bash
+./scripts/uninstall.sh
+```
+
+The uninstaller removes only the launcher created by AlfaCode and deliberately keeps `~/.alfacode` and Keychain credentials to prevent accidental data loss. Remove providers through `/providers` first if you also want their AlfaCode Keychain items deleted.
+
+## Troubleshooting
+
+### `alfacode: command not found`
+
+Confirm that `~/.local/bin` is on `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+alfacode --help
+```
+
+### No dynamically discovered model is available
+
+Open `/providers` and verify the selected connection, then run:
+
+```bash
+alfacode doctor
+alfacode models
+```
+
+A model must be live and have verified text/tool metadata before automatic selection can use it. Reconnect the provider if its credential changed.
+
+### HTTP 429 or quota exhausted
+
+This is an upstream quota or billing response. AlfaCode cools down that route and may fail over before output starts, but it cannot create quota. Check the provider dashboard, wait for the reported retry window, select another model, or connect another provider.
+
+### Empty or malformed streaming response
+
+This usually means an intermediary returned Server-Sent Events to a non-streaming retry, or the endpoint's advertised protocol does not match its wire format. Verify the base URL and protocol metadata; avoid model-name-based compatibility assumptions.
+
+### A model answers but cannot use tools reliably
+
+Visibility does not equal proven compatibility. Inspect `alfacode models`, switch to a model marked tool-capable, and include a redacted compatibility report when opening an issue. Never attach API keys or proprietary prompt contents.
+
+## Development
+
+```bash
+git clone https://github.com/alfanowski/AlfaCode.git
+cd AlfaCode
+pnpm install --frozen-lockfile
+pnpm check
+pnpm smoke:claude
+pnpm dev
+```
+
+Useful documentation:
+
+- [Architecture](docs/architecture.md)
+- [Provider foundation](docs/providers.md)
+- [Terminal UI](docs/terminal-ui.md)
+- [Research and design decisions](docs/research.md)
+- [Legal and distribution notes](docs/legal-distribution.md)
+- [Contributing](CONTRIBUTING.md)
+
+Provider adapters are contract-tested with local fixtures; the standard test suite performs no paid inference. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+## Project status
+
+AlfaCode is an alpha-stage personal project: the architecture and test suite are substantial, but the public compatibility matrix and packaged release channel are not final. Expect sharp edges in provider-specific streaming and tool behavior, and report reproducible failures through the issue templates.
+
+## License and trademarks
+
+AlfaCode's original source is available under the [MIT License](LICENSE).
+
+Anthropic's Claude Code and Claude Agent SDK are proprietary third-party software and are not covered by AlfaCode's MIT License. Their use is governed by Anthropic's terms. Product and provider names are used only for factual compatibility descriptions. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [legal and distribution notes](docs/legal-distribution.md).
+
+---
+
+<div align="center">
+  <strong>One terminal. The providers you choose.</strong><br />
+  <sub>Built independently for developers who want model choice without giving up a serious coding-agent runtime.</sub>
+</div>
