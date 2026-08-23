@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { listenLocalGateway } from "./gateway.js";
@@ -17,6 +17,11 @@ import { UsageLedger } from "./usage-ledger.js";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import { SecretResolver } from "./secrets.js";
 import { GoogleProvider } from "./providers/google/provider.js";
+import { AnthropicMessagesAdapter } from "./providers/anthropic/messages.js";
+import { OpenAIChatAdapter, OpenAIResponsesAdapter } from "./providers/openai/index.js";
+import { CompositeProvider } from "./providers/composite.js";
+import { discoverZenModels } from "./providers/zen/catalog.js";
+import { CAPABILITIES, type ModelDescriptor, type WireProtocol } from "./providers/foundation/types.js";
 import type {
   AnthropicRequest as GoogleRequest,
   CanonicalStreamEvent as GoogleEvent,
@@ -27,6 +32,7 @@ export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
   readonly defaultModelId?: string;
+  readonly modelCandidates: readonly ModelDescriptor[];
   readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   close(): Promise<void>;
@@ -42,6 +48,21 @@ export interface RuntimeDependencies {
   readonly homeDirectory?: string;
   readonly createGoogle?: (options: ConstructorParameters<typeof GoogleProvider>[0]) => GoogleProvider;
   readonly usageLedger?: UsageLedger;
+  readonly fetch?: typeof fetch;
+  /** Optional account-independent catalog evidence (for example models.dev). */
+  readonly modelMetadata?: DynamicModelMetadataResolver;
+}
+
+export interface DynamicModelMetadataResolver {
+  resolve(input: { providerId: string; modelId: string; wireProtocol: Exclude<WireProtocol, "unsupported"> }): Promise<DynamicModelMetadata | undefined>;
+}
+
+export interface DynamicModelMetadata {
+  readonly displayName?: string;
+  readonly capabilities: ModelDescriptor["capabilities"];
+  readonly contextWindow?: number;
+  readonly maxOutputTokens?: number;
+  readonly support?: ModelDescriptor["support"];
 }
 
 interface GoogleAdapter {
@@ -51,6 +72,186 @@ interface GoogleAdapter {
   close(): Promise<void>;
 }
 
+interface ConfiguredProvider {
+  readonly provider: Provider;
+  readonly descriptors: readonly ModelDescriptor[];
+}
+
+/** A catalog entry can name its wire protocol without becoming a new runtime switch case. */
+export interface DynamicWireProviderDescriptor {
+  readonly id: string;
+  readonly apiKey: string;
+  readonly baseUrl: string;
+  readonly wireProtocol: Exclude<WireProtocol, "unsupported" | "ollama-native">;
+  readonly models: readonly ModelDescriptor[];
+}
+
+const GOOGLE_PROBE_TTL_MS = 10 * 60 * 1000;
+const googleProbeCache = new Map<string, { expiresAt: number; availability: ModelDescriptor["availability"]; reason?: string }>();
+const DISCOVERY_TTL_MS = 10 * 60 * 1000;
+const modelDiscoveryCache = new Map<string, { expiresAt: number; models: readonly DiscoveredModel[] }>();
+const modelProbeCache = new Map<string, { expiresAt: number; availability: ModelDescriptor["availability"]; reason?: string }>();
+interface DiscoveredModel { readonly id: string; readonly displayName: string; readonly contextWindow?: number; readonly maxOutputTokens?: number; }
+
+/** Runtime-facing dynamic factory. Catalogs are prewarmed here; no caller gets a guessed model default. */
+export async function createConfiguredProvider(record: ProviderRecord, apiKey: string, dependencies: RuntimeDependencies, homeDirectory: string): Promise<ConfiguredProvider> {
+  const baseUrl = stringOption(record.options, "baseUrl");
+  if (record.type === "google" || record.type === "google-ai-studio") {
+    const google = (dependencies.createGoogle ?? ((options) => new GoogleProvider(options)))({ apiKey, ...(baseUrl === undefined ? {} : { baseUrl }), statePath: join(homeDirectory, ".alfacode", "state", `${record.id}-google-tools.json`) });
+    const models = await google.listModels();
+    const descriptors = await probeGoogleModels(record.id, apiKey, google, models, dependencies.modelMetadata);
+    return { provider: new GoogleGatewayProvider(record.id, google, models.filter((model) => descriptors.some((descriptor) => descriptor.id === model.id && descriptor.availability === "available" && descriptor.capabilities.tools))), descriptors };
+  }
+  if (record.type === "anthropic") {
+    const descriptors = await discoverConfiguredModels(record, apiKey, "anthropic-messages", baseUrl ?? "https://api.anthropic.com/v1", dependencies);
+    return { provider: createWireProvider({ id: record.id, apiKey, baseUrl: baseUrl ?? "https://api.anthropic.com/v1", wireProtocol: "anthropic-messages", models: descriptors }, dependencies, homeDirectory), descriptors };
+  }
+  if (record.type === "openai-compatible") {
+    if (baseUrl === undefined) throw new Error(`Provider '${record.id}' requires options.baseUrl`);
+    const descriptors = await discoverConfiguredModels(record, apiKey, "openai-chat", baseUrl, dependencies);
+    return { provider: createWireProvider({ id: record.id, apiKey, baseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
+  }
+  if (record.type === "opencode-zen") {
+    const zenBase = baseUrl ?? "https://opencode.ai/zen/v1";
+    const descriptors = await discoverZenModels({ apiKey, baseUrl: zenBase, ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }) });
+    const entries = descriptors.map((descriptor) => {
+      const models = [descriptor];
+      if (descriptor.wireProtocol !== "unsupported" && descriptor.wireProtocol !== "ollama-native") return { descriptor, provider: createWireProvider({ id: record.id, apiKey, baseUrl: zenBase, wireProtocol: descriptor.wireProtocol, models }, dependencies, homeDirectory) };
+      return { descriptor };
+    });
+    return { provider: new CompositeProvider(record.id, entries), descriptors };
+  }
+  const wireProtocol = wireProtocolOption(record.options);
+  if (baseUrl !== undefined && wireProtocol !== undefined) {
+    const descriptors = await discoverConfiguredModels(record, apiKey, wireProtocol, baseUrl, dependencies);
+    return { provider: createWireProvider({ id: record.id, apiKey, baseUrl, wireProtocol, models: descriptors }, dependencies, homeDirectory), descriptors };
+  }
+  throw new Error(`Unsupported provider type: ${record.type}`);
+}
+
+/**
+ * Composable protocol factory for dynamic catalogs (including models.dev
+ * descriptors). The caller supplies a known wire contract; unknown protocols
+ * stay unavailable instead of being routed optimistically.
+ */
+export function createWireProvider(descriptor: DynamicWireProviderDescriptor, dependencies: RuntimeDependencies, homeDirectory: string): Provider {
+  const callable = descriptor.models.filter((model) => model.availability === "available" && model.capabilities.tools);
+  const common = { id: descriptor.id, apiKey: descriptor.apiKey, models: callable, baseUrl: descriptor.baseUrl, ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }) };
+  if (descriptor.wireProtocol === "anthropic-messages") return new AnthropicMessagesAdapter(common);
+  if (descriptor.wireProtocol === "openai-chat") return new OpenAIChatAdapter(common);
+  if (descriptor.wireProtocol === "openai-responses") return new OpenAIResponsesAdapter(common);
+  const google = (dependencies.createGoogle ?? ((options) => new GoogleProvider(options)))({ apiKey: descriptor.apiKey, baseUrl: descriptor.baseUrl, statePath: join(homeDirectory, ".alfacode", "state", `${descriptor.id}-google-tools.json`) });
+  return new GoogleGatewayProvider(descriptor.id, google, callable.map(toGoogleModel));
+}
+
+async function discoverConfiguredModels(record: ProviderRecord, apiKey: string, wireProtocol: Exclude<WireProtocol, "unsupported" | "ollama-native">, baseUrl: string, dependencies: RuntimeDependencies): Promise<ModelDescriptor[]> {
+  let listed: readonly DiscoveredModel[];
+  try { listed = await discoverAccountModels(record.id, apiKey, baseUrl, wireProtocol, dependencies.fetch); }
+  catch (error: unknown) {
+    throw new Error(`Model discovery for '${record.id}' failed: ${redactProbeReason(error instanceof Error ? error.message : String(error))}`);
+  }
+  return Promise.all(listed.map(async (model) => {
+    const descriptor = await descriptorFromDiscovery(record.id, model, wireProtocol, dependencies.modelMetadata);
+    const probe = await probeProtocolModel(record.id, apiKey, baseUrl, model.id, wireProtocol, dependencies.fetch);
+    if (probe.availability === "available") return descriptor;
+    return { ...descriptor, availability: probe.availability, ...(probe.reason === undefined ? {} : { unavailableReason: probe.reason }) };
+  }));
+}
+
+async function discoverAccountModels(providerId: string, apiKey: string, baseUrl: string, wireProtocol: "anthropic-messages" | "openai-chat" | "openai-responses" | "gemini-generate-content", requestFetch: typeof fetch | undefined): Promise<readonly DiscoveredModel[]> {
+  const key = `${providerId}:${baseUrl}:${createHash("sha256").update(apiKey).digest("hex").slice(0, 16)}:${wireProtocol}`;
+  const cached = modelDiscoveryCache.get(key); if (cached?.expiresAt && cached.expiresAt > Date.now()) return cached.models;
+  try {
+    const headers = wireProtocol === "anthropic-messages" ? { accept: "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" } : { accept: "application/json", Authorization: `Bearer ${apiKey}` };
+    const response = await (requestFetch ?? fetch)(`${baseUrl.replace(/\/$/, "")}/models`, { headers });
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    const payload: unknown = await response.json(); const data = isRecord(payload) && Array.isArray(payload.data) ? payload.data : undefined;
+    if (!data) throw new Error("invalid model discovery response");
+    const models = data.flatMap((value): DiscoveredModel[] => {
+      if (!isRecord(value) || typeof value.id !== "string" || !value.id) return [];
+      const displayName = typeof value.display_name === "string" ? value.display_name : typeof value.name === "string" ? value.name : value.id;
+      return [{ id: value.id, displayName, ...(typeof value.context_window === "number" ? { contextWindow: value.context_window } : {}), ...(typeof value.max_output_tokens === "number" ? { maxOutputTokens: value.max_output_tokens } : {}) }];
+    });
+    if (!models.length) throw new Error("model discovery returned no valid models");
+    modelDiscoveryCache.set(key, { expiresAt: Date.now() + DISCOVERY_TTL_MS, models });
+    return models;
+  } catch (error) {
+    if (cached) return cached.models;
+    throw error;
+  }
+}
+
+/** Uses non-inference endpoints only; this verifies account visibility without paid generation. */
+async function probeProtocolModel(providerId: string, apiKey: string, baseUrl: string, modelId: string, wireProtocol: "anthropic-messages" | "openai-chat" | "openai-responses" | "gemini-generate-content", requestFetch: typeof fetch | undefined): Promise<{ availability: ModelDescriptor["availability"]; reason?: string }> {
+  const key = `${providerId}:${baseUrl}:${createHash("sha256").update(apiKey).digest("hex").slice(0, 16)}:${wireProtocol}:${modelId}`;
+  const cached = modelProbeCache.get(key); if (cached && cached.expiresAt > Date.now()) return cached;
+  try {
+    const root = baseUrl.replace(/\/$/, "");
+    const isAnthropic = wireProtocol === "anthropic-messages";
+    const response = await (requestFetch ?? fetch)(isAnthropic ? `${root}/messages/count_tokens` : `${root}/models/${encodeURIComponent(modelId)}`, isAnthropic
+      ? { method: "POST", headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" }, body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "" }] }) }
+      : { headers: { Authorization: `Bearer ${apiKey}`, accept: "application/json" } });
+    const availability: ModelDescriptor["availability"] = response.ok ? "available" : response.status === 404 || response.status === 410 ? "deprecated" : response.status === 401 || response.status === 403 ? "account-validation-required" : "unknown";
+    const result = { expiresAt: Date.now() + DISCOVERY_TTL_MS, availability, ...(availability === "available" ? {} : { reason: redactProbeReason(`non-inference model probe returned HTTP ${response.status}`) }) };
+    modelProbeCache.set(key, result); return result;
+  } catch (error: unknown) {
+    const result = { expiresAt: Date.now() + DISCOVERY_TTL_MS, availability: "unknown" as const, reason: redactProbeReason(error instanceof Error ? error.message : String(error)) };
+    modelProbeCache.set(key, result); return result;
+  }
+}
+
+async function probeGoogleModels(providerId: string, apiKey: string, google: GoogleAdapter, models: readonly GoogleModel[], metadataResolver: DynamicModelMetadataResolver | undefined): Promise<ModelDescriptor[]> {
+  const results = new Array<ModelDescriptor>(models.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(4, models.length) }, async () => {
+    while (cursor < models.length) {
+      const index = cursor; cursor += 1;
+      const model = models[index]; if (!model) continue;
+      const key = `${providerId}:${createHash("sha256").update(apiKey).digest("hex").slice(0, 16)}:${model.id}`; const cached = googleProbeCache.get(key); const now = Date.now();
+      let result = cached && cached.expiresAt > now ? cached : undefined;
+      if (!result) {
+        try { await google.countTokens({ model: model.id, messages: [{ role: "user", content: "" }] }, model.id, { session: "__probe__", agent: "__probe__" }); result = { expiresAt: now + GOOGLE_PROBE_TTL_MS, availability: "available" as const }; }
+        catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          const status = errorStatus(error);
+          const availability = status === 404 || status === 410 ? "deprecated" as const
+            : status === 401 || status === 403 ? "account-validation-required" as const
+            : "unknown" as const;
+          result = { expiresAt: now + GOOGLE_PROBE_TTL_MS, availability, reason: redactProbeReason(message) };
+        }
+        googleProbeCache.set(key, result);
+      }
+      const metadata = await metadataResolver?.resolve({ providerId, modelId: model.id, wireProtocol: "gemini-generate-content" });
+      const verified = result.availability === "available" && metadata?.capabilities.tools === true;
+      results[index] = { providerId, id: model.id, displayName: metadata?.displayName ?? model.displayName, wireProtocol: "gemini-generate-content", capabilities: metadata?.capabilities ?? unverifiedCapabilities("gemini-generate-content"), availability: verified ? "available" : result.availability === "available" ? "unknown" : result.availability, ...(!verified && result.availability === "available" ? { unavailableReason: "Tool capability is unverified for this account model" } : result.reason === undefined ? {} : { unavailableReason: result.reason }), ...(metadata?.contextWindow === undefined ? model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow } : { contextWindow: metadata.contextWindow }), ...(metadata?.maxOutputTokens === undefined ? model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens } : { maxOutputTokens: metadata.maxOutputTokens }), support: metadata?.support ?? "best-effort" };
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function descriptorFromDiscovery(providerId: string, model: DiscoveredModel, wireProtocol: Exclude<WireProtocol, "unsupported" | "ollama-native">, metadataResolver: DynamicModelMetadataResolver | undefined): Promise<ModelDescriptor> {
+  const metadata = await metadataResolver?.resolve({ providerId, modelId: model.id, wireProtocol });
+  const verified = metadata?.capabilities.tools === true;
+  return { providerId, id: model.id, displayName: metadata?.displayName ?? model.displayName, wireProtocol, capabilities: metadata?.capabilities ?? unverifiedCapabilities(wireProtocol), availability: verified ? "available" : "unknown", ...(!verified ? { unavailableReason: "Tool capability is unverified" } : {}), ...(metadata?.contextWindow === undefined ? model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow } : { contextWindow: metadata.contextWindow }), ...(metadata?.maxOutputTokens === undefined ? model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens } : { maxOutputTokens: metadata.maxOutputTokens }), support: metadata?.support ?? "best-effort" };
+}
+
+function unverifiedCapabilities(protocol: Exclude<WireProtocol, "unsupported" | "ollama-native">): ModelDescriptor["capabilities"] { return { ...CAPABILITIES[protocol], tools: false, parallelTools: false, forcedToolChoice: false }; }
+
+function toGoogleModel(descriptor: ModelDescriptor): GoogleModel { return { id: descriptor.id, displayName: descriptor.displayName, ...(descriptor.contextWindow === undefined ? {} : { contextWindow: descriptor.contextWindow }), ...(descriptor.maxOutputTokens === undefined ? {} : { maxOutputTokens: descriptor.maxOutputTokens }) }; }
+function stringOption(options: ProviderRecord["options"], key: string): string | undefined { return typeof options?.[key] === "string" ? options[key] as string : undefined; }
+function wireProtocolOption(options: ProviderRecord["options"]): Exclude<WireProtocol, "unsupported" | "ollama-native"> | undefined {
+  const value = stringOption(options, "wireProtocol") ?? stringOption(options, "protocol");
+  return value === "anthropic-messages" || value === "openai-chat" || value === "openai-responses" || value === "gemini-generate-content" ? value : undefined;
+}
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
+function errorStatus(error: unknown): number | undefined {
+  if (!isRecord(error)) return undefined;
+  const value = error.status ?? error.statusCode ?? error.code;
+  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+function redactProbeReason(value: string): string { return value.replace(/(?:AIza|api[_-]?key[=:]\s*)[^\s'"&]+/gi, "[REDACTED]").slice(0, 256); }
+
 /** Prewarms every configured catalog before exposing one loopback-only Anthropic endpoint. */
 export async function startRuntime(input: StartRuntimeInput, dependencies: RuntimeDependencies = {}): Promise<RuntimeHandle> {
   const secrets = dependencies.secrets ?? new SecretResolver();
@@ -59,27 +260,18 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
   const ledger = dependencies.usageLedger ?? await UsageLedger.open(join(homeDirectory, ".alfacode", "usage"));
 
   try {
+    const candidates: ModelDescriptor[] = [];
     for (const record of input.config.providers) {
-      if (record.type !== "google") throw new Error(`Unsupported provider type: ${record.type}`);
       if (record.apiKey === undefined) throw new Error(`Provider '${record.id}' has no API key reference`);
       const apiKey = await secrets.resolve(record.apiKey);
       if (apiKey === undefined || apiKey.length === 0) throw new Error(`API key unavailable for provider '${record.id}'`);
-      const google = (dependencies.createGoogle ?? ((options) => new GoogleProvider(options)))({
-        apiKey,
-        statePath: join(homeDirectory, ".alfacode", "state", `${record.id}-google-tools.json`),
-      });
-      const models = await google.listModels();
-      if (models.length === 0) throw new Error(`Provider '${record.id}' returned no Generate Content models`);
-      providers.push(new GoogleGatewayProvider(record.id, google, models));
+      const built = await createConfiguredProvider(record, apiKey, dependencies, homeDirectory);
+      providers.push(built.provider);
+      candidates.push(...built.descriptors);
     }
 
     const selectedProvider = providers.find((provider) => provider.id === input.provider.id);
     if (selectedProvider === undefined) throw new Error(`Default provider '${input.provider.id}' is unavailable`);
-    const preferredModel = typeof input.provider.options?.defaultModel === "string"
-      ? input.provider.options.defaultModel
-      : undefined;
-    const selectedModel = selectedProvider.models.find((model) => model.id === preferredModel) ?? selectedProvider.models[0];
-    if (selectedModel === undefined) throw new Error(`Default provider '${input.provider.id}' returned no models`);
 
     const authToken = randomBytes(32).toString("base64url");
     for (const provider of providers) {
@@ -88,16 +280,12 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       }
     }
     const gateway = await listenLocalGateway({ token: authToken, providers, usageLedger: ledger });
-    const contextWindows = providers.flatMap((provider) => provider instanceof GoogleGatewayProvider
-      ? provider.googleModels
-        .map((model) => model.contextWindow)
-        .filter((window): window is number => window !== undefined)
-      : []);
+    const contextWindows = providers.flatMap((provider) => provider.models.map((model) => model.limits?.maxInputTokens).filter((window): window is number => window !== undefined));
     const contextWindowTokens = contextWindows.length === 0 ? undefined : Math.min(...contextWindows);
     return {
       baseUrl: gateway.address,
       authToken,
-      defaultModelId: encodeModelId(selectedProvider.id, selectedModel.id),
+      modelCandidates: candidates,
       ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => {

@@ -17,13 +17,14 @@ describe("OpenAI Chat adapter", () => {
       ]); },
     });
     const events = await collect(adapter.streamMessage({
-      model: "model-a", max_tokens: 99,
+      model: "model-a", max_tokens: 99, system: [{ type: "text", text: "You are a coding agent." }],
       messages: [{ role: "assistant", content: [{ type: "tool_use", id: "previous", name: "old", input: { a: 1 } }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "previous", content: "ok" }] }],
       tools: [{ name: "weather", input_schema: { type: "object" } }], tool_choice: { type: "any" },
     }, context()));
-    expect(JSON.parse(body)).toMatchObject({ stream: true, stream_options: { include_usage: true }, tool_choice: "required", messages: [{ role: "assistant", tool_calls: [{ id: "previous" }] }, { role: "tool", tool_call_id: "previous", content: "ok" }] });
+    expect(JSON.parse(body)).toMatchObject({ stream: true, stream_options: { include_usage: true }, tool_choice: "required", messages: [{ role: "system", content: "You are a coding agent." }, { role: "assistant", tool_calls: [{ id: "previous" }] }, { role: "tool", tool_call_id: "previous", content: "ok" }] });
     expect(events).toContainEqual({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"city":"Rome"}' } });
     expect(events).toContainEqual({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"zone":"UTC"}' } });
+    expect(events).toContainEqual({ type: "usage", usage: { semantics: "cumulative", stage: "final", source: "provider", inputTokens: 9, outputTokens: 4 } });
     expect(events.at(-2)).toEqual({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { input_tokens: 9, output_tokens: 4 } });
   });
 

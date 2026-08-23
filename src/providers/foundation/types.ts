@@ -1,5 +1,5 @@
 /** The wire protocol, not the vendor, decides how a request is encoded and replayed. */
-export type WireProtocol = "anthropic-messages" | "openai-responses" | "openai-chat" | "gemini-generate-content" | "ollama-native";
+export type WireProtocol = "anthropic-messages" | "openai-responses" | "openai-chat" | "gemini-generate-content" | "ollama-native" | "unsupported";
 
 export interface CapabilitySet {
   readonly streaming: boolean;
@@ -20,6 +20,7 @@ export interface ModelDescriptor {
   readonly capabilities: CapabilitySet;
   /** A listed model is not necessarily callable by this account or project. */
   readonly availability: "available" | "deprecated" | "account-validation-required" | "unknown";
+  readonly unavailableReason?: string;
   readonly contextWindow?: number;
   readonly maxOutputTokens?: number;
   /** "best-effort" means the upstream has not passed AlfaCode's protocol contract suite. */
@@ -83,6 +84,7 @@ export const CAPABILITIES: Readonly<Record<WireProtocol, CapabilitySet>> = {
   "openai-chat": { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: true, reasoningState: "optional", nativeTokenCounting: false, jsonSchema: "full" },
   "gemini-generate-content": { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: true, reasoningState: "required", nativeTokenCounting: true, jsonSchema: "subset" },
   "ollama-native": { streaming: true, tools: true, parallelTools: true, forcedToolChoice: false, vision: true, reasoningState: "optional", nativeTokenCounting: false, jsonSchema: "subset" },
+  unsupported: { streaming: false, tools: false, parallelTools: false, forcedToolChoice: false, vision: false, reasoningState: "none", nativeTokenCounting: false, jsonSchema: "none" },
 };
 
 function protocolStateKey(input: Pick<ProtocolState, "protocol" | "session" | "agent" | "model">): string {

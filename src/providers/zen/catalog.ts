@@ -31,10 +31,15 @@ export async function discoverZenModels(options: ZenCatalogOptions): Promise<Mod
   if (!response.ok) throw zenError(response.status, await response.text(), options.apiKey);
   const body: unknown = await response.json();
   const models = extractModels(body);
-  return models.flatMap((model) => {
+  return models.flatMap<ModelDescriptor>((model) => {
     const id = model.id ?? model.name;
     if (!id) return [];
     const wireProtocol = classifyZenModel(model);
+    if (wireProtocol === undefined) return [{
+      providerId: "zen-unsupported", id, displayName: model.displayName ?? model.display_name ?? id,
+      wireProtocol: "unsupported", capabilities: CAPABILITIES.unsupported, availability: "unknown",
+      unavailableReason: "Zen catalog did not advertise a supported wire protocol for this model", support: "best-effort" as const,
+    }];
     return [{
       providerId: `zen-${wireProtocol}`,
       id,
@@ -59,17 +64,13 @@ function classifyAvailability(status: unknown): ModelDescriptor["availability"] 
 }
 
 /** Public for deterministic model routing tests and cache refreshes. */
-export function classifyZenModel(model: ZenCatalogModel): WireProtocol {
+export function classifyZenModel(model: ZenCatalogModel): WireProtocol | undefined {
   const hint = [model.protocol, model.api, model.npm, model.endpoint].filter((value): value is string => typeof value === "string").join(" ").toLowerCase();
   if (hint.includes("responses")) return "openai-responses";
   if (hint.includes("messages") || hint.includes("anthropic")) return "anthropic-messages";
   if (hint.includes("gemini") || hint.includes("google")) return "gemini-generate-content";
   if (hint.includes("chat/completions") || hint.includes("openai-compatible")) return "openai-chat";
-  const id = (model.id ?? model.name ?? "").toLowerCase();
-  if (/^(claude|qwen)/.test(id)) return "anthropic-messages";
-  if (/^gemini/.test(id)) return "gemini-generate-content";
-  if (/^(gpt|grok|muse)/.test(id)) return "openai-responses";
-  return "openai-chat";
+  return undefined;
 }
 
 function extractModels(value: unknown): ZenCatalogModel[] {

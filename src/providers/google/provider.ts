@@ -18,6 +18,7 @@ import type {
 
 export interface GoogleProviderOptions {
   apiKey?: string;
+  baseUrl?: string;
   client?: GoogleSdkClient;
   stateStore?: GoogleStateStore;
   statePath?: string;
@@ -30,7 +31,10 @@ export class GoogleProvider {
   private readonly stateStore: GoogleStateStore;
 
   public constructor(options: GoogleProviderOptions = {}) {
-    this.client = options.client ?? new GoogleGenAI(options.apiKey === undefined ? {} : { apiKey: options.apiKey }) as unknown as GoogleSdkClient;
+    this.client = options.client ?? new GoogleGenAI({
+      ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+      ...(options.baseUrl === undefined ? {} : { httpOptions: { baseUrl: options.baseUrl } }),
+    }) as unknown as GoogleSdkClient;
     this.stateStore = options.stateStore ?? new FileGoogleStateStore(options.statePath ?? '.alfacode/google-tool-state.json');
   }
 
@@ -211,15 +215,9 @@ function supportsGenerateContent(model: GoogleModel): boolean {
   return model.supportedActions?.some((action) => action === 'generateContent' || action === 'generate_content') ?? false;
 }
 
-const NON_CODING_MODEL_ID = /(?:^|[-_.])(tts|image|banana|lyria|robotics?|computer[-_.]?use|antigravity|deep[-_.]?research|omni)(?:$|[-_.])/i;
-
-/** Google mixes conversational, TTS, image, robotics, and specialist surfaces in one generateContent catalog. */
+/** The Google catalog is authoritative; capability verification happens at runtime. */
 export function isClaudeCodeCompatibleModel(model: GoogleModel): boolean {
-  if (!supportsGenerateContent(model) || !model.name) return false;
-  const id = model.name.replace(/^models\//, '');
-  return !NON_CODING_MODEL_ID.test(id)
-    && (model.inputTokenLimit ?? 0) >= 128_000
-    && (model.outputTokenLimit ?? 0) >= 8_192;
+  return supportsGenerateContent(model) && Boolean(model.name);
 }
 
 function toolResultResponse(block: Extract<AnthropicContentBlock, { type: 'tool_result' }>): JsonObject {

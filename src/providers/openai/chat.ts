@@ -37,7 +37,10 @@ export class OpenAIChatAdapter implements Provider {
   private readonly requestFetch: typeof fetch;
 
   public constructor(private readonly options: OpenAIChatAdapterOptions) {
-    this.models = options.models.map((model) => ({ id: model.id, displayName: model.displayName }));
+    this.models = options.models.map((model) => ({ id: model.id, displayName: model.displayName,
+      limits: { ...(model.contextWindow === undefined ? {} : { maxInputTokens: model.contextWindow }), ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }), contextIncludesOutput: false },
+      capabilities: { tokenCounting: "estimate" as const, usageReporting: "final" as const },
+    }));
     this.endpoint = options.baseUrl.replace(/\/$/, "");
     this.requestFetch = options.fetch ?? fetch;
   }
@@ -116,6 +119,7 @@ export class OpenAIChatAdapter implements Provider {
         nextBlockIndex += 1;
       }
       if (tools.size > 0) stopReason = "tool_use";
+      yield { type: "usage", usage: { semantics: "cumulative", stage: "final", source: "provider", inputTokens: usage.input_tokens, outputTokens: usage.output_tokens } };
       yield { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage };
       yield { type: "message_stop" };
     } catch (error: unknown) {
@@ -134,7 +138,8 @@ export class OpenAIChatAdapter implements Provider {
 }
 
 function toChatRequest(request: ProviderMessageRequest): Record<string, unknown> {
-  const messages = toChatMessages(request.messages);
+  const system = systemText(request.system);
+  const messages = [...(system === undefined ? [] : [{ role: "system", content: system }]), ...toChatMessages(request.messages)];
   const tools = Array.isArray(request.tools) ? request.tools.filter(isTool).map((tool) => ({ type: "function", function: { name: tool.name, ...(tool.description === undefined ? {} : { description: tool.description }), parameters: tool.input_schema } })) : undefined;
   const toolChoice = mapToolChoice(request.tool_choice);
   return {
@@ -149,6 +154,13 @@ function toChatRequest(request: ProviderMessageRequest): Record<string, unknown>
     ...(tools?.length ? { tools } : {}),
     ...(toolChoice === undefined ? {} : { tool_choice: toolChoice }),
   };
+}
+
+function systemText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return undefined;
+  const text = value.flatMap((block) => isRecord(block) && typeof block.text === "string" ? [block.text] : []).join("\n");
+  return text.length === 0 ? undefined : text;
 }
 
 function toChatMessages(input: readonly unknown[]): Record<string, unknown>[] {
