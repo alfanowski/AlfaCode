@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z } from "zod";
@@ -87,6 +87,24 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       return reply.code(resolved.status).send(anthropicError(resolved.errorType, resolved.message));
     }
 
+    const requestId = `req_${randomUUID().replaceAll("-", "")}`;
+    reply.raw.setHeader("request-id", requestId);
+    reply.raw.setHeader("x-request-id", requestId);
+    if (parsed.data.stream !== true) {
+      const controller = new AbortController();
+      request.raw.once("aborted", () => controller.abort());
+      try {
+        return await collectResponse(
+          resolved.provider,
+          resolved.request,
+          providerContext(request, controller.signal),
+        );
+      } catch (error) {
+        const normalized = normalizeProviderError(error);
+        return reply.code(normalized.status).send(normalized.body);
+      }
+    }
+
     reply.hijack();
     await streamResponse(reply.raw, request, resolved.provider, resolved.request, pingIntervalMs);
   });
@@ -118,6 +136,79 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
   });
 
   return app;
+}
+
+async function collectResponse(
+  provider: Provider,
+  providerRequest: ProviderMessageRequest,
+  context: ReturnType<typeof providerContext>,
+): Promise<Record<string, unknown>> {
+  let id: string | undefined;
+  let model = providerRequest.model;
+  let usage = { input_tokens: 0, output_tokens: 0 };
+  let stopReason: string | null = null;
+  let stopSequence: string | null = null;
+  const blocks = new Map<number, {
+    block: Record<string, unknown>;
+    inputJson: string;
+  }>();
+
+  for await (const event of provider.streamMessage(providerRequest, context)) {
+    if (event.type === "message_start") {
+      id = event.message.id;
+      model = event.message.model;
+      usage = event.message.usage;
+      continue;
+    }
+    if (event.type === "content_block_start") {
+      blocks.set(event.index, { block: { ...event.content_block }, inputJson: "" });
+      continue;
+    }
+    if (event.type === "content_block_delta") {
+      const current = blocks.get(event.index);
+      if (current === undefined) throw new Error(`Provider emitted a delta for unopened block ${event.index}`);
+      if (event.delta.type === "text_delta") {
+        current.block.text = `${typeof current.block.text === "string" ? current.block.text : ""}${event.delta.text}`;
+      } else if (event.delta.type === "thinking_delta") {
+        current.block.thinking = `${typeof current.block.thinking === "string" ? current.block.thinking : ""}${event.delta.thinking}`;
+      } else if (event.delta.type === "signature_delta") {
+        current.block.signature = `${typeof current.block.signature === "string" ? current.block.signature : ""}${event.delta.signature}`;
+      } else {
+        current.inputJson += event.delta.partial_json;
+      }
+      continue;
+    }
+    if (event.type === "content_block_stop") {
+      const current = blocks.get(event.index);
+      if (current?.block.type === "tool_use" && current.inputJson.length > 0) {
+        try {
+          current.block.input = JSON.parse(current.inputJson) as unknown;
+        } catch {
+          throw { kind: "api", message: "Upstream provider returned malformed tool input" } satisfies ProviderError;
+        }
+      }
+      continue;
+    }
+    if (event.type === "message_delta") {
+      usage = event.usage;
+      stopReason = event.delta.stop_reason ?? stopReason;
+      stopSequence = event.delta.stop_sequence ?? stopSequence;
+    }
+  }
+
+  if (id === undefined) {
+    throw { kind: "api", message: "Upstream provider returned an empty response" } satisfies ProviderError;
+  }
+  return {
+    id,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [...blocks.entries()].sort(([left], [right]) => left - right).map(([, value]) => value.block),
+    stop_reason: stopReason,
+    stop_sequence: stopSequence,
+    usage,
+  };
 }
 
 /** The only production listen helper: loopback and an OS-assigned port are intentional. */
