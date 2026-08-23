@@ -61,6 +61,7 @@ export class GoogleProvider {
       let finishReason: string | undefined;
       let usage: GoogleGenerateResponse['usageMetadata'];
       const emittedToolCalls = new Set<string>();
+      let functionCallOrdinal = 0;
 
       for await (const chunk of responseStream) {
         usage = chunk.usageMetadata ?? usage;
@@ -70,7 +71,8 @@ export class GoogleProvider {
         for (const part of candidate.content?.parts ?? []) {
           if (part.text && !part.thought) yield { type: 'text_delta', text: part.text };
           if (part.functionCall) {
-            const tool = await this.normaliseFunctionCall(part, context);
+            const tool = await this.normaliseFunctionCall(part, context, functionCallOrdinal);
+            functionCallOrdinal += 1;
             // Gemini can repeat a complete function call in a later stream chunk.
             if (!emittedToolCalls.has(tool.id)) {
               emittedToolCalls.add(tool.id);
@@ -173,10 +175,10 @@ export class GoogleProvider {
     return parts;
   }
 
-  private async normaliseFunctionCall(part: GooglePart, context: ProviderContext): Promise<{ id: string; name: string; input: JsonObject }> {
+  private async normaliseFunctionCall(part: GooglePart, context: ProviderContext, ordinal: number): Promise<{ id: string; name: string; input: JsonObject }> {
     const call = part.functionCall;
     if (!call?.name) throw new Error('Gemini returned a function call without a name.');
-    const id = call.id ?? stableToolId(context, 0, 0, call.name, call.args ?? {});
+    const id = call.id ?? stableToolId(context, 0, ordinal, call.name, call.args ?? {});
     const value: ToolCallState = { id, name: call.name, ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}) };
     await this.stateStore.put(context.session, context.agent, id, value);
     return { id, name: call.name, input: call.args ?? {} };

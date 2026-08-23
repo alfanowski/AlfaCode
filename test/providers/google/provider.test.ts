@@ -112,6 +112,17 @@ describe('GoogleProvider', () => {
     expect(first[0]).toEqual(second[0]);
   });
 
+  it('does not collapse identical parallel calls with missing upstream ids', async () => {
+    const mock = client({ streams: [[{ candidates: [{ content: { parts: [
+      { functionCall: { name: 'weather', args: { city: 'Rome' } } },
+      { functionCall: { name: 'weather', args: { city: 'Rome' } } },
+    ] } }] }]] });
+    const events = await collect(new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() }).stream(baseRequest, context));
+    const toolEvents = events.filter((event) => event.type === 'tool_use');
+    expect(toolEvents).toHaveLength(2);
+    expect(toolEvents[0]?.id).not.toBe(toolEvents[1]?.id);
+  });
+
   it('filters model pages and maps model metadata', async () => {
     const mock = client({ models: [
       { name: 'models/gemini-good', displayName: 'Good', inputTokenLimit: 1000, outputTokenLimit: 100, supportedActions: ['generateContent'] },
