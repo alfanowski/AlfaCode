@@ -153,14 +153,15 @@ describe('GoogleProvider', () => {
 
   it('filters model pages and maps model metadata', async () => {
     const mock = client({ models: [
-      { name: 'models/gemini-good', displayName: 'Good', inputTokenLimit: 1000, outputTokenLimit: 100, supportedActions: ['generateContent'] },
+      { name: 'models/gemini-good', displayName: 'Good', inputTokenLimit: 262144, outputTokenLimit: 32768, supportedActions: ['generateContent'] },
+      { name: 'models/gemini-2.5-flash-preview-tts', displayName: 'TTS', inputTokenLimit: 8192, outputTokenLimit: 16384, supportedActions: ['generateContent'] },
+      { name: 'models/gemini-3-pro-image', displayName: 'Image', inputTokenLimit: 131072, outputTokenLimit: 32768, supportedActions: ['generateContent'] },
       { name: 'models/embed', supportedActions: ['embedContent'] },
       { name: 'models/also-good', supportedActions: ['generate_content'] },
     ] });
     const provider = new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() });
     expect(await provider.listModels()).toEqual([
-      { id: 'gemini-good', displayName: 'Good', contextWindow: 1000, maxOutputTokens: 100 },
-      { id: 'also-good', displayName: 'models/also-good' },
+      { id: 'gemini-good', displayName: 'Good', contextWindow: 262144, maxOutputTokens: 32768 },
     ]);
   });
 

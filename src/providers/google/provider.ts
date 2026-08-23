@@ -38,7 +38,7 @@ export class GoogleProvider {
     const pager = await this.client.models.list({ config: { pageSize: 100 } });
     const models: ProviderModel[] = [];
     for await (const model of pager) {
-      if (!supportsGenerateContent(model)) continue;
+      if (!isClaudeCodeCompatibleModel(model)) continue;
       const name = model.name;
       if (!name) continue;
       models.push({
@@ -201,6 +201,17 @@ export class GoogleProvider {
 
 function supportsGenerateContent(model: GoogleModel): boolean {
   return model.supportedActions?.some((action) => action === 'generateContent' || action === 'generate_content') ?? false;
+}
+
+const NON_CODING_MODEL_ID = /(?:^|[-_.])(tts|image|banana|lyria|robotics?|computer[-_.]?use|antigravity|deep[-_.]?research|omni)(?:$|[-_.])/i;
+
+/** Google mixes conversational, TTS, image, robotics, and specialist surfaces in one generateContent catalog. */
+export function isClaudeCodeCompatibleModel(model: GoogleModel): boolean {
+  if (!supportsGenerateContent(model) || !model.name) return false;
+  const id = model.name.replace(/^models\//, '');
+  return !NON_CODING_MODEL_ID.test(id)
+    && (model.inputTokenLimit ?? 0) >= 128_000
+    && (model.outputTokenLimit ?? 0) >= 8_192;
 }
 
 function toolResultResponse(block: Extract<AnthropicContentBlock, { type: 'tool_result' }>): JsonObject {
