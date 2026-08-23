@@ -12,10 +12,18 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { buildClaudeEnvironment } from "./claude-launcher.js";
 import { ALFACODE_CLIENT_ID, checkEngineCompatibility, type EngineCompatibility } from "./engine-compatibility.js";
-import type { RuntimeHandle } from "./runtime.js";
+
+export interface AgentRuntimeHandle {
+  readonly baseUrl: string;
+  readonly authToken: string;
+  readonly defaultModelId?: string;
+  readonly contextWindowTokens?: number;
+  readonly secretEnvironmentNames?: readonly string[];
+  close(): Promise<void>;
+}
 
 export interface AgentSessionOptions {
-  readonly runtime: RuntimeHandle;
+  readonly runtime: AgentRuntimeHandle;
   readonly cwd?: string;
   readonly configDir?: string;
   readonly permissionMode?: PermissionMode;
@@ -73,12 +81,19 @@ export class AgentSession {
   private rejectInitialized!: (error: Error) => void;
   private consumePromise: Promise<void>;
   private closed = false;
+  private didInitialize = false;
+  private initializationTimer: NodeJS.Timeout | undefined;
+  private readonly listeners = new Set<(message: SDKMessage) => void | Promise<void>>();
 
   private constructor(private readonly options: AgentSessionOptions) {
     this.initialized = new Promise((resolve, reject) => {
       this.resolveInitialized = resolve;
       this.rejectInitialized = reject;
     });
+    // Native mode renders before the SDK starts its child process. Keep the
+    // deferred identity observable without producing an unhandled rejection
+    // if initialization fails before the UI asks for it.
+    void this.initialized.catch(() => undefined);
     const configDir = options.configDir ?? join(homedir(), ".alfacode", "claude");
     const env = buildClaudeEnvironment({
       claudeArgs: [],
@@ -112,18 +127,16 @@ export class AgentSession {
   }
 
   public static async start(options: AgentSessionOptions): Promise<AgentSession> {
-    const session = new AgentSession(options);
-    try {
-      await withTimeout(session.initialized, options.initializationTimeoutMs ?? 15_000, "Claude Code engine initialization timed out");
-      return session;
-    } catch (error) {
-      await session.close();
-      throw error;
-    }
+    return new AgentSession(options);
   }
 
   public identity(): Promise<AgentSessionIdentity> {
     return this.initialized;
+  }
+
+  public subscribe(listener: (message: SDKMessage) => void | Promise<void>): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   public sendPrompt(text: string): string {
@@ -135,6 +148,13 @@ export class AgentSession {
       parent_tool_use_id: null,
       uuid,
     });
+    if (!this.didInitialize && this.initializationTimer === undefined) {
+      this.initializationTimer = setTimeout(() => {
+        const error = new Error("Claude Code engine initialization timed out");
+        this.rejectInitialized(error);
+        this.query.close();
+      }, this.options.initializationTimeoutMs ?? 15_000);
+    }
     return uuid;
   }
 
@@ -165,6 +185,7 @@ export class AgentSession {
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    if (this.initializationTimer !== undefined) clearTimeout(this.initializationTimer);
     this.input.close();
     this.query.close();
     await Promise.allSettled([this.consumePromise, this.options.runtime.close()]);
@@ -176,6 +197,11 @@ export class AgentSession {
       for await (const message of this.query) {
         if (!sawInit && isInitMessage(message)) {
           sawInit = true;
+          this.didInitialize = true;
+          if (this.initializationTimer !== undefined) {
+            clearTimeout(this.initializationTimer);
+            this.initializationTimer = undefined;
+          }
           this.resolveInitialized({
             sessionId: message.session_id,
             model: message.model,
@@ -185,12 +211,24 @@ export class AgentSession {
           });
         }
         await this.options.onMessage?.(message);
+        for (const listener of this.listeners) await listener(message);
       }
       if (!sawInit) this.rejectInitialized(new Error("Claude Code engine exited before initialization"));
+      else if (!this.closed) {
+        const message = syntheticEngineError(new Error("Claude Code engine exited unexpectedly"));
+        await this.options.onMessage?.(message);
+        for (const listener of this.listeners) await listener(message);
+      }
     } catch (error) {
+      if (this.initializationTimer !== undefined) {
+        clearTimeout(this.initializationTimer);
+        this.initializationTimer = undefined;
+      }
       const normalized = error instanceof Error ? error : new Error(String(error));
       if (!sawInit) this.rejectInitialized(normalized);
-      else await this.options.onMessage?.(syntheticEngineError(normalized));
+      const message = syntheticEngineError(normalized);
+      await this.options.onMessage?.(message);
+      for (const listener of this.listeners) await listener(message);
     }
   }
 }
@@ -209,16 +247,4 @@ function syntheticEngineError(error: Error): SDKMessage {
     uuid: randomUUID(),
     session_id: "unknown",
   };
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }

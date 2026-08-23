@@ -1,30 +1,30 @@
-# AlfaCode outer terminal UX
+# AlfaCode terminal UX
 
-AlfaCode owns provider configuration outside Claude Code. Its terminal UI is intentionally a small line-oriented wizard rather than an embedded Claude plugin or a custom TUI inside Claude Code. Provider choices come from descriptors: Google AI Studio, OpenCode Zen, Anthropic, and custom OpenAI-compatible endpoints.
+AlfaCode owns the complete terminal surface while the Claude Code engine remains headless underneath it. This is a native Ink application, not a Claude Code skin or plugin. Provider choices come from live descriptors: Google AI Studio, OpenCode Zen, Anthropic, custom endpoints, and compatible models.dev catalog providers.
 
 ## Trust boundary
 
-The API key never enters a Claude prompt, transcript, skill, plugin, project setting, or command argument. On macOS, a Keychain-backed connection invokes `/usr/bin/security add-generic-password -w` with `-w` as the final argument so the system process prompts securely. Automated environments use an environment-variable reference stored in the non-secret AlfaCode config.
+The API key never enters a Claude prompt, transcript, skill, plugin, project setting, or command argument. A masked Ink input writes the value directly to the native macOS Keychain binding. Automated environments use an environment-variable reference stored in the non-secret AlfaCode config.
 
-`providers remove` keeps credentials by default. `--delete-keychain` is an explicit, irreversible request and only applies to the referenced Keychain record.
+Interactive deletion requires a confirmation card and removes only the selected provider plus its AlfaCode-owned Keychain record. The compatibility CLI keeps credential deletion behind `--delete-keychain`.
 
 ## Interaction modes
 
 | Environment | Behaviour |
 | --- | --- |
-| Interactive TTY | First-run onboarding can select a provider, choose a provider id, and ask Keychain for a key. Model selection remains automatic unless the user later pins one with `alfacode default`. |
+| Interactive TTY | Native chat, searchable provider/model pickers, masked credentials, usage, permissions, tools, and subagent status. |
 | `NO_COLOR` or `TERM=dumb` | Text-only output. No color carries meaning. |
 | No TTY / CI | No prompts or Keychain setup. Use `connect --api-key-env NAME` then `run --non-interactive`. |
 
-The UI uses numbered selections and text prompts, not terminal cursor control, spinners, or emoji-only status. Ctrl-C before config writing leaves no partial config because writes are atomic.
+No color or symbol carries meaning alone. Ctrl-C before config writing leaves no partial config because writes are atomic.
 
-## Claude Code boundary
+## Engine boundary
 
-AlfaCode does not inject provider forms, a usage dashboard, or secret management into Claude Code's TUI. Claude receives only a loopback gateway URL and a process-local, short-lived gateway token. The separate `usage` command queries the local content-free usage ledger; it reports token accounting without provider credentials, prompts, transcripts, or billing data.
+The pinned Claude Code engine receives only a loopback gateway URL and a process-local, short-lived gateway token. AlfaCode renders SDK events itself. `/usage` combines live context occupancy with the local content-free provider ledger; it contains no credentials, prompts, or response bodies.
 
 ## Model discovery and pins
 
-Discovery is injected at the outer CLI boundary. A platform implementation can return model availability, advertised capabilities, quota state, and context/output headroom; AlfaCode renders every supplied field and does not contain a model allowlist. `alfacode default <model-id>` writes an explicit pin in AlfaCode metadata. `alfacode default auto` deletes that pin and returns control to the platform selector for later launches.
+Discovery runs before each native session across every configured provider. `/model` searches the combined verified tool-capable catalog. `alfacode default <model-id>` writes an explicit pin; `alfacode default auto` returns control to automatic selection.
 
 ## Legacy import
 

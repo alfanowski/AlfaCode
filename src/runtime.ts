@@ -59,7 +59,7 @@ export interface RuntimeDependencies {
 }
 
 export interface DynamicModelMetadataResolver {
-  resolve(input: { providerId: string; modelId: string; wireProtocol: Exclude<WireProtocol, "unsupported"> }): Promise<DynamicModelMetadata | undefined>;
+  resolve(input: { providerId: string; modelId: string; wireProtocol?: Exclude<WireProtocol, "unsupported"> }): Promise<DynamicModelMetadata | undefined>;
 }
 
 export interface DynamicModelMetadata {
@@ -68,6 +68,9 @@ export interface DynamicModelMetadata {
   readonly contextWindow?: number;
   readonly maxOutputTokens?: number;
   readonly support?: ModelDescriptor["support"];
+  readonly wireProtocol?: Exclude<WireProtocol, "unsupported">;
+  readonly free?: boolean;
+  readonly deprecated?: boolean;
 }
 
 interface GoogleAdapter {
@@ -123,7 +126,29 @@ export async function createConfiguredProvider(record: ProviderRecord, apiKey: s
   }
   if (record.type === "opencode-zen" || record.type === "zen") {
     const zenBase = baseUrl ?? "https://opencode.ai/zen/v1";
-    const descriptors = await discoverZenModels({ apiKey, baseUrl: zenBase, ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }) });
+    const listed = await discoverZenModels({ apiKey, baseUrl: zenBase, ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }) });
+    const descriptors = (await Promise.all(listed.map(async (listedModel): Promise<ModelDescriptor | undefined> => {
+      const metadata = await dependencies.modelMetadata?.resolve({ providerId: record.id, modelId: listedModel.id });
+      if (apiKey === "public" && metadata?.free !== true) return undefined;
+      const wireProtocol = metadata?.wireProtocol;
+      if (metadata === undefined || wireProtocol === undefined || wireProtocol === "ollama-native") {
+        return { ...listedModel, providerId: record.id, availability: "unknown", unavailableReason: "No verified wire protocol metadata is available" };
+      }
+      const capabilities = metadata.capabilities;
+      const availability: ModelDescriptor["availability"] = metadata.deprecated ? "deprecated" : capabilities.tools ? "available" : "unknown";
+      return {
+        providerId: record.id,
+        id: listedModel.id,
+        displayName: metadata.displayName ?? listedModel.displayName,
+        wireProtocol,
+        capabilities,
+        availability,
+        ...(!capabilities.tools && !metadata.deprecated ? { unavailableReason: "Tool calling is not verified" } : {}),
+        ...(metadata.contextWindow === undefined ? {} : { contextWindow: metadata.contextWindow }),
+        ...(metadata.maxOutputTokens === undefined ? {} : { maxOutputTokens: metadata.maxOutputTokens }),
+        support: metadata.support ?? "best-effort",
+      };
+    }))).filter((descriptor): descriptor is ModelDescriptor => descriptor !== undefined);
     const entries = descriptors.map((descriptor) => {
       const models = [descriptor];
       if (descriptor.wireProtocol !== "unsupported" && descriptor.wireProtocol !== "ollama-native") return { descriptor, provider: createWireProvider({ id: record.id, apiKey, baseUrl: zenBase, wireProtocol: descriptor.wireProtocol, models }, dependencies, homeDirectory) };
@@ -274,8 +299,9 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
     const warnings: string[] = [];
     for (const record of input.config.providers) {
       try {
-        if (record.apiKey === undefined) throw new Error("no API key reference");
-        const apiKey = await secrets.resolve(record.apiKey);
+        const anonymousZen = (record.type === "opencode-zen" || record.type === "zen") && record.apiKey === undefined;
+        if (record.apiKey === undefined && !anonymousZen) throw new Error("no API key reference");
+        const apiKey = anonymousZen ? "public" : await secrets.resolve(record.apiKey!);
         if (apiKey === undefined || apiKey.length === 0) throw new Error("API key unavailable");
         const built = await createConfiguredProvider(record, apiKey, dependencies, homeDirectory);
         providers.push(built.provider);
@@ -312,7 +338,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       providers,
       usageLedger: ledger,
       ...(activeSelector === undefined ? {} : {
-        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: 404 | 429; retryAfter?: string | number }) => activeSelector.recordOutcome(outcome),
+        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: number; retryAfter?: string | number }) => activeSelector.recordOutcome(outcome),
         selectFallback: async () => {
           const fallback = (await activeSelector.select(candidates, { streaming: true, tools: true })).selected;
           if (fallback === undefined) return undefined;
@@ -322,6 +348,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
         },
       }),
     });
+    let closed = false;
     return {
       baseUrl: gateway.address,
       authToken,
@@ -331,6 +358,8 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       ...(selectedModel?.contextWindow === undefined ? {} : { contextWindowTokens: selectedModel.contextWindow }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => {
+        if (closed) return;
+        closed = true;
         await gateway.app.close();
         await ledger.close();
       },

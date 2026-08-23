@@ -7,14 +7,15 @@ alfacode CLI
   ├─ loads non-secret provider configuration
   ├─ resolves credentials from the OS keychain or environment
   ├─ starts a loopback-only gateway on an ephemeral port
-  └─ launches the real Claude Code binary
+  └─ renders the AlfaCode Ink TUI over the pinned Claude Agent SDK
+       └─ starts the embedded Claude Code engine
        ├─ CLAUDE_CONFIG_DIR=~/.alfacode/claude
        ├─ ANTHROPIC_BASE_URL=http://127.0.0.1:<port>
        ├─ ANTHROPIC_AUTH_TOKEN=<ephemeral token>
        └─ CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-Claude Code sends Anthropic Messages API traffic to a single endpoint. The gateway aggregates model catalogs and routes each inference request using the model ID selected in `/model`.
+The engine sends Anthropic Messages API traffic to a single endpoint. The gateway aggregates model catalogs and routes each inference request using the AlfaCode model picker or automatic selector.
 
 ## Dynamic catalog and selection
 
@@ -22,7 +23,7 @@ Claude Code sends Anthropic Messages API traffic to a single endpoint. The gatew
 - AlfaCode verifies availability with non-inference endpoints before routing.
 - models.dev supplies refreshable protocol/capability metadata, never credentials or a default-model policy.
 - Selection never parses a model ID, version, display name, or catalog position. Known normalized quota headroom wins; otherwise the privacy-preserving local usage ledger prioritizes routes already proven compatible and fairly schedules comparable candidates.
-- Provider 404/429 outcomes persist into future selection. Before any response bytes are emitted, AlfaCode transparently fails over to the next eligible route; an exhausted catalog returns a cooldown instead of repeatedly choosing the same model.
+- Provider 404/429/retryable-5xx outcomes persist into future selection. Before any response bytes are emitted, AlfaCode transparently fails over to an untried eligible route; an exhausted catalog returns the upstream error instead of looping.
 - The context limit passed to Claude Code belongs to the selected model. It is never the smallest unrelated entry in a heterogeneous provider catalog.
 
 ## Model identifiers
@@ -37,13 +38,14 @@ The prefix is a compatibility marker, not a claim that the upstream model is an 
 
 ## Components
 
-### Launcher
+### Agent session
 
 - Uses process-local environment overrides only.
 - Keeps AlfaCode sessions and settings separate through `CLAUDE_CONFIG_DIR`.
 - Scrubs inherited provider-selection and API-key variables from the child process.
-- Forwards user arguments and signals to the real Claude Code process.
-- Stops the gateway when the child exits.
+- Uses the official Agent SDK streaming-input contract and its Claude Code system/tool presets.
+- Forwards permissions, partial output, tool calls, task/subagent events, interrupts, sessions, and model changes to the native UI.
+- Exact-pins the SDK and embedded engine version and stops the gateway with the session.
 
 ### Gateway
 

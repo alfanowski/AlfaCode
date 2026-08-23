@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createCli } from "../src/cli.js";
 import { ConfigStore } from "../src/config.js";
 import type { TerminalUi } from "../src/terminal-ui.js";
+import type { AgentSession } from "../src/agent-session.js";
 import { CAPABILITIES } from "../src/providers/foundation/types.js";
 
 const directories: string[] = [];
@@ -59,10 +60,81 @@ describe("createCli", () => {
       launch: async (options) => { launched.push(options); return 0; },
     });
 
-    await cli.parseAsync(["node", "alfacode", "--resume", "session-id", "-p", "hello"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "launch", "--resume", "session-id", "-p", "hello"], { from: "node" });
     expect(launched).toEqual([expect.objectContaining({ claudeArgs: ["--resume", "session-id", "-p", "hello"] })]);
     expect(launched).toEqual([expect.objectContaining({ scrubEnvironmentKeys: ["CUSTOM_KEY"] })]);
     expect(closed).toBe(true);
+  });
+
+  it("starts the native AlfaCode UI by default with every provider model", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-native-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, defaultProviderId: "google", providers: [
+      { id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } },
+      { id: "zen", type: "opencode-zen" },
+    ] });
+    let runtimeClosed = false;
+    let sessionClosed = false;
+    const cli = createCli({
+      configStore,
+      keychain: { store: async () => undefined, retrieve: async () => "configured" },
+      startRuntime: async () => ({
+        baseUrl: "http://gateway", authToken: "token", defaultModelId: "alfacode-anthropic/zen/free-model",
+        modelCandidates: [
+          { providerId: "google", id: "gemini", displayName: "Gemini", wireProtocol: "gemini-generate-content", capabilities: CAPABILITIES["gemini-generate-content"], availability: "available", support: "best-effort" },
+          { providerId: "zen", id: "free-model", displayName: "Free model", wireProtocol: "openai-chat", capabilities: CAPABILITIES["openai-chat"], availability: "available", support: "best-effort" },
+        ],
+        close: async () => { runtimeClosed = true; },
+      }),
+      startAgentSession: async (input) => ({ close: async () => { sessionClosed = true; await input.runtime.close(); } }) as unknown as AgentSession,
+      chatTui: async (input) => {
+        expect(input.config.providers.map((provider) => provider.id)).toEqual(["google", "zen"]);
+        expect(input.models.map((model) => model.providerId)).toEqual(["google", "zen"]);
+        return { type: "exit" };
+      },
+      ui: fakeUi(),
+    });
+
+    await cli.parseAsync(["node", "alfacode"], { from: "node" });
+    expect(sessionClosed).toBe(true);
+    expect(runtimeClosed).toBe(true);
+  });
+
+  it("restores the previous Keychain secret when reconnect validation fails", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-reconnect-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, defaultProviderId: "google", providers: [
+      { id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } },
+    ] });
+    let secret: string | undefined = "working-key";
+    let chatCalls = 0;
+    const cli = createCli({
+      configStore,
+      keychain: {
+        store: async () => undefined,
+        storeSecret: async (_account, value) => { secret = value; },
+        retrieve: async () => secret,
+        delete: async () => { secret = undefined; },
+      },
+      startRuntime: async (input) => {
+        if (input.purpose === "discovery") throw new Error("invalid replacement key");
+        return { baseUrl: "http://gateway", authToken: "token", defaultModelId: "route/model", modelCandidates: [], close: async () => undefined };
+      },
+      startAgentSession: async (input) => ({ close: async () => input.runtime.close() }) as unknown as AgentSession,
+      chatTui: async () => (++chatCalls === 1 ? { type: "reconnect-provider", providerId: "google" } : { type: "exit" }),
+      providerSetup: async (input) => {
+        const google = input.descriptors.find((descriptor) => descriptor.id === "google");
+        if (google === undefined) throw new Error("missing Google descriptor");
+        await input.connect({ descriptor: google, apiKey: "broken-key" });
+      },
+      ui: fakeUi(),
+    });
+
+    await expect(cli.parseAsync(["node", "alfacode"], { from: "node" })).rejects.toThrow("invalid replacement key");
+    expect(secret).toBe("working-key");
+    expect(await configStore.read()).toMatchObject({ providers: [{ id: "google", type: "google" }] });
   });
 
   it("reconnects missing credentials through the native setup before launch", async () => {
@@ -109,7 +181,7 @@ describe("createCli", () => {
       ui: fakeUi(),
     });
 
-    await cli.parseAsync(["node", "alfacode"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "launch"], { from: "node" });
     expect(stored).toBe("new-key");
     expect(launched).toBe(true);
     expect(await configStore.read()).toMatchObject({ defaultProviderId: "zen", providers: [{ id: "zen", type: "opencode-zen" }] });

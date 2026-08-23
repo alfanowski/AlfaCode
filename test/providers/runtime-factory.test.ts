@@ -36,9 +36,26 @@ describe("runtime provider factory", () => {
     const record: ProviderRecord = { id: "zen", type: "opencode-zen" };
     const built = await createConfiguredProvider(record, "zen-secret", {
       fetch: async () => Response.json({ data: [{ id: "known", endpoint: "/chat/completions", status: "available" }, { id: "unknown" }] }),
+      modelMetadata: { async resolve(input) { return input.modelId === "known" ? { wireProtocol: "openai-chat" as const, free: false, deprecated: false, capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: false, reasoningState: "none" as const, nativeTokenCounting: false, jsonSchema: "full" as const } } : undefined; } },
     }, "/tmp/alfacode-test");
     expect(built.descriptors.map((model) => [model.id, model.wireProtocol])).toEqual([["known", "openai-chat"], ["unknown", "unsupported"]]);
     expect(built.provider.models.map((model) => model.id)).toEqual(["known"]);
+  });
+
+  it("exposes only verified zero-cost Zen models for anonymous access", async () => {
+    const built = await createConfiguredProvider({ id: "zen", type: "opencode-zen" }, "public", {
+      fetch: async () => Response.json({ data: [{ id: "free" }, { id: "paid" }, { id: "retired-free" }] }),
+      modelMetadata: { async resolve(input) {
+        return {
+          wireProtocol: "openai-chat" as const,
+          free: input.modelId !== "paid",
+          deprecated: input.modelId === "retired-free",
+          capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: false, reasoningState: "none" as const, nativeTokenCounting: false, jsonSchema: "full" as const },
+        };
+      } },
+    }, "/tmp/alfacode-test");
+    expect(built.descriptors.map((model) => [model.id, model.availability])).toEqual([["free", "available"], ["retired-free", "deprecated"]]);
+    expect(built.provider.models.map((model) => model.id)).toEqual(["free"]);
   });
 
   it("discovers a catalog-defined wire provider without a provider-type switch", async () => {

@@ -2,7 +2,7 @@
   "name": "alfacode",
   "version": "0.1.0",
   "private": true,
-  "description": "Run Claude Code against configurable AI providers through an isolated local gateway.",
+  "description": "A native multi-provider coding-agent TUI powered by a pinned Claude Code engine.",
   "type": "module",
   "bin": {
     "alfacode": "./dist/cli.js"

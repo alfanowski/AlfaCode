@@ -116,7 +116,8 @@ export interface ModelSelectionResult {
 export interface ProviderOutcome {
   readonly providerId: string;
   readonly modelId: string;
-  readonly statusCode: 404 | 429;
+  /** 404 is treated as removal; 429 and retryable 5xx responses enter a short cooldown. */
+  readonly statusCode: number;
   /** Accepts an HTTP Retry-After value (seconds/date) or a millisecond delay. */
   readonly retryAfter?: string | number;
 }
@@ -224,7 +225,7 @@ export class AutomaticModelSelector {
     const state = await this.stateStore.load();
     const key = keyFromParts(outcome.providerId, outcome.modelId);
     const previous = state.models[key] ?? { selections: 0 };
-    const delay = outcome.statusCode === 429 ? retryAfterDelay(outcome.retryAfter, now) ?? this.fallbackCooldownMs : this.notFoundCooldownMs;
+    const delay = outcome.statusCode === 404 ? this.notFoundCooldownMs : retryAfterDelay(outcome.retryAfter, now) ?? this.fallbackCooldownMs;
     await this.stateStore.save({
       version: 1,
       models: {

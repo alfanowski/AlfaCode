@@ -9,12 +9,13 @@ export interface ProviderDescriptor {
   readonly suggestedBaseUrl?: string;
   readonly configurationOptions?: Readonly<Record<string, string>>;
   readonly environmentVariables?: readonly string[];
+  readonly allowsAnonymous?: boolean;
 }
 
 /** Configuration metadata only; runtime adapters are resolved by the platform layer. */
 export const providerDescriptors: readonly ProviderDescriptor[] = [
   { id: "google", configType: "google", displayName: "Google AI Studio", description: "Gemini models through Google AI Studio" },
-  { id: "zen", configType: "opencode-zen", displayName: "OpenCode Zen", description: "OpenCode's multi-model gateway" },
+  { id: "zen", configType: "opencode-zen", displayName: "OpenCode Zen", description: "Free public models or your own Zen account", allowsAnonymous: true, configurationOptions: { catalogProviderId: "opencode" } },
   { id: "anthropic", configType: "anthropic", displayName: "Anthropic", description: "Anthropic Messages API" },
   { id: "openai-compatible", configType: "openai-compatible", displayName: "OpenAI-compatible", description: "A custom compatible API endpoint", requiresBaseUrl: true },
 ];
