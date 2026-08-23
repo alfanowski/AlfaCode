@@ -22,13 +22,27 @@ describe("MacOSKeychain", () => {
     await expect(resolver.resolve({ kind: "env", name: "ALFACODE_KEY" })).resolves.toBe("test-value");
   });
 
+  it("stores a TUI secret through the native credential vault without spawning", async () => {
+    const calls: Array<{ service: string; account: string; secret: string }> = [];
+    const runner: CommandRunner = { run: async () => { throw new Error("must not spawn"); } };
+    const entryFactory = (service: string, account: string) => ({
+      setPassword: (secret: string) => calls.push({ service, account, secret }),
+      getPassword: () => null,
+      deletePassword: () => true,
+    });
+    await new MacOSKeychain(runner, entryFactory).storeSecret("google-main", "secret-value");
+    expect(calls).toEqual([{ service: "alfacode", account: "google-main", secret: "secret-value" }]);
+  });
+
   it("deletes only the named Keychain record", async () => {
-    const calls: string[][] = [];
-    const runner: CommandRunner = { run: async (_command, args) => {
-      calls.push([...args]);
-      return { stdout: "", stderr: "", exitCode: 0 };
-    } };
-    await new MacOSKeychain(runner).delete("google-work", "alfacode");
-    expect(calls).toEqual([["delete-generic-password", "-a", "google-work", "-s", "alfacode"]]);
+    const calls: Array<{ service: string; account: string }> = [];
+    const runner: CommandRunner = { run: async () => { throw new Error("must not spawn"); } };
+    const entryFactory = (service: string, account: string) => ({
+      setPassword: () => undefined,
+      getPassword: () => null,
+      deletePassword: () => { calls.push({ service, account }); return true; },
+    });
+    await new MacOSKeychain(runner, entryFactory).delete("google-work", "alfacode");
+    expect(calls).toEqual([{ service: "alfacode", account: "google-work" }]);
   });
 });
