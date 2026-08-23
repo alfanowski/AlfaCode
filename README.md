@@ -9,7 +9,11 @@ alfacode -> local Anthropic-compatible gateway -> configured AI provider
 The normal `claude` command and its configuration are left untouched. AlfaCode uses its own Claude config directory, session history, model cache, provider credentials, and gateway process.
 
 > [!WARNING]
-> AlfaCode is experimental and not affiliated with or supported by Anthropic. Anthropic does not support routing Claude Code to non-Claude models. Claude Code or provider API updates may require compatibility fixes.
+> AlfaCode is an independent, experimental project. It is not affiliated with,
+> endorsed by, or supported by Anthropic, OpenCode, Google, or any model
+> provider. Claude Code, the Claude Agent SDK, and provider APIs remain subject
+> to their respective owners' terms. Gateway compatibility with non-Claude
+> models is not guaranteed by Anthropic.
 
 ## Goals
 
@@ -125,4 +129,7 @@ Requests contain repository context and are sent to the selected provider. Verif
 
 ## License
 
-MIT.
+AlfaCode's original source code is licensed under the MIT License. Anthropic's
+Claude Code and Claude Agent SDK are proprietary software and are not licensed
+under AlfaCode's MIT License. They remain governed by Anthropic's applicable
+terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
