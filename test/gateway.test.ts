@@ -107,7 +107,7 @@ describe("Anthropic gateway", () => {
       method: "POST",
       url: "/v1/messages?beta=true",
       headers: authorizedHeaders(),
-      payload: { model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 10, experimental: { x: 1 } },
+      payload: { model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 10, stream: true, experimental: { x: 1 } },
     });
 
     expect(response.statusCode).toBe(200);
@@ -121,6 +121,47 @@ describe("Anthropic gateway", () => {
       "event: message_stop",
     ]);
     expect(response.body).toContain('data: {"type":"message_stop"}');
+    expect(response.headers["request-id"]).toMatch(/^req_[a-f0-9]+$/);
+  });
+
+  it("returns a JSON message for non-streaming requests and assembles tool input", async () => {
+    const toolEvents: readonly CanonicalStreamEvent[] = [
+      events[0]!,
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi " } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "there" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "tool_1", name: "Read", input: {} } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"file_' } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: 'path":"README.md"}' } },
+      { type: "content_block_stop", index: 1 },
+      events[4]!,
+      events[5]!,
+    ];
+    const response = await app(fakeProvider({
+      async *streamMessage() {
+        yield* toolEvents;
+      },
+    })).inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 10, stream: false },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("application/json");
+    expect(response.json()).toMatchObject({
+      id: "msg_1",
+      type: "message",
+      role: "assistant",
+      content: [
+        { type: "text", text: "hi there" },
+        { type: "tool_use", id: "tool_1", name: "Read", input: { file_path: "README.md" } },
+      ],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 1 },
+    });
   });
 
   it("returns Anthropic-shaped validation and token-count responses", async () => {
@@ -158,7 +199,7 @@ describe("Anthropic gateway", () => {
         method: "POST",
         headers: { ...authorizedHeaders(), "content-type": "application/json" },
       });
-      req.end(JSON.stringify({ model: modelId, messages: [], max_tokens: 1 }));
+      req.end(JSON.stringify({ model: modelId, messages: [], max_tokens: 1, stream: true }));
       await once(req, "response");
       req.destroy();
       await new Promise((resolve) => setTimeout(resolve, 30));
@@ -179,7 +220,7 @@ describe("Anthropic gateway", () => {
       method: "POST",
       url: "/v1/messages",
       headers: authorizedHeaders(),
-      payload: { model: modelId, messages: [], max_tokens: 1 },
+      payload: { model: modelId, messages: [], max_tokens: 1, stream: true },
     });
     expect(response.statusCode).toBe(200);
     expect(signal).toBeDefined();
