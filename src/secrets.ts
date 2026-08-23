@@ -42,6 +42,11 @@ export class MacOSKeychain {
     const secret = result.stdout.replace(/\r?\n$/, "");
     return secret.length > 0 ? secret : undefined;
   }
+
+  async delete(account: string, service = keychainService): Promise<void> {
+    const result = await this.runner.run("/usr/bin/security", ["delete-generic-password", "-a", account, "-s", service]);
+    if (result.exitCode !== 0) throw new Error(`Unable to remove secret from macOS Keychain: ${result.stderr.trim()}`);
+  }
 }
 
 export interface SecretResolverOptions {

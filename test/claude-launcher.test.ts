@@ -30,6 +30,13 @@ describe("launchClaude", () => {
       ANTHROPIC_AUTH_TOKEN: "ephemeral-token",
       CLAUDE_CONFIG_DIR: configDir,
       CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
+      CLAUDE_CODE_DISABLE_ARTIFACT: "1",
+      CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+      DISABLE_TELEMETRY: "1",
+      DISABLE_ERROR_REPORTING: "1",
+      DISABLE_FEEDBACK_COMMAND: "1",
+      CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS: "0",
       ANTHROPIC_DEFAULT_OPUS_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_SONNET_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "gemini-3-pro",
@@ -47,5 +54,16 @@ describe("launchClaude", () => {
     const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", environment });
     expect(environment).toEqual({ ANTHROPIC_API_KEY: "outside", PATH: "/bin" });
     expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("allows explicit launch options to opt into a safe default", () => {
+    const result = buildClaudeEnvironment({
+      claudeArgs: [],
+      baseUrl: "http://gateway",
+      authToken: "token",
+      extraEnv: { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS: "1" },
+    });
+    expect(result.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS).toBe("1");
+    expect(result.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined();
   });
 });

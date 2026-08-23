@@ -2,7 +2,7 @@ import { chmod, lstat, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ConfigStore } from "../src/config.js";
+import { ConfigStore, migrateLegacyConfig } from "../src/config.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -60,5 +60,18 @@ describe("ConfigStore", () => {
     await store.write({ version: 1, providers: [] });
     await chmod(store.path, 0o640);
     await expect(store.read()).rejects.toThrow("insecure permissions");
+  });
+
+  it("migrates legacy metadata once without changing its Keychain reference", async () => {
+    const home = await createTemporaryDirectory();
+    const target = new ConfigStore({ homeDirectory: home });
+    const legacyPath = join(home, ".polycode", "config.json");
+    const legacy = new ConfigStore({ homeDirectory: home, configPath: legacyPath });
+    await legacy.write({ version: 1, defaultProviderId: "old", providers: [{ id: "old", type: "google", apiKey: { kind: "keychain", service: "polycode", account: "old" } }] });
+
+    await expect(migrateLegacyConfig({ target, legacyConfigPath: legacyPath })).resolves.toMatchObject({ migrated: true });
+    expect(await target.read()).toMatchObject({ providers: [{ apiKey: { kind: "keychain", service: "polycode", account: "old" } }] });
+    await expect(migrateLegacyConfig({ target, legacyConfigPath: legacyPath })).resolves.toMatchObject({ migrated: false });
+    expect(await legacy.read()).toMatchObject({ providers: [{ id: "old" }] });
   });
 });

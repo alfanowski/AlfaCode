@@ -45,6 +45,17 @@ const inheritedSecretKeys = new Set([
   "VERTEX_REGION",
 ]);
 
+/** Safe child-process defaults. Explicit launch extraEnv values may opt back in deliberately. */
+const safeClaudeDefaults: Readonly<Record<string, string>> = {
+  CLAUDE_CODE_DISABLE_ARTIFACT: "1",
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+  DISABLE_TELEMETRY: "1",
+  DISABLE_ERROR_REPORTING: "1",
+  DISABLE_FEEDBACK_COMMAND: "1",
+  CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
+  CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS: "0",
+};
+
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {
   const base = options.environment ?? process.env;
   const secretKeys = new Set([...inheritedSecretKeys, ...(options.scrubEnvironmentKeys ?? [])]);
@@ -52,7 +63,7 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
   for (const [key, value] of Object.entries(base)) {
     if (!secretKeys.has(key) && !key.startsWith("ANTHROPIC_")) environment[key] = value;
   }
-  Object.assign(environment, options.extraEnv);
+  Object.assign(environment, safeClaudeDefaults, options.extraEnv);
   for (const key of secretKeys) delete environment[key];
   for (const key of Object.keys(environment)) {
     if (key.startsWith("ANTHROPIC_") && key !== "ANTHROPIC_CUSTOM_HEADERS") delete environment[key];
