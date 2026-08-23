@@ -66,4 +66,4 @@ Requests contain repository context and are sent to the selected provider. Verif
 
 ## License
 
-Apache-2.0.
+MIT.
