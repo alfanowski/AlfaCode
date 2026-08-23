@@ -1,0 +1,32 @@
+import { describe, expect, it, vi } from "vitest";
+import { PermissionBroker } from "../src/permission-broker.js";
+
+describe("PermissionBroker", () => {
+  it("surfaces and resolves queued tool permission requests", async () => {
+    const broker = new PermissionBroker();
+    const listener = vi.fn();
+    broker.subscribe(listener);
+    const controller = new AbortController();
+    const result = broker.canUseTool("Bash", { command: "pwd" }, {
+      signal: controller.signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+      requestId: "request-1",
+      decisionReason: "Requires approval",
+    });
+
+    expect(broker.current()).toMatchObject({ toolName: "Bash", input: { command: "pwd" }, reason: "Requires approval" });
+    broker.allow();
+    await expect(result).resolves.toEqual({ behavior: "allow" });
+    expect(broker.current()).toBeUndefined();
+    expect(listener).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it("rejects pending requests when the permission surface closes", async () => {
+    const broker = new PermissionBroker();
+    const controller = new AbortController();
+    const result = broker.canUseTool("Write", { file_path: "x" }, { signal: controller.signal, suggestions: [], toolUseID: "tool-2", requestId: "request-2" });
+    broker.close();
+    await expect(result).rejects.toThrow("Permission surface closed");
+  });
+});

@@ -11,13 +11,18 @@ export function createModelsDevMetadataResolver(catalog: ModelsDevCatalog, confi
       const key = providerKeys.get(input.providerId) ?? input.providerId;
       const provider = catalog.providers.get(key);
       const model = provider?.models.get(input.modelId);
-      if (provider === undefined || model === undefined || model.wireFamily !== input.wireProtocol) return undefined;
+      if (provider === undefined || model === undefined || (input.wireProtocol !== undefined && model.wireFamily !== input.wireProtocol)) return undefined;
+      const wireProtocol = input.wireProtocol ?? model.wireFamily;
+      if (wireProtocol === undefined) return undefined;
       return {
         displayName: model.name,
-        capabilities: modelCapabilities(model, input.wireProtocol),
+        capabilities: modelCapabilities(model, wireProtocol),
         contextWindow: model.limits.input ?? model.limits.context,
         maxOutputTokens: model.limits.output,
         support: "best-effort",
+        ...(model.wireFamily === undefined ? {} : { wireProtocol: model.wireFamily }),
+        free: model.costs !== undefined && model.costs.input === 0 && model.costs.output === 0,
+        deprecated: model.deprecated,
       };
     },
   };

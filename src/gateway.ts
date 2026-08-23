@@ -31,8 +31,8 @@ export interface GatewayOptions {
   readonly providers: readonly Provider[];
   readonly pingIntervalMs?: number;
   readonly usageLedger?: UsageLedger;
-  readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429; readonly retryAfter?: string | number }) => Promise<void> | void;
-  readonly selectFallback?: (failure: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429; readonly retryAfter?: string | number }) => Promise<{ readonly provider: Provider; readonly model: ProviderModel } | undefined>;
+  readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: number; readonly retryAfter?: string | number }) => Promise<void> | void;
+  readonly selectFallback?: (failure: { readonly providerId: string; readonly modelId: string; readonly statusCode: number; readonly retryAfter?: string | number }) => Promise<{ readonly provider: Provider; readonly model: ProviderModel } | undefined>;
 }
 
 interface AnthropicErrorEnvelope {
@@ -97,25 +97,45 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     reply.raw.setHeader("x-request-id", requestId);
     if (parsed.data.stream !== true) {
       const controller = new AbortController();
-      request.raw.once("aborted", () => controller.abort());
+      const abort = () => controller.abort();
+      request.raw.once("aborted", abort);
       const context = providerContext(request, controller.signal);
-      const effectiveRequest = withAlfaCodeIdentity(resolved.request, resolved.provider, resolved.model);
-      const tracker = await startAttempt(options.usageLedger, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, effectiveRequest, context);
+      let provider = resolved.provider;
+      let model = resolved.model;
+      let routeModelId = parsed.data.model;
+      const attemptedRoutes = new Set([routeModelId]);
       try {
-        const response = await collectResponse(
-          resolved.provider,
-          effectiveRequest,
-          context,
-          async (usage) => tracker.observe(usage),
-        );
-        await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", true);
-        return response;
-      } catch (error) {
-        await tracker.finish(controller.signal.aborted ? "cancelled" : "failed", false, errorClass(error));
-        const normalized = normalizeProviderError(error);
-        await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status, normalized.retryAfter);
-        if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
-        return reply.code(normalized.status).send(normalized.body);
+        while (!controller.signal.aborted) {
+          const effectiveRequest = withAlfaCodeIdentity({ ...resolved.request, model: model.id }, provider, model);
+          const tracker = await startAttempt(options.usageLedger, provider, model, routeModelId, resolved.extendedContext, effectiveRequest, context);
+          try {
+            const response = await collectResponse(provider, effectiveRequest, context, async (usage) => tracker.observe(usage));
+            await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", true);
+            return { ...response, model: routeModelId };
+          } catch (error) {
+            await tracker.finish(controller.signal.aborted ? "cancelled" : "failed", false, errorClass(error));
+            if (controller.signal.aborted) return reply.code(499).send(anthropicError("cancelled_error", "Request cancelled"));
+            const normalized = normalizeProviderError(error);
+            if (isFailoverStatus(normalized.status)) {
+              const failure = { providerId: provider.id, modelId: model.id, statusCode: normalized.status, ...(normalized.retryAfter === undefined ? {} : { retryAfter: normalized.retryAfter }) };
+              await options.onProviderOutcome?.(failure);
+              const fallback = await options.selectFallback?.(failure);
+              const fallbackRoute = fallback === undefined ? undefined : encodeModelId(fallback.provider.id, fallback.model.id);
+              if (fallback !== undefined && fallbackRoute !== undefined && !attemptedRoutes.has(fallbackRoute)) {
+                provider = fallback.provider;
+                model = fallback.model;
+                routeModelId = fallbackRoute;
+                attemptedRoutes.add(fallbackRoute);
+                continue;
+              }
+            }
+            if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
+            return reply.code(normalized.status).send(normalized.body);
+          }
+        }
+        return reply.code(499).send(anthropicError("cancelled_error", "Request cancelled"));
+      } finally {
+        request.raw.removeListener("aborted", abort);
       }
     }
 
@@ -316,6 +336,7 @@ async function streamResponse(
   let provider = initialProvider;
   let providerModel = initialProviderModel;
   let routeModelId = initialRouteModelId;
+  const attemptedRoutes = new Set([initialRouteModelId]);
   try {
     while (!controller.signal.aborted) {
       const providerRequest = withAlfaCodeIdentity(
@@ -346,7 +367,10 @@ async function streamResponse(
             wireStarted = true;
             outputStarted = true;
             attemptOutputStarted = true;
-            await write(response, serializeEvent(next.value), controller.signal);
+            const event = next.value.type === "message_start"
+              ? { ...next.value, message: { ...next.value.message, model: routeModelId } } as CanonicalStreamEvent
+              : next.value;
+            await write(response, serializeEvent(event), controller.signal);
           }
         }
         await tracker.finish("cancelled", attemptOutputStarted);
@@ -355,7 +379,7 @@ async function streamResponse(
         const normalized = normalizeProviderError(error);
         await tracker.finish(controller.signal.aborted ? "cancelled" : attemptOutputStarted ? "partial" : "failed", attemptOutputStarted, errorClass(error));
         if (controller.signal.aborted) return;
-        if (!outputStarted && (normalized.status === 404 || normalized.status === 429)) {
+        if (!outputStarted && isFailoverStatus(normalized.status)) {
           const failure = {
             providerId: provider.id,
             modelId: providerModel.id,
@@ -364,10 +388,12 @@ async function streamResponse(
           } as const;
           await onProviderOutcome?.(failure);
           const fallback = await selectFallback?.(failure);
-          if (fallback !== undefined) {
+          const fallbackRoute = fallback === undefined ? undefined : encodeModelId(fallback.provider.id, fallback.model.id);
+          if (fallback !== undefined && fallbackRoute !== undefined && !attemptedRoutes.has(fallbackRoute)) {
             provider = fallback.provider;
             providerModel = fallback.model;
-            routeModelId = encodeModelId(provider.id, providerModel.id);
+            routeModelId = fallbackRoute;
+            attemptedRoutes.add(fallbackRoute);
             continue;
           }
         }
@@ -392,9 +418,13 @@ async function streamResponse(
 }
 
 async function recordProviderOutcome(options: GatewayOptions, providerId: string, modelId: string, status: number, retryAfter?: string | number): Promise<void> {
-  if (status === 404 || status === 429) {
+  if (isFailoverStatus(status)) {
     await options.onProviderOutcome?.({ providerId, modelId, statusCode: status, ...(retryAfter === undefined ? {} : { retryAfter }) });
   }
+}
+
+function isFailoverStatus(status: number): boolean {
+  return status === 404 || status === 429 || status >= 500;
 }
 
 function providerContext(request: FastifyRequest, signal: AbortSignal): import("./provider-contract.js").ProviderRequestContext {

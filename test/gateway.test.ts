@@ -160,8 +160,8 @@ describe("Anthropic gateway", () => {
     }
   });
 
-  it("feeds live 404 and 429 outcomes back to automatic selection", async () => {
-    const outcomes: Array<{ providerId: string; modelId: string; statusCode: 404 | 429; retryAfter?: string | number }> = [];
+  it("feeds live availability failures back to automatic selection", async () => {
+    const outcomes: Array<{ providerId: string; modelId: string; statusCode: number; retryAfter?: string | number }> = [];
     const server = createGatewayServer({
       token: "test-token",
       providers: [fakeProvider({ async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429, retryAfter: 14_125 }; } })],
@@ -175,8 +175,8 @@ describe("Anthropic gateway", () => {
     } finally { await server.close(); }
   });
 
-  it("fails over before model output even after keepalive pings", async () => {
-    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { await new Promise((resolve) => setTimeout(resolve, 10)); throw { kind: "rate_limit", message: "busy", statusCode: 429 }; } });
+  it("fails over on an overloaded model before output even after keepalive pings", async () => {
+    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { await new Promise((resolve) => setTimeout(resolve, 10)); throw { kind: "overloaded", message: "busy", statusCode: 503 }; } });
     let receivedByFallback: unknown;
     const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }], async *streamMessage(request) { receivedByFallback = request; yield* events; } });
     const failures: string[] = [];
@@ -190,10 +190,26 @@ describe("Anthropic gateway", () => {
       expect(response.statusCode).toBe(200);
       expect(response.body).toContain("event: ping");
       expect(response.body).toContain('"text":"hello"');
+      expect(response.body).toContain(`"model":"${encodeModelId("healthy", "model-b")}"`);
       expect(failures).toEqual(["exhausted/model-a"]);
       expect(systemText(receivedByFallback)).toContain('Active provider ID: "healthy"');
       expect(systemText(receivedByFallback)).toContain('Active model ID: "model-b"');
       expect(systemText(receivedByFallback)).not.toContain('Active model ID: "model-a"');
+    } finally { await server.close(); }
+  });
+
+  it("fails over non-streaming retries without returning a streamed response", async () => {
+    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { throw { kind: "overloaded", message: "busy", statusCode: 503 }; } });
+    const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }] });
+    const server = createGatewayServer({
+      token: "test-token", providers: [exhausted, healthy],
+      selectFallback: async () => ({ provider: healthy, model: healthy.models[0]! }),
+    });
+    try {
+      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: encodeModelId("exhausted", "model-a"), messages: [], max_tokens: 10, stream: false } });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-type"]).toContain("application/json");
+      expect(response.json()).toMatchObject({ model: encodeModelId("healthy", "model-b"), content: [{ text: "hello" }] });
     } finally { await server.close(); }
   });
 

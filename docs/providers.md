@@ -44,6 +44,8 @@ generic OpenAI-compatible presets are `best-effort` until their exact model
 passes the contract suite. A matching API key does **not** imply protocol
 compatibility.
 
+Anonymous Zen uses the same literal `public` bearer credential as OpenCode. The live Zen model list is intersected with refreshable models.dev metadata; anonymous sessions keep only entries currently marked free, non-deprecated, tool-capable, and mapped to an explicit protocol. No free model ID is bundled in AlfaCode.
+
 ## Integration
 
 `createWireProvider` is the composable runtime boundary for catalog-defined

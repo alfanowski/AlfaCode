@@ -1,9 +1,9 @@
 # AlfaCode
 
-AlfaCode runs the real Claude Code runtime as a separate, isolated command while routing model requests through a local multi-provider gateway.
+AlfaCode is an independent terminal coding agent with its own UI, provider manager, and multi-provider gateway. Its execution engine is the pinned Claude Agent SDK/Claude Code runtime, so tools, permissions, sessions, subagents, skills, and project settings retain Claude Code semantics without reusing Claude Code's terminal UI.
 
 ```text
-alfacode -> local Anthropic-compatible gateway -> configured AI provider
+AlfaCode TUI -> pinned Claude Code engine -> local gateway -> any configured provider
 ```
 
 The normal `claude` command and its configuration are left untouched. AlfaCode uses its own Claude config directory, session history, model cache, provider credentials, and gateway process.
@@ -18,7 +18,7 @@ The normal `claude` command and its configuration are left untouched. AlfaCode u
 ## Goals
 
 - Launch a fully isolated Claude Code instance with `alfacode`.
-- Populate Claude Code's `/model` picker from every configured provider.
+- Aggregate every configured provider in AlfaCode's live `/model` picker.
 - Preserve tool calls, tool results, streaming, usage, and provider reasoning state.
 - Keep provider credentials outside project files and Claude settings.
 - Fail visibly when a provider cannot represent a requested capability.
@@ -38,7 +38,7 @@ Requirements:
 
 - Node.js 24 or newer
 - pnpm
-- Claude Code installed as `claude`
+- macOS for native Keychain-backed interactive credential storage
 
 ```bash
 pnpm install
@@ -51,7 +51,14 @@ For this checkout, install a local `alfacode` launcher in a directory already on
 
 ## Configure and launch
 
-On first interactive launch, AlfaCode runs a small outer-terminal wizard. It selects a provider, invokes macOS Keychain for the API key, and then starts the real Claude Code TUI with automatic model selection. Pin a model later only when you need a stable override. The API key is never collected through a Claude prompt, transcript, plugin, or project configuration.
+On first launch, AlfaCode opens its own provider screen. Credentials are entered in a masked TUI field, saved directly to macOS Keychain, verified, and never sent through a model prompt or transcript. After setup, `alfacode` opens the native AlfaCode chat UI. `/connect`, `/providers`, `/model`, `/usage`, `/agents`, and `/permissions` all stay inside that UI.
+
+OpenCode Zen supports two clearly separated connection modes:
+
+- **Free public models**: no account, billing setup, or API key. AlfaCode uses Zen's public access token and admits only currently listed free models with verified protocol and tool metadata.
+- **Zen API key**: optional account-scoped catalog and billing limits controlled by OpenCode.
+
+All configured providers are active simultaneously. Automatic selection ranks the combined live catalog, records failures and usage locally, and can fail over to another model/provider before output begins. “Preferred provider” only controls an explicit persisted pin; it does not disable the others.
 
 Configure a Google provider explicitly using the macOS Keychain prompt:
 
@@ -59,7 +66,7 @@ Configure a Google provider explicitly using the macOS Keychain prompt:
 alfacode connect google --id google-personal
 ```
 
-With no credential flag, AlfaCode opens its interactive provider picker, allocates a short local provider label automatically, and asks macOS Keychain to read the API key securely from the terminal. To add another provider later, exit the Claude runtime and run `alfacode connect` again. The key is never written to AlfaCode or Claude configuration and never enters a model transcript. `--id` accepts only a local label; values that look like credentials are rejected before anything is stored.
+With no credential flag, `alfacode connect` opens the same native connection flow used by `/connect`. Add, reconnect, select, or delete providers from `/providers`; deleting requires confirmation and also removes AlfaCode's matching Keychain record. The key is never written to AlfaCode or Claude configuration and never enters a model transcript. `--id` accepts only a local label; values that look like credentials are rejected before anything is stored.
 
 Or reference an existing environment variable without persisting the key:
 
@@ -92,14 +99,14 @@ Provider choices are descriptor-driven rather than model-hardcoded:
 
 ```bash
 alfacode connect google --id personal
-alfacode connect zen --id zen --api-key-env OPENCODE_API_KEY
+alfacode connect zen                            # choose public access or an API key in the TUI
 alfacode connect anthropic --id anthropic --api-key-env ANTHROPIC_API_KEY
 alfacode connect openai-compatible --id local --base-url http://127.0.0.1:4000/v1 --api-key-env LOCAL_API_KEY
 ```
 
-`alfacode models` displays live availability, advertised capabilities, quota state, and context/output headroom. Automatic selection first uses provider-reported normalized remaining capacity when it exists, then rolling local usage and fair scheduling. A 404 removes a model from consideration. A 429 applies the provider's precise `Retry-After` delay when available, otherwise a conservative fallback cooldown, and transparently tries the next eligible model before any response content is emitted. Google AI Studio does not expose exact remaining RPM/TPM/RPD through its model API, so AlfaCode deliberately reports that quota as unknown instead of inventing a number.
+`/model` and `alfacode models` display the dynamically discovered catalog; no model ID is bundled or hardcoded. Automatic selection first uses provider-reported normalized remaining capacity when it exists, then proven compatibility, rolling local usage, failures, and fair scheduling. A 404 removes a model from consideration. A 429 or retryable 5xx applies a cooldown and transparently tries the next eligible model before any response content is emitted. Google AI Studio does not expose exact remaining RPM/TPM/RPD through its model API, so AlfaCode deliberately reports that quota as unknown instead of inventing a number.
 
-`alfacode` and `alfacode launch` pass subsequent Claude Code arguments through unchanged. `alfacode run` is the non-interactive alias; use `--` before Claude flags that could otherwise be interpreted by AlfaCode.
+`alfacode` starts the native UI. `alfacode launch` is an explicitly named compatibility escape hatch that opens Anthropic's original terminal UI against the same gateway. `alfacode run` is the non-interactive compatibility alias; use `--` before Claude flags that could otherwise be interpreted by AlfaCode.
 
 ### Configuration migration
 
@@ -109,7 +116,7 @@ Configuration directories and files are owner-only (`0700`/`0600`), written atom
 
 ### Terminal behavior
 
-The outer UI is deliberately conservative: it is line-oriented, supports `NO_COLOR` and `TERM=dumb`, and refuses interactive credential setup outside a TTY. This keeps setup usable over SSH, tmux, screen, basic terminals, and screen readers. It does not replace or alter Claude Code's own TUI.
+The native Ink UI uses a restrained cyan/magenta AlfaCode palette, keyboard navigation, searchable models, masked secret entry, explicit permission cards, live tool/subagent events, and a local content-free usage view. Interactive setup refuses to run outside a TTY; CI keeps the environment-variable workflow.
 
 Launch the isolated runtime:
 
@@ -118,10 +125,12 @@ alfacode
 alfacode -- --model alfacode-anthropic/google-personal/<model-id>
 ```
 
-Inside the session, `/model` shows only currently callable, tool-capable models discovered from configured providers.
+Inside the session, `/model` shows only currently callable, tool-capable models discovered from all configured providers.
 Use `alfacode default <model-id>` to persist a manual AlfaCode pin, or `alfacode default auto` to return to automatic selection.
 
-Claude Code may still print that a project `.claude/settings.json` model pin applies on restart. That message describes Claude's own project setting; AlfaCode's launch-time `ANTHROPIC_MODEL` has higher precedence and automatic selection is recalculated on the next AlfaCode launch. AlfaCode also appends an authoritative runtime identity with the actual provider and model to every request, including requests retried through automatic failover.
+AlfaCode appends an authoritative runtime identity with the actual provider and model to every request, including requests retried through automatic failover.
+
+The Agent SDK and embedded Claude Code binary are exact-pinned together. A normal global `claude` update therefore cannot silently change AlfaCode. AlfaCode upgrades the pin only after its compatibility suite passes; an unexpected engine version is surfaced in the UI instead of being accepted implicitly.
 
 ## Data and cost warning
 

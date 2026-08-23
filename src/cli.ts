@@ -13,6 +13,11 @@ import { homedir } from "node:os";
 import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
 import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
+import { runProviderSetup, type ProviderSetupOptions, type ProviderSetupResult } from "./setup-tui.js";
+import { AgentSession } from "./agent-session.js";
+import { PermissionBroker } from "./permission-broker.js";
+import { runChatTui, type ChatAction } from "./chat-tui.js";
+import { PINNED_CLAUDE_CODE_VERSION, checkEngineCompatibility } from "./engine-compatibility.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -40,7 +45,7 @@ export type QueryUsage = (query: UsageQuery) => Promise<UsageSummary>;
 
 export interface CreateCliOptions {
   readonly configStore?: ConfigStore;
-  readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "delete">>;
+  readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>;
   readonly startRuntime?: StartRuntime;
   readonly discoverModels?: DiscoverModels;
   readonly queryUsage?: QueryUsage;
@@ -49,6 +54,9 @@ export interface CreateCliOptions {
   readonly legacyConfigPath?: string;
   /** Platform-supplied catalog; the bundled catalog is only a bootstrap fallback. */
   readonly providerDescriptors?: readonly ProviderDescriptor[];
+  readonly providerSetup?: (options: ProviderSetupOptions) => Promise<void>;
+  readonly startAgentSession?: typeof AgentSession.start;
+  readonly chatTui?: typeof runChatTui;
 }
 
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
@@ -114,6 +122,56 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return provider;
   };
 
+  const saveTuiProvider = async (result: ProviderSetupResult, replaceProviderId?: string, forceAdd = false): Promise<void> => {
+    if (keychain.storeSecret === undefined || keychain.delete === undefined) throw new Error("Native credential storage is unavailable");
+    const config = await loadConfig();
+    const replaceable = replaceProviderId === undefined
+      ? forceAdd ? undefined : config.providers.find((item) => item.type === result.descriptor.configType)
+      : config.providers.find((item) => item.id === replaceProviderId);
+    const id = replaceable?.id ?? availableProviderId(localProviderId(result.descriptor.id), config.providers);
+    const baseUrl = result.baseUrl;
+    if (result.descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) throw new Error("Enter an absolute http(s) base URL");
+    const provider: ProviderRecord = {
+      id,
+      type: result.descriptor.configType,
+      ...(result.apiKey === undefined ? {} : { apiKey: { kind: "keychain" as const, service: keychainService, account: id } }),
+      ...((baseUrl === undefined && result.descriptor.configurationOptions === undefined) ? {} : {
+        options: { ...(result.descriptor.configurationOptions ?? {}), ...(baseUrl === undefined ? {} : { baseUrl }) },
+      }),
+    };
+    const previousKeychain = replaceable?.apiKey?.kind === "keychain" && replaceable.apiKey.service === keychainService
+      ? replaceable.apiKey
+      : undefined;
+    if (result.apiKey !== undefined && previousKeychain !== undefined && keychain.retrieve === undefined) {
+      throw new Error("Credential backup is unavailable; refusing to overwrite the existing Keychain item");
+    }
+    const previousSecret = previousKeychain === undefined || keychain.retrieve === undefined
+      ? undefined
+      : await keychain.retrieve(previousKeychain.account, previousKeychain.service);
+    if (result.apiKey !== undefined) await keychain.storeSecret(id, result.apiKey, keychainService);
+    try {
+      const providers = replaceable === undefined ? [...config.providers, provider] : config.providers.map((item) => item.id === replaceable.id ? provider : item);
+      const draft: AlfaCodeConfig = { ...config, providers, defaultProviderId: id };
+      if (runtimeStarter === undefined) throw new Error("Gateway runtime is unavailable");
+      const probe = await runtimeStarter({ provider, config: draft, purpose: "discovery" });
+      try {
+        const callable = probe.modelCandidates?.filter((model) => model.providerId === id && model.availability === "available" && model.capabilities.tools) ?? [];
+        if (callable.length === 0) throw new Error(probe.warnings?.join("; ") || "No tool-capable model is available for this credential");
+      } finally { await probe.close(); }
+      await configStore.write(draft);
+    } catch (error) {
+      if (result.apiKey !== undefined) {
+        if (previousSecret === undefined) await keychain.delete(id, keychainService).catch(() => undefined);
+        else await keychain.storeSecret(previousKeychain!.account, previousSecret, previousKeychain!.service).catch(() => undefined);
+      }
+      throw error;
+    }
+    if (result.apiKey === undefined && previousKeychain !== undefined) {
+      await keychain.delete(previousKeychain.account, previousKeychain.service).catch(() => undefined);
+    }
+  };
+  const connectFromTui = (result: ProviderSetupResult): Promise<void> => saveTuiProvider(result);
+
   const setDefaultModel = async (model: string): Promise<void> => {
     const decoded = decodeModelId(model);
     if (decoded === undefined) throw new Error("Use a model id from `alfacode models`, for example alfacode-anthropic/google/model-id");
@@ -153,15 +211,17 @@ export function createCli(options: CreateCliOptions = {}): Command {
     ui.write("Default model: automatic selection.");
   };
 
-  const launch = async (args: readonly string[]): Promise<void> => {
+  const classicLaunch = async (args: readonly string[]): Promise<void> => {
     let config = await loadConfig();
-    if (config.providers.length === 0) {
+    const unavailable = await selectedCredentialUnavailable(config, keychain);
+    if (config.providers.length === 0 || unavailable !== undefined) {
       requireInteractive(ui.interactive);
-      ui.write("Welcome to AlfaCode. Connect a provider before launching Claude Code.");
-      const type = await ui.select("Choose a provider", descriptors.map(toChoice));
-      await connect(type, {});
+      await (options.providerSetup ?? runProviderSetup)({
+        descriptors,
+        ...(unavailable === undefined ? {} : { notice: `The saved provider '${unavailable}' has no credential. Reconnect it to continue.` }),
+        connect: connectFromTui,
+      });
       config = await loadConfig();
-      ui.write("Model selection is automatic. Run `alfacode default` later to pin a model.");
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     const provider = await selectedProvider(config);
@@ -182,11 +242,97 @@ export function createCli(options: CreateCliOptions = {}): Command {
     }
   };
 
+  const removeProvider = async (id: string, deleteCredential: boolean): Promise<void> => {
+    const config = await loadConfig();
+    const provider = config.providers.find((item) => item.id === id);
+    if (provider === undefined) throw new Error(`Provider not found: ${id}`);
+    if (deleteCredential && provider.apiKey?.kind === "keychain" && provider.apiKey.service === keychainService && keychain.delete !== undefined) {
+      await keychain.delete(provider.apiKey.account, provider.apiKey.service).catch(() => undefined);
+    }
+    await configStore.update((current) => {
+      const remaining = current.providers.filter((item) => item.id !== id);
+      const defaultProviderId = current.defaultProviderId === id ? remaining[0]?.id : current.defaultProviderId;
+      return { version: 1, providers: remaining, ...(defaultProviderId === undefined ? {} : { defaultProviderId }) };
+    });
+  };
+
+  const nativeLaunch = async (args: readonly string[]): Promise<void> => {
+    if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
+    let nextAction: ChatAction = { type: "connect" };
+    while (nextAction.type !== "exit") {
+      let config = await loadConfig();
+      const unavailable = await selectedCredentialUnavailable(config, keychain);
+      if (config.providers.length === 0 || unavailable !== undefined) {
+        requireInteractive(ui.interactive);
+        await (options.providerSetup ?? runProviderSetup)({
+          descriptors,
+          ...(unavailable === undefined ? {} : { notice: `The saved provider '${unavailable}' has no credential. Reconnect it to continue.` }),
+          connect: connectFromTui,
+        });
+        config = await loadConfig();
+      }
+      const provider = await selectedProvider(config);
+      const runtime = await runtimeStarter({ provider, config });
+      const permissions = new PermissionBroker();
+      let session: AgentSession | undefined;
+      try {
+        const resume = resumeArgument(args);
+        session = await (options.startAgentSession ?? AgentSession.start)({
+          runtime,
+          cwd: process.cwd(),
+          canUseTool: permissions.canUseTool,
+          ...(resume === undefined ? {} : { resume }),
+        });
+        const identity = {
+          sessionId: "pending",
+          model: runtime.defaultModelId ?? "automatic",
+          claudeCodeVersion: PINNED_CLAUDE_CODE_VERSION,
+          compatibility: checkEngineCompatibility(PINNED_CLAUDE_CODE_VERSION),
+          capabilities: [] as string[],
+        };
+        nextAction = await (options.chatTui ?? runChatTui)({
+          session,
+          identity,
+          config,
+          models: runtime.modelCandidates ?? [],
+          permissions,
+          loadUsage: () => options.queryUsage === undefined
+            ? queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), { limit: 100 })
+            : options.queryUsage({ limit: 100 }),
+        });
+      } finally {
+        permissions.close();
+        if (session === undefined) await runtime.close(); else await session.close();
+      }
+
+      const action = nextAction;
+      if (action.type === "connect") {
+        await (options.providerSetup ?? runProviderSetup)({ descriptors, connect: (result) => saveTuiProvider(result, undefined, true) });
+      } else if (action.type === "delete-provider") {
+        await removeProvider(action.providerId, true);
+      } else if (action.type === "reconnect-provider") {
+        const current = (await loadConfig()).providers.find((item) => item.id === action.providerId);
+        if (current === undefined) throw new Error(`Provider not found: ${action.providerId}`);
+        const descriptor = descriptorForProvider(current, descriptors);
+        if (descriptor === undefined) throw new Error(`No connector is available for provider type '${current.type}'`);
+        await (options.providerSetup ?? runProviderSetup)({ descriptors: [descriptor], notice: `Reconnect '${current.id}'`, connect: (result) => saveTuiProvider(result, current.id) });
+      } else if (action.type === "set-default-provider") {
+        await configStore.update((current) => ({ ...current, defaultProviderId: action.providerId }));
+      }
+    }
+  };
+
   const program = new Command();
-  program.name("alfacode").description("Launch Claude Code through the local AlfaCode gateway").argument("[args...]", "Arguments passed unchanged to Claude").allowUnknownOption(true).action(launch);
+  program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true).action(nativeLaunch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
     .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely").option("--base-url <url>", "Base URL for an OpenAI-compatible provider")
     .action(async (type: string | undefined, flags: ConnectFlags) => {
+      if (flags.apiKeyEnv === undefined && flags.baseUrl === undefined && !flags.keychain && flags.id === undefined) {
+        const choices = type === undefined ? descriptors : descriptors.filter((item) => item.id === type);
+        if (choices.length === 0) throw new Error(`Unsupported provider type: ${type}`);
+        await (options.providerSetup ?? runProviderSetup)({ descriptors: choices, connect: (result) => saveTuiProvider(result, undefined, true) });
+        return;
+      }
       const selectedType = type ?? (ui.interactive ? await ui.select("Choose a provider", descriptors.map(toChoice)) : undefined);
       if (selectedType === undefined) throw new Error("Specify a provider type in a non-interactive terminal");
       await connect(selectedType, flags);
@@ -254,12 +400,31 @@ export function createCli(options: CreateCliOptions = {}): Command {
     ui.write(`Config: ${report.configPath}`); ui.write(`Providers: ${report.providers.length}`); ui.write(`Default provider: ${report.defaultProviderId ?? "not set"}`); ui.write(`Claude state: ${report.isolatedClaudeConfig}`); ui.write(`Status: ${report.status}`);
   });
   program.command("config").command("path").action(() => ui.write(configStore.path));
-  program.command("launch [args...]").allowUnknownOption(true).action(launch);
+  program.command("launch [args...]").description("Compatibility mode using Anthropic's original terminal UI").allowUnknownOption(true).action(classicLaunch);
   program.command("run [args...]").allowUnknownOption(true).option("--non-interactive", "Fail instead of prompting for setup").action(async (args: string[], flags: { nonInteractive?: boolean }) => {
     if (flags.nonInteractive && !ui.interactive && (await loadConfig()).providers.length === 0) throw new Error("No provider configured. Use `alfacode connect google --api-key-env NAME` first.");
-    await launch(args);
+    await classicLaunch(args);
   });
   return program;
+}
+
+async function selectedCredentialUnavailable(
+  config: AlfaCodeConfig,
+  keychain: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>,
+): Promise<string | undefined> {
+  const provider = config.providers.find((item) => item.id === config.defaultProviderId) ?? config.providers[0];
+  if (provider === undefined) return undefined;
+  if ((provider.type === "opencode-zen" || provider.type === "zen") && provider.apiKey === undefined) return undefined;
+  if (provider.apiKey === undefined) return provider.id;
+  if (provider.apiKey.kind === "env") return process.env[provider.apiKey.name] ? undefined : provider.id;
+  if (keychain.retrieve === undefined) return undefined;
+  return await keychain.retrieve(provider.apiKey.account, provider.apiKey.service) ? undefined : provider.id;
+}
+
+function resumeArgument(args: readonly string[]): string | undefined {
+  const index = args.findIndex((value) => value === "--resume" || value === "-r");
+  const session = index < 0 ? undefined : args[index + 1];
+  return session?.startsWith("-") ? undefined : session;
 }
 
 async function discoverModelsFromGateway(start: StartRuntime, input: { provider: ProviderRecord; config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
@@ -329,6 +494,11 @@ function availableProviderId(base: string, providers: readonly ProviderRecord[])
     if (!existing.has(candidate)) return candidate;
   }
   throw new Error(`Unable to allocate a local provider id for ${base}`);
+}
+
+function descriptorForProvider(provider: ProviderRecord, descriptors: readonly ProviderDescriptor[]): ProviderDescriptor | undefined {
+  const matching = descriptors.filter((descriptor) => descriptor.configType === provider.type);
+  return matching.find((descriptor) => Object.entries(descriptor.configurationOptions ?? {}).every(([key, value]) => provider.options?.[key] === value)) ?? matching[0];
 }
 
 function renderModel(model: GatewayModel): string {
