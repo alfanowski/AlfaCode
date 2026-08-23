@@ -18,7 +18,7 @@ describe("launchClaude", () => {
       contextWindowTokens: 262_144,
       extraEnv: { ALFACODE_GATEWAY_URL: "http://127.0.0.1:4317" },
       scrubEnvironmentKeys: ["CUSTOM_GOOGLE_KEY"],
-      environment: { ANTHROPIC_API_KEY: "leak", GEMINI_API_KEY: "leak", CUSTOM_GOOGLE_KEY: "leak", AWS_PROFILE: "wrong", PATH: "/bin" },
+      environment: { ANTHROPIC_API_KEY: "leak", GEMINI_API_KEY: "leak", CUSTOM_GOOGLE_KEY: "leak", AWS_PROFILE: "wrong", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "9999999", DISABLE_AUTO_COMPACT: "1", PATH: "/bin" },
       spawner: async (next) => { request = next; return 17; },
     });
 
@@ -36,7 +36,7 @@ describe("launchClaude", () => {
       DISABLE_ERROR_REPORTING: "1",
       DISABLE_FEEDBACK_COMMAND: "1",
       CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
-      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS: "0",
+      CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "0",
       ANTHROPIC_DEFAULT_OPUS_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_SONNET_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "gemini-3-pro",
@@ -46,6 +46,8 @@ describe("launchClaude", () => {
     expect(request?.env.GEMINI_API_KEY).toBeUndefined();
     expect(request?.env.CUSTOM_GOOGLE_KEY).toBeUndefined();
     expect(request?.env.AWS_PROFILE).toBeUndefined();
+    expect(request?.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
+    expect(request?.env.DISABLE_AUTO_COMPACT).toBeUndefined();
     await rm(configDir, { recursive: true, force: true });
   });
 
@@ -61,9 +63,9 @@ describe("launchClaude", () => {
       claudeArgs: [],
       baseUrl: "http://gateway",
       authToken: "token",
-      extraEnv: { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS: "1" },
+      extraEnv: { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "1" },
     });
-    expect(result.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS).toBe("1");
+    expect(result.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("1");
     expect(result.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined();
   });
 });

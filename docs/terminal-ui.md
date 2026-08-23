@@ -1,6 +1,6 @@
 # AlfaCode outer terminal UX
 
-AlfaCode owns provider configuration outside Claude Code. Its terminal UI is intentionally a small line-oriented wizard rather than an embedded Claude plugin or a custom TUI inside Claude Code.
+AlfaCode owns provider configuration outside Claude Code. Its terminal UI is intentionally a small line-oriented wizard rather than an embedded Claude plugin or a custom TUI inside Claude Code. Provider choices come from descriptors: Google AI Studio, OpenCode Zen, Anthropic, and custom OpenAI-compatible endpoints.
 
 ## Trust boundary
 
@@ -12,7 +12,7 @@ The API key never enters a Claude prompt, transcript, skill, plugin, project set
 
 | Environment | Behaviour |
 | --- | --- |
-| Interactive TTY | First-run onboarding can select Google, choose a provider id, ask Keychain for a key, and select a default model. |
+| Interactive TTY | First-run onboarding can select a provider, choose a provider id, and ask Keychain for a key. Model selection remains automatic unless the user later pins one with `alfacode default`. |
 | `NO_COLOR` or `TERM=dumb` | Text-only output. No color carries meaning. |
 | No TTY / CI | No prompts or Keychain setup. Use `connect --api-key-env NAME` then `run --non-interactive`. |
 
@@ -20,7 +20,11 @@ The UI uses numbered selections and text prompts, not terminal cursor control, s
 
 ## Claude Code boundary
 
-AlfaCode does not inject provider forms, a usage dashboard, or secret management into Claude Code's TUI. Claude receives only a loopback gateway URL and a process-local, short-lived gateway token. The separate `usage` command currently reports that no local ledger exists; a future ledger must remain local and redact credentials.
+AlfaCode does not inject provider forms, a usage dashboard, or secret management into Claude Code's TUI. Claude receives only a loopback gateway URL and a process-local, short-lived gateway token. The separate `usage` command queries the local content-free usage ledger; it reports token accounting without provider credentials, prompts, transcripts, or billing data.
+
+## Model discovery and pins
+
+Discovery is injected at the outer CLI boundary. A platform implementation can return model availability, advertised capabilities, quota state, and context/output headroom; AlfaCode renders every supplied field and does not contain a model allowlist. `alfacode default <model-id>` writes an explicit pin in AlfaCode metadata. `alfacode default auto` deletes that pin and returns control to the platform selector for later launches.
 
 ## Legacy import
 

@@ -6,6 +6,9 @@ import { launchClaude, type ClaudeLaunchOptions } from "./claude-launcher.js";
 import { keychainService, MacOSKeychain } from "./secrets.js";
 import { startRuntime } from "./runtime.js";
 import { createTerminalUi, requireInteractive, type TerminalUi } from "./terminal-ui.js";
+import { providerDescriptors, type ProviderDescriptor } from "./provider-descriptors.js";
+import { UsageLedger, type UsageQuery, type UsageSummary } from "./usage-ledger.js";
+import { join } from "node:path";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -19,29 +22,39 @@ export interface RuntimeHandle {
 export interface GatewayModel {
   readonly id: string;
   readonly displayName: string;
+  readonly availability?: "available" | "deprecated" | "account-validation-required" | "unknown";
+  readonly capabilities?: Readonly<Record<string, boolean | string>>;
+  readonly quota?: { readonly state: "available" | "limited" | "exhausted" | "unknown"; readonly remainingRequests?: number; readonly retryAfterSeconds?: number };
+  readonly headroom?: { readonly contextWindowTokens?: number; readonly availableInputTokens?: number; readonly maxOutputTokens?: number };
 }
 
 export type StartRuntime = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<RuntimeHandle>;
 export type DiscoverModels = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<readonly GatewayModel[]>;
+export type QueryUsage = (query: UsageQuery) => Promise<UsageSummary>;
 
 export interface CreateCliOptions {
   readonly configStore?: ConfigStore;
   readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "delete">>;
   readonly startRuntime?: StartRuntime;
   readonly discoverModels?: DiscoverModels;
+  readonly queryUsage?: QueryUsage;
   readonly launch?: (options: ClaudeLaunchOptions) => Promise<number>;
   readonly ui?: TerminalUi;
   readonly legacyConfigPath?: string;
+  /** Platform-supplied catalog; the bundled catalog is only a bootstrap fallback. */
+  readonly providerDescriptors?: readonly ProviderDescriptor[];
 }
 
-interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; }
+interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
 interface RemoveFlags { readonly deleteKeychain?: boolean; }
+interface UsageFlags { readonly json?: boolean; readonly provider?: string; readonly model?: string; readonly session?: string; readonly limit?: string; }
 
 export function createCli(options: CreateCliOptions = {}): Command {
   const configStore = options.configStore ?? new ConfigStore();
   const keychain = options.keychain ?? new MacOSKeychain();
   const runtimeStarter = options.startRuntime;
   const ui = options.ui ?? createTerminalUi();
+  const descriptors = options.providerDescriptors ?? providerDescriptors;
   let migrationChecked = false;
 
   const loadConfig = async (): Promise<AlfaCodeConfig> => {
@@ -67,10 +80,15 @@ export function createCli(options: CreateCliOptions = {}): Command {
   };
 
   const connect = async (type: string, flags: ConnectFlags): Promise<ProviderRecord> => {
-    if (type !== "google") throw new Error(`Unsupported provider type: ${type}`);
+    const descriptor = descriptors.find((item) => item.id === type);
+    if (descriptor === undefined) throw new Error(`Unsupported provider type: ${type}. Use: ${descriptors.map((item) => item.id).join(", ")}`);
     if (flags.apiKeyEnv !== undefined && flags.keychain) throw new Error("Use either --api-key-env or --keychain, not both");
-    const id = flags.id ?? (ui.interactive ? await ui.ask("Provider id", type) : type);
+    const id = flags.id ?? (ui.interactive ? await ui.ask("Provider id", descriptor.id) : descriptor.id);
     if (id.length === 0) throw new Error("Provider id is required");
+    const baseUrl = flags.baseUrl ?? (descriptor.requiresBaseUrl && ui.interactive ? await ui.ask(`${descriptor.displayName} base URL`) : undefined);
+    if (descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) {
+      throw new Error(`${descriptor.displayName} requires an absolute http(s) --base-url`);
+    }
     const useKeychain = flags.keychain || flags.apiKeyEnv === undefined;
     if (useKeychain) requireInteractive(ui.interactive);
     const apiKey: SecretReference = flags.apiKeyEnv === undefined
@@ -79,9 +97,14 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const config = await loadConfig();
     if (config.providers.some((item) => item.id === id)) throw new Error(`Provider already exists: ${id}`);
     if (useKeychain) await keychain.store(id, "alfacode");
-    const provider: ProviderRecord = { id, type, apiKey };
+    const provider: ProviderRecord = {
+      id,
+      type: descriptor.configType,
+      apiKey,
+      ...(baseUrl === undefined ? {} : { options: { baseUrl } }),
+    };
     await configStore.update((current) => ({ ...current, providers: [...current.providers, provider], defaultProviderId: current.defaultProviderId ?? id }));
-    ui.write(`Connected ${id} (${type}) using ${apiKey.kind === "env" ? `environment variable ${apiKey.name}` : "macOS Keychain"}.`);
+    ui.write(`Connected ${id} (${descriptor.displayName}) using ${apiKey.kind === "env" ? `environment variable ${apiKey.name}` : "macOS Keychain"}.`);
     return provider;
   };
 
@@ -108,20 +131,31 @@ export function createCli(options: CreateCliOptions = {}): Command {
     await setDefaultModel(model);
   };
 
+  const clearDefaultModel = async (): Promise<void> => {
+    const config = await loadConfig();
+    const provider = await selectedProvider(config);
+    await configStore.update((current) => ({
+      ...current,
+      providers: current.providers.map((item) => {
+        if (item.id !== provider.id || item.options?.defaultModel === undefined) return item;
+        const { defaultModel: _pinnedModel, ...remainingOptions } = item.options;
+        if (Object.keys(remainingOptions).length > 0) return { ...item, options: remainingOptions };
+        const { options: _removedOptions, ...withoutOptions } = item;
+        return withoutOptions;
+      }),
+    }));
+    ui.write("Default model: automatic selection.");
+  };
+
   const launch = async (args: readonly string[]): Promise<void> => {
     let config = await loadConfig();
     if (config.providers.length === 0) {
       requireInteractive(ui.interactive);
       ui.write("Welcome to AlfaCode. Connect a provider before launching Claude Code.");
-      const type = await ui.select("Choose a provider", [{ value: "google", label: "Google AI Studio / Gemini" }]);
+      const type = await ui.select("Choose a provider", descriptors.map(toChoice));
       await connect(type, {});
       config = await loadConfig();
-      try {
-        await chooseDefaultModel();
-        config = await loadConfig();
-      } catch (error: unknown) {
-        ui.write(`Model selection skipped: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      ui.write("Model selection is automatic. Run `alfacode default` later to pin a model.");
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     const provider = await selectedProvider(config);
@@ -144,8 +178,12 @@ export function createCli(options: CreateCliOptions = {}): Command {
   const program = new Command();
   program.name("alfacode").description("Launch Claude Code through the local AlfaCode gateway").argument("[args...]", "Arguments passed unchanged to Claude").allowUnknownOption(true).action(launch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
-    .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely")
-    .action(async (type: string | undefined, flags: ConnectFlags) => { await connect(type ?? "google", flags); });
+    .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely").option("--base-url <url>", "Base URL for an OpenAI-compatible provider")
+    .action(async (type: string | undefined, flags: ConnectFlags) => {
+      const selectedType = type ?? (ui.interactive ? await ui.select("Choose a provider", descriptors.map(toChoice)) : undefined);
+      if (selectedType === undefined) throw new Error("Specify a provider type in a non-interactive terminal");
+      await connect(selectedType, flags);
+    });
 
   const providers = program.command("providers").description("List, select, and remove provider metadata");
   providers.command("list").action(async () => {
@@ -183,19 +221,24 @@ export function createCli(options: CreateCliOptions = {}): Command {
   });
 
   const legacy = program.command("provider").description("Compatibility aliases for provider management");
-  legacy.command("add <type>").option("--id <id>").option("--api-key-env <name>").option("--keychain").action(async (type: string, flags: ConnectFlags) => { await connect(type, flags); });
+  legacy.command("add <type>").option("--id <id>").option("--api-key-env <name>").option("--keychain").option("--base-url <url>").action(async (type: string, flags: ConnectFlags) => { await connect(type, flags); });
 
   program.command("models [provider]").option("--json", "Emit JSON").action(async (providerId: string | undefined, flags: { json?: boolean }) => {
     const config = await loadConfig();
     const models = await catalog(config, await selectedProvider(config, providerId));
     if (flags.json) return ui.write(JSON.stringify(models));
     if (models.length === 0) return ui.write("No models available.");
-    for (const model of models) ui.write(`${model.id}\t${model.displayName}`);
+    for (const model of models) ui.write(renderModel(model));
   });
-  program.command("default [model]").description("Select the default model").action(async (model: string | undefined) => { if (model === undefined) await chooseDefaultModel(); else await setDefaultModel(model); });
-  program.command("usage").option("--json", "Emit JSON").action((flags: { json?: boolean }) => {
-    const result = { available: false, reason: "No local usage ledger is configured yet." };
-    ui.write(flags.json ? JSON.stringify(result) : result.reason);
+  program.command("default [model]").description("Pin a default model, or clear it with 'auto'").action(async (model: string | undefined) => {
+    if (model === undefined) await chooseDefaultModel();
+    else if (model === "auto") await clearDefaultModel();
+    else await setDefaultModel(model);
+  });
+  program.command("usage").option("--json", "Emit JSON").option("--provider <id>").option("--model <id>").option("--session <id>").option("--limit <count>").action(async (flags: UsageFlags) => {
+    const query = usageQuery(flags);
+    const summary = options.queryUsage === undefined ? await queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), query) : await options.queryUsage(query);
+    ui.write(flags.json ? JSON.stringify(summary) : renderUsage(summary));
   });
   program.command("doctor").option("--json", "Emit JSON").action(async (flags: { json?: boolean }) => {
     const config = await loadConfig();
@@ -219,13 +262,66 @@ async function discoverModelsFromGateway(start: StartRuntime, input: { provider:
     if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
     const payload: unknown = await response.json();
     if (!isModelResponse(payload)) throw new Error("Gateway returned an invalid model catalog");
-    return payload.data.map((model) => ({ id: model.id, displayName: model.display_name }));
+    return payload.data.map((model) => ({ id: model.id, displayName: model.display_name, availability: "unknown" }));
   } finally { await runtime.close(); }
 }
 
 function isModelResponse(value: unknown): value is { data: Array<{ id: string; display_name: string }> } {
   return typeof value === "object" && value !== null && "data" in value && Array.isArray(value.data)
     && value.data.every((model) => typeof model === "object" && model !== null && "id" in model && typeof model.id === "string" && "display_name" in model && typeof model.display_name === "string");
+}
+
+function toChoice(descriptor: ProviderDescriptor): { value: string; label: string; hint: string } {
+  return { value: descriptor.id, label: descriptor.displayName, hint: descriptor.description };
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function renderModel(model: GatewayModel): string {
+  const availability = model.availability ?? "unknown";
+  const capabilities = model.capabilities === undefined ? "" : ` capabilities:${Object.entries(model.capabilities).filter(([, value]) => value === true).map(([name]) => name).join(",") || "none"}`;
+  const quota = model.quota === undefined ? "" : ` quota:${model.quota.state}${model.quota.remainingRequests === undefined ? "" : ` (${model.quota.remainingRequests} remaining)`}${model.quota.retryAfterSeconds === undefined ? "" : ` retry:${model.quota.retryAfterSeconds}s`}`;
+  const headroom = model.headroom === undefined ? "" : ` headroom:context=${model.headroom.contextWindowTokens ?? "?"},input=${model.headroom.availableInputTokens ?? "?"},output=${model.headroom.maxOutputTokens ?? "?"}`;
+  return `${model.id}\t${model.displayName}\tavailability:${availability}${capabilities}${quota}${headroom}`;
+}
+
+function usageQuery(flags: UsageFlags): UsageQuery {
+  const limit = flags.limit === undefined ? undefined : Number(flags.limit);
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) throw new Error("--limit must be a positive integer");
+  return {
+    ...(flags.provider === undefined ? {} : { providerId: flags.provider }),
+    ...(flags.model === undefined ? {} : { routeModelId: flags.model }),
+    ...(flags.session === undefined ? {} : { session: flags.session }),
+    ...(limit === undefined ? {} : { limit }),
+  };
+}
+
+async function queryUsageLedger(directory: string, query: UsageQuery): Promise<UsageSummary> {
+  const ledger = await UsageLedger.open(directory);
+  try {
+    return await ledger.query(query);
+  } finally {
+    await ledger.close();
+  }
+}
+
+function renderUsage(summary: UsageSummary): string {
+  const totals = summary.totals;
+  const lines = [
+    `Attempts: ${summary.attempts.length}`,
+    `Tokens: total ${totals.totalTokens} | input ${totals.inputTokens} | output ${totals.outputTokens} | cached ${totals.cachedInputTokens} | reasoning ${totals.reasoningTokens} | tools ${totals.toolTokens}`,
+  ];
+  for (const attempt of summary.attempts) {
+    lines.push(`${attempt.providerId}\t${attempt.routeModelId}\t${attempt.outcome}\tusage:${attempt.usageCompleteness}\ttokens:${attempt.totalTokens ?? "unknown"}`);
+  }
+  return lines.join("\n");
 }
 
 export async function main(argv = process.argv): Promise<void> { await createCli({ startRuntime }).parseAsync(argv); }
