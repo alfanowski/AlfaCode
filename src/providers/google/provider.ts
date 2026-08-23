@@ -106,7 +106,8 @@ export class GoogleProvider {
       };
       yield { type: 'message_delta', stop_reason: mapFinishReason(finishReason, sawToolUse) };
     } catch (error: unknown) {
-      yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error) } };
+      const statusCode = errorStatus(error);
+      yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error), ...(statusCode === undefined ? {} : { statusCode }) } };
     }
   }
 
@@ -274,4 +275,13 @@ function safeErrorMessage(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error);
   // API keys are never sent in URLs by this adapter and must not escape through an SDK error either.
   return text.replace(/(?:AIza|api[_-]?key[=:]\s*)[^\s'"&]+/gi, '[REDACTED]');
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (!isRecord(error)) return undefined;
+  const nested = isRecord(error.error) ? error.error : undefined;
+  const value = error.status ?? error.statusCode ?? error.code ?? nested?.status ?? nested?.code;
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value === 'string' && /^\d{3}$/.test(value)) return Number(value);
+  return undefined;
 }

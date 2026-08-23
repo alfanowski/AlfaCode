@@ -16,6 +16,15 @@ alfacode CLI
 
 Claude Code sends Anthropic Messages API traffic to a single endpoint. The gateway aggregates model catalogs and routes each inference request using the model ID selected in `/model`.
 
+## Dynamic catalog and selection
+
+- Provider-owned account catalogs are authoritative for additions and removals.
+- AlfaCode verifies availability with non-inference endpoints before routing.
+- models.dev supplies refreshable protocol/capability metadata, never credentials or a default-model policy.
+- Selection never parses a model ID, version, display name, or catalog position. Known normalized quota headroom wins; otherwise the privacy-preserving local usage ledger provides fair scheduling.
+- Provider 404/429 outcomes persist into future selection, so retired or exhausted routes are not repeatedly chosen.
+- The context limit passed to Claude Code belongs to the selected model. It is never the smallest unrelated entry in a heterogeneous provider catalog.
+
 ## Model identifiers
 
 Claude Code currently retains discovered gateway models only when their ID contains `claude` or `anthropic`. AlfaCode therefore exposes stable routing IDs:

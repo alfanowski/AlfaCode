@@ -198,6 +198,13 @@ describe('GoogleProvider', () => {
     expect(errors).toEqual([{ type: 'error', error: { type: 'Error', message: 'request failed key=[REDACTED]' } }]);
   });
 
+  it('preserves structured upstream status codes for cooldown learning', async () => {
+    const mock = client();
+    mock.client.models.generateContentStream = async () => { throw Object.assign(new Error('quota exhausted'), { status: 429 }); };
+    expect(await collect(new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() }).stream(baseRequest, context)))
+      .toEqual([{ type: 'error', error: { type: 'Error', message: 'quota exhausted', statusCode: 429 } }]);
+  });
+
   it('persists state with atomic valid JSON', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'alfacode-google-'));
     const path = join(dir, 'state.json');

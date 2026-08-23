@@ -152,6 +152,33 @@ describe("Anthropic gateway", () => {
     }
   });
 
+  it("feeds live 404 and 429 outcomes back to automatic selection", async () => {
+    const outcomes: Array<{ providerId: string; modelId: string; statusCode: 404 | 429 }> = [];
+    const server = createGatewayServer({
+      token: "test-token",
+      providers: [fakeProvider({ async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429 }; } })],
+      onProviderOutcome: async (outcome) => { outcomes.push(outcome); },
+    });
+    try {
+      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
+      expect(response.statusCode).toBe(429);
+      expect(outcomes).toEqual([{ providerId: "mock", modelId: "claude-test", statusCode: 429 }]);
+    } finally { await server.close(); }
+  });
+
+  it("rejects oversized prompts before starting billable inference", async () => {
+    let streamed = false;
+    const provider = fakeProvider({
+      models: [{ id: "claude-test", limits: { maxInputTokens: 5, contextIncludesOutput: false }, capabilities: { tokenCounting: "exact", usageReporting: "final" } }],
+      async *streamMessage() { streamed = true; yield* events; },
+      async countTokens() { return { inputTokens: 12, source: "provider", exact: true }; },
+    });
+    const response = await app(provider).inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("capability_rejected: prompt_too_long");
+    expect(streamed).toBe(false);
+  });
+
   it("forwards unknown fields and translates canonical events in exact SSE order", async () => {
     let received: unknown;
     const response = await app(fakeProvider({

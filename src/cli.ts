@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { decodeModelId } from "./model-id.js";
+import { decodeModelId, encodeModelId } from "./model-id.js";
 import { ConfigStore, migrateLegacyConfig, type AlfaCodeConfig, type ProviderRecord, type SecretReference } from "./config.js";
 import { launchClaude, type ClaudeLaunchOptions } from "./claude-launcher.js";
 import { keychainService, MacOSKeychain } from "./secrets.js";
 import { startRuntime } from "./runtime.js";
 import { createTerminalUi, requireInteractive, type TerminalUi } from "./terminal-ui.js";
-import { providerDescriptors, type ProviderDescriptor } from "./provider-descriptors.js";
+import { descriptorsFromDynamicCatalog, providerDescriptors, type ProviderDescriptor } from "./provider-descriptors.js";
 import { UsageLedger, type UsageQuery, type UsageSummary } from "./usage-ledger.js";
 import { join } from "node:path";
+import { homedir } from "node:os";
+import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
+import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
+import type { ModelDescriptor } from "./providers/foundation/types.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -16,6 +20,8 @@ export interface RuntimeHandle {
   readonly defaultModelId?: string;
   readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
+  readonly modelCandidates?: readonly ModelDescriptor[];
+  readonly warnings?: readonly string[];
   close(): Promise<void>;
 }
 
@@ -28,7 +34,7 @@ export interface GatewayModel {
   readonly headroom?: { readonly contextWindowTokens?: number; readonly availableInputTokens?: number; readonly maxOutputTokens?: number };
 }
 
-export type StartRuntime = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<RuntimeHandle>;
+export type StartRuntime = (input: { provider: ProviderRecord; config: AlfaCodeConfig; purpose?: "launch" | "discovery" }) => Promise<RuntimeHandle>;
 export type DiscoverModels = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<readonly GatewayModel[]>;
 export type QueryUsage = (query: UsageQuery) => Promise<UsageSummary>;
 
@@ -85,7 +91,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     if (flags.apiKeyEnv !== undefined && flags.keychain) throw new Error("Use either --api-key-env or --keychain, not both");
     const id = flags.id ?? (ui.interactive ? await ui.ask("Provider id", descriptor.id) : descriptor.id);
     if (id.length === 0) throw new Error("Provider id is required");
-    const baseUrl = flags.baseUrl ?? (descriptor.requiresBaseUrl && ui.interactive ? await ui.ask(`${descriptor.displayName} base URL`) : undefined);
+    const baseUrl = flags.baseUrl ?? (descriptor.requiresBaseUrl && ui.interactive ? await ui.ask(`${descriptor.displayName} base URL`, descriptor.suggestedBaseUrl) : undefined);
     if (descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) {
       throw new Error(`${descriptor.displayName} requires an absolute http(s) --base-url`);
     }
@@ -101,7 +107,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
       id,
       type: descriptor.configType,
       apiKey,
-      ...(baseUrl === undefined ? {} : { options: { baseUrl } }),
+      ...((baseUrl === undefined && descriptor.configurationOptions === undefined) ? {} : { options: { ...(descriptor.configurationOptions ?? {}), ...(baseUrl === undefined ? {} : { baseUrl }) } }),
     };
     await configStore.update((current) => ({ ...current, providers: [...current.providers, provider], defaultProviderId: current.defaultProviderId ?? id }));
     ui.write(`Connected ${id} (${descriptor.displayName}) using ${apiKey.kind === "env" ? `environment variable ${apiKey.name}` : "macOS Keychain"}.`);
@@ -161,6 +167,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const provider = await selectedProvider(config);
     const runtime = await runtimeStarter({ provider, config });
     try {
+      for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
       const launchOptions: ClaudeLaunchOptions = {
         claudeArgs: args,
         baseUrl: runtime.baseUrl,
@@ -256,14 +263,29 @@ export function createCli(options: CreateCliOptions = {}): Command {
 }
 
 async function discoverModelsFromGateway(start: StartRuntime, input: { provider: ProviderRecord; config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
-  const runtime = await start(input);
+  const runtime = await start({ ...input, purpose: "discovery" });
   try {
+    if (runtime.modelCandidates !== undefined) return runtime.modelCandidates.map(toGatewayModel);
     const response = await fetch(`${runtime.baseUrl}/v1/models`, { headers: { authorization: `Bearer ${runtime.authToken}` } });
     if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
     const payload: unknown = await response.json();
     if (!isModelResponse(payload)) throw new Error("Gateway returned an invalid model catalog");
     return payload.data.map((model) => ({ id: model.id, displayName: model.display_name, availability: "unknown" }));
   } finally { await runtime.close(); }
+}
+
+function toGatewayModel(model: ModelDescriptor): GatewayModel {
+  return {
+    id: encodeModelId(model.providerId, model.id),
+    displayName: `[${model.providerId}] ${model.displayName}`,
+    availability: model.availability,
+    capabilities: { ...model.capabilities },
+    quota: { state: "unknown" },
+    headroom: {
+      ...(model.contextWindow === undefined ? {} : { contextWindowTokens: model.contextWindow }),
+      ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
+    },
+  };
 }
 
 function isModelResponse(value: unknown): value is { data: Array<{ id: string; display_name: string }> } {
@@ -324,6 +346,20 @@ function renderUsage(summary: UsageSummary): string {
   return lines.join("\n");
 }
 
-export async function main(argv = process.argv): Promise<void> { await createCli({ startRuntime }).parseAsync(argv); }
+export async function main(argv = process.argv): Promise<void> {
+  let dynamicDescriptors: readonly ProviderDescriptor[] = [];
+  let catalog: Awaited<ReturnType<ModelsDevCatalogClient["load"]>>["catalog"] | undefined;
+  try {
+    const result = await new ModelsDevCatalogClient({ cachePath: join(homedir(), ".alfacode", "catalog", "models-dev.json"), ttlMs: 1 }).load();
+    catalog = result.catalog;
+    dynamicDescriptors = descriptorsFromDynamicCatalog(dynamicProviderDescriptors(result.catalog));
+  } catch {
+    // Provider-owned live discovery still runs; missing external metadata remains explicitly unverified.
+  }
+  await createCli({
+    providerDescriptors: [...providerDescriptors, ...dynamicDescriptors],
+    startRuntime: (input) => startRuntime(input, catalog === undefined ? {} : { modelMetadata: createModelsDevMetadataResolver(catalog, input.config) }),
+  }).parseAsync(argv);
+}
 
 if (import.meta.url === `file://${process.argv[1]}`) void main().catch((error: unknown) => { process.stderr.write(`alfacode: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

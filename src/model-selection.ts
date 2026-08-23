@@ -150,7 +150,7 @@ export class AutomaticModelSelector {
     this.probeTtlMs = options.probeTtlMs ?? 60_000;
     this.quotaTtlMs = options.quotaTtlMs ?? 60_000;
     this.notFoundCooldownMs = options.notFoundCooldownMs ?? 3_600_000;
-    this.fallbackCooldownMs = options.fallbackCooldownMs ?? 30_000;
+    this.fallbackCooldownMs = options.fallbackCooldownMs ?? 600_000;
     this.rollingWindowMs = options.rollingWindowMs ?? 3_600_000;
     this.maxConcurrentChecks = Math.max(1, options.maxConcurrentChecks ?? 2);
   }

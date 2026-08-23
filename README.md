@@ -19,10 +19,14 @@ The normal `claude` command and its configuration are left untouched. AlfaCode u
 - Keep provider credentials outside project files and Claude settings.
 - Fail visibly when a provider cannot represent a requested capability.
 
-## Initial provider support
+## Provider support
 
-- Google AI Studio / Gemini native API: first-class adapter.
-- Additional adapters: planned behind the same provider contract.
+- Google AI Studio: native Gemini Generate Content adapter, live account discovery, non-inference availability probes, tool/thought-signature replay.
+- OpenCode Zen: live multi-protocol discovery; models without explicit wire metadata stay visible but are never guessed.
+- Anthropic Messages, OpenAI Responses, and OpenAI Chat Completions compatible APIs.
+- A models.dev-backed connector catalog, refreshed automatically, currently covering compatible providers without bundling model IDs.
+
+AlfaCode contains no model allowlist, version table, name-family heuristic, or positional default. Provider catalogs are refreshed at runtime. Newly listed models appear automatically; removed or non-callable models disappear from the Claude picker. Account-visible models without verified text/tool metadata remain diagnostic entries in `alfacode models` but are not auto-selected.
 
 ## Development
 
@@ -89,7 +93,7 @@ alfacode connect anthropic --id anthropic --api-key-env ANTHROPIC_API_KEY
 alfacode connect openai-compatible --id local --base-url http://127.0.0.1:4000/v1 --api-key-env LOCAL_API_KEY
 ```
 
-`alfacode models` displays discovery metadata including availability, advertised capabilities, quota state, and context/output headroom whenever the platform discovery implementation returns it. Provider runtime support is intentionally separate from configuration: a configured provider is not a claim that a compatible runtime adapter is already installed.
+`alfacode models` displays live availability, advertised capabilities, quota state, and context/output headroom. Automatic selection first uses provider-reported normalized remaining capacity when it exists, then rolling local usage and fair scheduling. A 404 removes a model from consideration and a 429 puts it on cooldown. Google AI Studio does not expose exact remaining RPM/TPM/RPD through its model API, so AlfaCode deliberately reports that quota as unknown instead of inventing a number.
 
 `alfacode` and `alfacode launch` pass subsequent Claude Code arguments through unchanged. `alfacode run` is the non-interactive alias; use `--` before Claude flags that could otherwise be interpreted by AlfaCode.
 
@@ -110,7 +114,7 @@ alfacode
 alfacode -- --model alfacode-anthropic/google-personal/<model-id>
 ```
 
-Inside the session, `/model` shows models discovered from configured providers.
+Inside the session, `/model` shows only currently callable, tool-capable models discovered from configured providers.
 Use `alfacode default <model-id>` to persist a manual AlfaCode pin, or `alfacode default auto` to return to automatic selection.
 
 ## Data and cost warning

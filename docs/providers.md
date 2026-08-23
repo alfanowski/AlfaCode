@@ -39,7 +39,7 @@ Zen serves several incompatible protocols:
 - The catalog endpoint/API metadata selects the transport; there is no family or
   version-name fallback.
 
-Explicit endpoint/API/NPM metadata wins over name heuristics. All Zen and
+Explicit endpoint/API/NPM metadata is mandatory; AlfaCode never falls back to model-name heuristics. All Zen and
 generic OpenAI-compatible presets are `best-effort` until their exact model
 passes the contract suite. A matching API key does **not** imply protocol
 compatibility.

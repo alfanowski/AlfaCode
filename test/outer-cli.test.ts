@@ -87,7 +87,7 @@ describe("AlfaCode outer configuration CLI", () => {
     await cli.parseAsync(["node", "alfacode", "connect", "anthropic", "--id", "anthropic", "--api-key-env", "ANTHROPIC_KEY"], { from: "node" });
     await cli.parseAsync(["node", "alfacode", "connect", "openai-compatible", "--id", "local", "--base-url", "http://127.0.0.1:4000/v1", "--api-key-env", "LOCAL_KEY"], { from: "node" });
     expect((await configStore.read()).providers).toMatchObject([
-      { id: "zen", type: "zen" },
+      { id: "zen", type: "opencode-zen" },
       { id: "anthropic", type: "anthropic" },
       { id: "local", type: "openai-compatible", options: { baseUrl: "http://127.0.0.1:4000/v1" } },
     ]);

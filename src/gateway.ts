@@ -31,6 +31,7 @@ export interface GatewayOptions {
   readonly providers: readonly Provider[];
   readonly pingIntervalMs?: number;
   readonly usageLedger?: UsageLedger;
+  readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429 }) => Promise<void> | void;
 }
 
 interface AnthropicErrorEnvelope {
@@ -90,6 +91,16 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       return reply.code(resolved.status).send(anthropicError(resolved.errorType, resolved.message));
     }
 
+    const preflightController = new AbortController();
+    request.raw.once("aborted", () => preflightController.abort());
+    try {
+      await enforceModelContext(resolved.provider, resolved.model, resolved.request, providerContext(request, preflightController.signal));
+    } catch (error) {
+      const normalized = normalizeProviderError(error);
+      await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status);
+      return reply.code(normalized.status).send(normalized.body);
+    }
+
     const requestId = `req_${randomUUID().replaceAll("-", "")}`;
     reply.raw.setHeader("request-id", requestId);
     reply.raw.setHeader("x-request-id", requestId);
@@ -110,12 +121,13 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       } catch (error) {
         await tracker.finish(controller.signal.aborted ? "cancelled" : "failed", false, errorClass(error));
         const normalized = normalizeProviderError(error);
+        await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status);
         return reply.code(normalized.status).send(normalized.body);
       }
     }
 
     reply.hijack();
-    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, pingIntervalMs, options.usageLedger);
+    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, pingIntervalMs, options.usageLedger, options.onProviderOutcome);
   });
 
   app.post("/v1/messages/count_tokens", async (request, reply) => {
@@ -136,6 +148,7 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       return { input_tokens: usage.inputTokens };
     } catch (error) {
       const normalized = normalizeProviderError(error);
+      await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status);
       return reply.code(normalized.status).send(normalized.body);
     }
   });
@@ -145,6 +158,18 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
   });
 
   return app;
+}
+
+async function enforceModelContext(provider: Provider, model: ProviderModel, request: ProviderMessageRequest, context: ReturnType<typeof providerContext>): Promise<void> {
+  const maximum = model.limits?.maxInputTokens ?? model.limits?.contextWindowTokens;
+  if (maximum === undefined || model.capabilities?.tokenCounting === "none") return;
+  const count = await provider.countTokens(request, context);
+  if (count.inputTokens <= maximum) return;
+  throw {
+    kind: "invalid_request",
+    statusCode: 400,
+    message: `capability_rejected: prompt_too_long (input ${count.inputTokens}, model limit ${maximum})`,
+  } satisfies ProviderError;
 }
 
 async function collectResponse(
@@ -290,6 +315,7 @@ async function streamResponse(
   providerRequest: ProviderMessageRequest,
   pingIntervalMs: number,
   ledger: UsageLedger | undefined,
+  onProviderOutcome: GatewayOptions["onProviderOutcome"],
 ): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -334,6 +360,7 @@ async function streamResponse(
     outcome = controller.signal.aborted ? "cancelled" : outputStarted ? "partial" : "failed";
     if (!controller.signal.aborted) {
       const normalized = normalizeProviderError(error);
+      if (normalized.status === 404 || normalized.status === 429) await onProviderOutcome?.({ providerId: provider.id, modelId: providerModel.id, statusCode: normalized.status });
       if (!outputStarted) {
         response.statusCode = normalized.status;
         response.setHeader("content-type", "application/json; charset=utf-8");
@@ -353,6 +380,10 @@ async function streamResponse(
     await tracker.finish(controller.signal.aborted ? "cancelled" : outcome, outputStarted, failureClass);
   }
 
+}
+
+async function recordProviderOutcome(options: GatewayOptions, providerId: string, modelId: string, status: number): Promise<void> {
+  if (status === 404 || status === 429) await options.onProviderOutcome?.({ providerId, modelId, statusCode: status });
 }
 
 function providerContext(request: FastifyRequest, signal: AbortSignal): import("./provider-contract.js").ProviderRequestContext {
