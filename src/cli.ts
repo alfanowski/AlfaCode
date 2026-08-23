@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
 import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
+import { runProviderSetup, type ProviderSetupOptions, type ProviderSetupResult } from "./setup-tui.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -40,7 +41,7 @@ export type QueryUsage = (query: UsageQuery) => Promise<UsageSummary>;
 
 export interface CreateCliOptions {
   readonly configStore?: ConfigStore;
-  readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "delete">>;
+  readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>;
   readonly startRuntime?: StartRuntime;
   readonly discoverModels?: DiscoverModels;
   readonly queryUsage?: QueryUsage;
@@ -49,6 +50,7 @@ export interface CreateCliOptions {
   readonly legacyConfigPath?: string;
   /** Platform-supplied catalog; the bundled catalog is only a bootstrap fallback. */
   readonly providerDescriptors?: readonly ProviderDescriptor[];
+  readonly providerSetup?: (options: ProviderSetupOptions) => Promise<void>;
 }
 
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
@@ -114,6 +116,38 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return provider;
   };
 
+  const connectFromTui = async (result: ProviderSetupResult): Promise<void> => {
+    if (keychain.storeSecret === undefined || keychain.delete === undefined) throw new Error("Native credential storage is unavailable");
+    const config = await loadConfig();
+    const replaceable = config.providers.find((item) => item.type === result.descriptor.configType && item.apiKey?.kind === "keychain");
+    const id = replaceable?.id ?? availableProviderId(localProviderId(result.descriptor.id), config.providers);
+    const baseUrl = result.baseUrl;
+    if (result.descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) throw new Error("Enter an absolute http(s) base URL");
+    const provider: ProviderRecord = {
+      id,
+      type: result.descriptor.configType,
+      apiKey: { kind: "keychain", service: keychainService, account: id },
+      ...((baseUrl === undefined && result.descriptor.configurationOptions === undefined) ? {} : {
+        options: { ...(result.descriptor.configurationOptions ?? {}), ...(baseUrl === undefined ? {} : { baseUrl }) },
+      }),
+    };
+    await keychain.storeSecret(id, result.apiKey, keychainService);
+    try {
+      const providers = replaceable === undefined ? [...config.providers, provider] : config.providers.map((item) => item.id === replaceable.id ? provider : item);
+      const draft: AlfaCodeConfig = { ...config, providers, defaultProviderId: id };
+      if (runtimeStarter === undefined) throw new Error("Gateway runtime is unavailable");
+      const probe = await runtimeStarter({ provider, config: draft, purpose: "discovery" });
+      try {
+        const callable = probe.modelCandidates?.filter((model) => model.providerId === id && model.availability === "available" && model.capabilities.tools) ?? [];
+        if (callable.length === 0) throw new Error(probe.warnings?.join("; ") || "No tool-capable model is available for this credential");
+      } finally { await probe.close(); }
+      await configStore.write(draft);
+    } catch (error) {
+      await keychain.delete(id, keychainService).catch(() => undefined);
+      throw error;
+    }
+  };
+
   const setDefaultModel = async (model: string): Promise<void> => {
     const decoded = decodeModelId(model);
     if (decoded === undefined) throw new Error("Use a model id from `alfacode models`, for example alfacode-anthropic/google/model-id");
@@ -155,13 +189,15 @@ export function createCli(options: CreateCliOptions = {}): Command {
 
   const launch = async (args: readonly string[]): Promise<void> => {
     let config = await loadConfig();
-    if (config.providers.length === 0) {
+    const unavailable = await selectedCredentialUnavailable(config, keychain);
+    if (config.providers.length === 0 || unavailable !== undefined) {
       requireInteractive(ui.interactive);
-      ui.write("Welcome to AlfaCode. Connect a provider before launching Claude Code.");
-      const type = await ui.select("Choose a provider", descriptors.map(toChoice));
-      await connect(type, {});
+      await (options.providerSetup ?? runProviderSetup)({
+        descriptors,
+        ...(unavailable === undefined ? {} : { notice: `The saved provider '${unavailable}' has no credential. Reconnect it to continue.` }),
+        connect: connectFromTui,
+      });
       config = await loadConfig();
-      ui.write("Model selection is automatic. Run `alfacode default` later to pin a model.");
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     const provider = await selectedProvider(config);
@@ -260,6 +296,18 @@ export function createCli(options: CreateCliOptions = {}): Command {
     await launch(args);
   });
   return program;
+}
+
+async function selectedCredentialUnavailable(
+  config: AlfaCodeConfig,
+  keychain: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>,
+): Promise<string | undefined> {
+  const provider = config.providers.find((item) => item.id === config.defaultProviderId) ?? config.providers[0];
+  if (provider === undefined) return undefined;
+  if (provider.apiKey === undefined) return provider.id;
+  if (provider.apiKey.kind === "env") return process.env[provider.apiKey.name] ? undefined : provider.id;
+  if (keychain.retrieve === undefined) return undefined;
+  return await keychain.retrieve(provider.apiKey.account, provider.apiKey.service) ? undefined : provider.id;
 }
 
 async function discoverModelsFromGateway(start: StartRuntime, input: { provider: ProviderRecord; config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
