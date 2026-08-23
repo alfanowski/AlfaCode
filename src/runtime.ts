@@ -8,9 +8,12 @@ import type {
   CanonicalStreamEvent,
   Provider,
   ProviderError,
+  ProviderModel,
   ProviderMessageRequest,
   ProviderRequestContext,
+  TokenCount,
 } from "./provider-contract.js";
+import { UsageLedger } from "./usage-ledger.js";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import { SecretResolver } from "./secrets.js";
 import { GoogleProvider } from "./providers/google/provider.js";
@@ -38,6 +41,7 @@ export interface RuntimeDependencies {
   readonly secrets?: SecretResolver;
   readonly homeDirectory?: string;
   readonly createGoogle?: (options: ConstructorParameters<typeof GoogleProvider>[0]) => GoogleProvider;
+  readonly usageLedger?: UsageLedger;
 }
 
 interface GoogleAdapter {
@@ -52,6 +56,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
   const secrets = dependencies.secrets ?? new SecretResolver();
   const homeDirectory = dependencies.homeDirectory ?? homedir();
   const providers: Provider[] = [];
+  const ledger = dependencies.usageLedger ?? await UsageLedger.open(join(homeDirectory, ".alfacode", "usage"));
 
   try {
     for (const record of input.config.providers) {
@@ -77,7 +82,12 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
     if (selectedModel === undefined) throw new Error(`Default provider '${input.provider.id}' returned no models`);
 
     const authToken = randomBytes(32).toString("base64url");
-    const gateway = await listenLocalGateway({ token: authToken, providers });
+    for (const provider of providers) {
+      for (const model of provider.models) {
+        await ledger.registerModel(provider.id, encodeModelId(provider.id, model.id), model);
+      }
+    }
+    const gateway = await listenLocalGateway({ token: authToken, providers, usageLedger: ledger });
     const contextWindows = providers.flatMap((provider) => provider instanceof GoogleGatewayProvider
       ? provider.googleModels
         .map((model) => model.contextWindow)
@@ -90,16 +100,20 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       defaultModelId: encodeModelId(selectedProvider.id, selectedModel.id),
       ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
-      close: async () => gateway.app.close(),
+      close: async () => {
+        await gateway.app.close();
+        await ledger.close();
+      },
     };
   } catch (error) {
     await Promise.allSettled(providers.map(async (provider) => provider.close()));
+    await ledger.close();
     throw error;
   }
 }
 
 export class GoogleGatewayProvider implements Provider {
-  public readonly models;
+  public readonly models: readonly ProviderModel[];
 
   public constructor(
     public readonly id: string,
@@ -109,6 +123,12 @@ export class GoogleGatewayProvider implements Provider {
     this.models = googleModels.map((model) => ({
       id: model.id,
       displayName: `[${id}] ${model.displayName}`,
+      limits: {
+        ...(model.contextWindow === undefined ? {} : { maxInputTokens: model.contextWindow }),
+        ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
+        contextIncludesOutput: false,
+      },
+      capabilities: { tokenCounting: "exact" as const, usageReporting: "final" as const },
     }));
   }
 
@@ -141,7 +161,24 @@ export class GoogleGatewayProvider implements Provider {
       if (event.type === "warning") continue;
       if (event.type === "error") throw googleProviderError(event);
       if (event.type === "usage") {
-        usage = { input_tokens: event.input_tokens, output_tokens: event.output_tokens };
+        usage = {
+          input_tokens: event.input_tokens,
+          output_tokens: event.output_tokens,
+          ...(event.cached_input_tokens === undefined ? {} : { cache_read_input_tokens: event.cached_input_tokens }),
+          ...(event.cache_write_tokens === undefined ? {} : { cache_creation_input_tokens: event.cache_write_tokens }),
+        };
+        yield {
+          type: "usage",
+          usage: {
+            semantics: "cumulative", stage: "final", source: "provider",
+            inputTokens: event.input_tokens, outputTokens: event.output_tokens,
+            ...(event.cached_input_tokens === undefined ? {} : { cachedInputTokens: event.cached_input_tokens }),
+            ...(event.cache_write_tokens === undefined ? {} : { cacheWriteTokens: event.cache_write_tokens }),
+            ...(event.reasoning_tokens === undefined ? {} : { reasoningTokens: event.reasoning_tokens }),
+            ...(event.tool_tokens === undefined ? {} : { toolTokens: event.tool_tokens }),
+            ...(event.total_tokens === undefined ? {} : { totalTokens: event.total_tokens }),
+          },
+        };
         continue;
       }
       if (event.type === "message_delta") {
@@ -195,13 +232,13 @@ export class GoogleGatewayProvider implements Provider {
     yield { type: "message_stop" };
   }
 
-  public async countTokens(request: ProviderMessageRequest, context: ProviderRequestContext): Promise<AnthropicUsage> {
+  public async countTokens(request: ProviderMessageRequest, context: ProviderRequestContext): Promise<TokenCount> {
     const inputTokens = await this.upstream.countTokens(toGoogleRequest(request), request.model, {
       session: context.session,
       agent: context.agent,
       signal: context.signal,
     });
-    return { input_tokens: inputTokens, output_tokens: 0 };
+    return { inputTokens, source: "provider", exact: true };
   }
 
   public close(): Promise<void> {

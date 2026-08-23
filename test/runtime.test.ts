@@ -29,6 +29,7 @@ describe("Google gateway bridge", () => {
       "content_block_start",
       "content_block_delta",
       "content_block_stop",
+      "usage",
       "message_delta",
       "message_stop",
     ]);
@@ -45,9 +46,12 @@ describe("Google gateway bridge", () => {
   });
 
   it("qualifies duplicate model names with the provider id", () => {
-    expect(new GoogleGatewayProvider("work", fakeGoogle([]), models()).models).toEqual([
-      { id: "gemini-test", displayName: "[work] Gemini Test" },
-    ]);
+    expect(new GoogleGatewayProvider("work", fakeGoogle([]), models()).models).toEqual([{
+      id: "gemini-test",
+      displayName: "[work] Gemini Test",
+      limits: { maxInputTokens: 1_000_000, contextIncludesOutput: false },
+      capabilities: { tokenCounting: "exact", usageReporting: "final" },
+    }]);
   });
 
   it("preserves Gemini thinking and signature blocks on the Anthropic stream", async () => {

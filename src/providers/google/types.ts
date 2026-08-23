@@ -43,7 +43,11 @@ export type CanonicalStreamEvent =
   | { type: 'thinking_delta'; thinking: string; signature?: string }
   | { type: 'tool_use'; id: string; name: string; input: JsonObject }
   | { type: 'message_delta'; stop_reason: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'content_filtered' }
-  | { type: 'usage'; input_tokens: number; output_tokens: number }
+  | {
+      type: 'usage'; input_tokens: number; output_tokens: number;
+      cached_input_tokens?: number; cache_write_tokens?: number;
+      reasoning_tokens?: number; tool_tokens?: number; total_tokens?: number;
+    }
   | { type: 'error'; error: { type: string; message: string } };
 
 export interface ProviderModel {
@@ -110,5 +114,12 @@ export interface GoogleCountTokensParameters {
 
 export interface GoogleGenerateResponse {
   candidates?: Array<{ content?: { parts?: GooglePart[] }; finishReason?: string }>;
-  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+    cachedContentTokenCount?: number;
+    thoughtsTokenCount?: number;
+    toolUsePromptTokenCount?: number;
+  };
 }

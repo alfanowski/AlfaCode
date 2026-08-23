@@ -91,7 +91,15 @@ export class GoogleProvider {
           }
         }
       }
-      if (usage) yield { type: 'usage', input_tokens: usage.promptTokenCount ?? 0, output_tokens: usage.candidatesTokenCount ?? 0 };
+      if (usage) yield {
+        type: 'usage',
+        input_tokens: usage.promptTokenCount ?? 0,
+        output_tokens: usage.candidatesTokenCount ?? 0,
+        ...(usage.cachedContentTokenCount === undefined ? {} : { cached_input_tokens: usage.cachedContentTokenCount }),
+        ...(usage.thoughtsTokenCount === undefined ? {} : { reasoning_tokens: usage.thoughtsTokenCount }),
+        ...(usage.toolUsePromptTokenCount === undefined ? {} : { tool_tokens: usage.toolUsePromptTokenCount }),
+        ...(usage.totalTokenCount === undefined ? {} : { total_tokens: usage.totalTokenCount }),
+      };
       yield { type: 'message_delta', stop_reason: mapFinishReason(finishReason, sawToolUse) };
     } catch (error: unknown) {
       yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error) } };

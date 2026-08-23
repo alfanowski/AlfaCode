@@ -1,9 +1,13 @@
 import { getEventListeners, once } from "node:events";
 import { request as httpRequest } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createGatewayServer, listenLocalGateway } from "../src/gateway.js";
 import { decodeModelId, encodeModelId } from "../src/model-id.js";
 import type { CanonicalStreamEvent, Provider } from "../src/provider-contract.js";
+import { UsageLedger } from "../src/usage-ledger.js";
 
 const modelId = encodeModelId("mock", "claude-test");
 const events: readonly CanonicalStreamEvent[] = [
@@ -35,7 +39,7 @@ function fakeProvider(overrides: Partial<Provider> = {}): Provider {
       yield* events;
     },
     async countTokens() {
-      return { input_tokens: 12, output_tokens: 0 };
+      return { inputTokens: 12, source: "provider" as const, exact: true };
     },
     close() {},
     ...overrides,
@@ -100,6 +104,52 @@ describe("Anthropic gateway", () => {
     });
     expect(decodeModelId("claude-test")).toBeUndefined();
     expect(decodeModelId("alfacode-anthropic/a/%ZZ")).toBeUndefined();
+  });
+
+  it("records final cumulative usage without emitting a private SSE event", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "alfacode-gateway-usage-"));
+    const ledger = await UsageLedger.open(directory);
+    const provider = fakeProvider({
+      async *streamMessage() {
+        yield events[0]!;
+        yield { type: "usage", usage: { semantics: "cumulative", stage: "interim", source: "provider", inputTokens: 2, outputTokens: 1 } };
+        yield { type: "usage", usage: { semantics: "cumulative", stage: "final", source: "provider", inputTokens: 2, outputTokens: 3, totalTokens: 5 } };
+        yield events[5]!;
+      },
+    });
+    const server = createGatewayServer({ token: "test-token", providers: [provider], usageLedger: ledger });
+    try {
+      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: { ...authorizedHeaders(), "x-claude-code-session-id": "session-private", "x-claude-code-agent-id": "subagent" }, payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
+      expect(response.body).not.toContain("event: usage");
+      expect((await ledger.query({ session: "session-private" })).attempts[0]).toMatchObject({ outcome: "completed", usageCompleteness: "final", inputTokens: 2, outputTokens: 3, totalTokens: 5 });
+    } finally {
+      await server.close();
+      await ledger.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("records failed-before-output and partial-after-output attempts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "alfacode-gateway-failures-"));
+    const ledger = await UsageLedger.open(directory);
+    const before = createGatewayServer({ token: "test-token", providers: [fakeProvider({
+      async *streamMessage() { throw { kind: "api", message: "upstream failed" }; },
+    })], usageLedger: ledger });
+    const after = createGatewayServer({ token: "test-token", providers: [fakeProvider({
+      async *streamMessage() { yield events[0]!; throw { kind: "api", message: "upstream failed" }; },
+    })], usageLedger: ledger });
+    try {
+      const payload = { model: modelId, messages: [], max_tokens: 10, stream: true };
+      expect((await before.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload })).statusCode).toBe(500);
+      const streamed = await after.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload });
+      expect(streamed.body).toContain("event: error");
+      expect((await ledger.query()).attempts.map((attempt) => attempt.outcome).sort()).toEqual(["failed", "partial"]);
+    } finally {
+      await before.close();
+      await after.close();
+      await ledger.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("forwards unknown fields and translates canonical events in exact SSE order", async () => {
