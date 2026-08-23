@@ -18,6 +18,7 @@ export interface ClaudeLaunchOptions {
   readonly authToken: string;
   readonly configDir?: string;
   readonly defaultModelId?: string;
+  readonly contextWindowTokens?: number;
   readonly extraEnv?: Readonly<Record<string, string>>;
   readonly scrubEnvironmentKeys?: readonly string[];
   readonly environment?: NodeJS.ProcessEnv;
@@ -67,11 +68,17 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
     environment.ANTHROPIC_DEFAULT_SONNET_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_HAIKU_MODEL = options.defaultModelId;
   }
+  if (options.contextWindowTokens !== undefined) {
+    environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(options.contextWindowTokens);
+  }
   return environment;
 }
 
 export async function launchClaude(options: ClaudeLaunchOptions): Promise<number> {
   const configDirectory = options.configDir ?? join(homedir(), ".alfacode", "claude");
+  if (options.contextWindowTokens !== undefined && (!Number.isSafeInteger(options.contextWindowTokens) || options.contextWindowTokens <= 0)) {
+    throw new Error("contextWindowTokens must be a positive integer");
+  }
   await ensurePrivateDirectory(configDirectory);
   return (options.spawner ?? systemClaudeSpawner)({ command: options.claudePath ?? "claude", args: options.claudeArgs, env: buildClaudeEnvironment(options) });
 }
