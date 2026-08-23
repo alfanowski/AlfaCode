@@ -40,12 +40,13 @@ describe("createCli", () => {
     let closed = false;
     const cli = createCli({
       configStore,
-      startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", close: async () => { closed = true; } }),
+      startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", secretEnvironmentNames: ["CUSTOM_KEY"], close: async () => { closed = true; } }),
       launch: async (options) => { launched.push(options); return 0; },
     });
 
     await cli.parseAsync(["node", "polycode", "--resume", "session-id", "-p", "hello"], { from: "node" });
     expect(launched).toEqual([expect.objectContaining({ claudeArgs: ["--resume", "session-id", "-p", "hello"] })]);
+    expect(launched).toEqual([expect.objectContaining({ scrubEnvironmentKeys: ["CUSTOM_KEY"] })]);
     expect(closed).toBe(true);
   });
 });

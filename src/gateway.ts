@@ -250,8 +250,12 @@ async function nextOrPing<T>(
   const ping = new Promise<"ping">((resolve) => {
     timeout = setTimeout(() => resolve("ping"), intervalMs);
   });
+  let rejectAbort: ((error: Error) => void) | undefined;
+  const onAbort = () => rejectAbort?.(new Error("Client disconnected"));
   const aborted = new Promise<never>((_resolve, reject) => {
-    signal.addEventListener("abort", () => reject(new Error("Client disconnected")), { once: true });
+    rejectAbort = reject;
+    if (signal.aborted) reject(new Error("Client disconnected"));
+    else signal.addEventListener("abort", onAbort, { once: true });
   });
   try {
     return await Promise.race([next, ping, aborted]);
@@ -259,6 +263,7 @@ async function nextOrPing<T>(
     if (timeout !== undefined) {
       clearTimeout(timeout);
     }
+    signal.removeEventListener("abort", onAbort);
   }
 }
 

@@ -49,6 +49,19 @@ describe("Google gateway bridge", () => {
       { id: "gemini-test", displayName: "[work] Gemini Test" },
     ]);
   });
+
+  it("preserves Gemini thinking and signature blocks on the Anthropic stream", async () => {
+    const provider = new GoogleGatewayProvider("google", fakeGoogle([
+      { type: "thinking_delta", thinking: "summary", signature: "opaque" },
+      { type: "text_delta", text: "answer" },
+      { type: "message_delta", stop_reason: "end_turn" },
+    ]), models());
+    const output = [];
+    for await (const event of provider.streamMessage(request, context())) output.push(event);
+    expect(output).toContainEqual({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "summary" } });
+    expect(output).toContainEqual({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "opaque" } });
+    expect(output).toContainEqual({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } });
+  });
 });
 
 function models(): ProviderModel[] {

@@ -123,6 +123,34 @@ describe('GoogleProvider', () => {
     expect(toolEvents[0]?.id).not.toBe(toolEvents[1]?.id);
   });
 
+  it('deduplicates an id-less function call repeated by a later stream chunk', async () => {
+    const repeated = { candidates: [{ content: { parts: [
+      { functionCall: { name: 'weather', args: { city: 'Rome' } } },
+    ] } }] };
+    const mock = client({ streams: [[repeated, repeated]] });
+    const events = await collect(new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() }).stream(baseRequest, context));
+    expect(events.filter((event) => event.type === 'tool_use')).toHaveLength(1);
+  });
+
+  it('emits and replays Gemini thinking parts with their signatures', async () => {
+    const mock = client({ streams: [[{ candidates: [{ content: { parts: [
+      { thought: true, text: 'summary', thoughtSignature: 'thinking-signature' },
+      { text: 'answer' },
+    ] } }] }], []] });
+    const provider = new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() });
+    const first = await collect(provider.stream(baseRequest, context));
+    expect(first).toContainEqual({ type: 'thinking_delta', thinking: 'summary', signature: 'thinking-signature' });
+
+    await collect(provider.stream({ ...baseRequest, messages: [{ role: 'assistant', content: [
+      { type: 'thinking', thinking: 'summary', signature: 'thinking-signature' },
+      { type: 'text', text: 'answer' },
+    ] }] }, context));
+    expect(mock.calls[1]?.contents).toEqual([{ role: 'model', parts: [
+      { text: 'summary', thought: true, thoughtSignature: 'thinking-signature' },
+      { text: 'answer' },
+    ] }]);
+  });
+
   it('filters model pages and maps model metadata', async () => {
     const mock = client({ models: [
       { name: 'models/gemini-good', displayName: 'Good', inputTokenLimit: 1000, outputTokenLimit: 100, supportedActions: ['generateContent'] },

@@ -4,6 +4,7 @@ export type AnthropicContentBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id?: string; name: string; input: JsonObject }
+  | { type: 'thinking'; thinking: string; signature?: string }
   | { type: 'tool_result'; tool_use_id: string; content: string | AnthropicContentBlock[]; is_error?: boolean };
 
 export interface AnthropicMessage {
@@ -39,6 +40,7 @@ export interface ProviderContext {
 export type CanonicalStreamEvent =
   | { type: 'warning'; message: string }
   | { type: 'text_delta'; text: string }
+  | { type: 'thinking_delta'; thinking: string; signature?: string }
   | { type: 'tool_use'; id: string; name: string; input: JsonObject }
   | { type: 'message_delta'; stop_reason: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'content_filtered' }
   | { type: 'usage'; input_tokens: number; output_tokens: number }

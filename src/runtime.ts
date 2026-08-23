@@ -25,6 +25,7 @@ export interface RuntimeHandle {
   readonly authToken: string;
   readonly defaultModelId?: string;
   readonly contextWindowTokens?: number;
+  readonly secretEnvironmentNames?: readonly string[];
   close(): Promise<void>;
 }
 
@@ -86,6 +87,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       authToken,
       defaultModelId: encodeModelId(selectedProvider.id, selectedModel.id),
       ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
+      secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => gateway.app.close(),
     };
   } catch (error) {
@@ -111,7 +113,7 @@ export class GoogleGatewayProvider implements Provider {
   public async *streamMessage(request: ProviderMessageRequest, context: ProviderRequestContext): AsyncIterable<CanonicalStreamEvent> {
     const model = encodeModelId(this.id, request.model);
     let index = 0;
-    let openTextBlock: number | undefined;
+    let openBlock: { index: number; type: "text" | "thinking" } | undefined;
     let usage: AnthropicUsage = { input_tokens: 0, output_tokens: 0 };
     let stopReason = "end_turn";
 
@@ -144,19 +146,40 @@ export class GoogleGatewayProvider implements Provider {
         stopReason = event.stop_reason;
         continue;
       }
+      if (event.type === "thinking_delta") {
+        if (openBlock?.type !== "thinking") {
+          if (openBlock !== undefined) {
+            yield { type: "content_block_stop", index: openBlock.index };
+            index += 1;
+          }
+          openBlock = { index, type: "thinking" };
+          yield { type: "content_block_start", index, content_block: { type: "thinking", thinking: "" } };
+        }
+        if (event.thinking) {
+          yield { type: "content_block_delta", index: openBlock.index, delta: { type: "thinking_delta", thinking: event.thinking } };
+        }
+        if (event.signature) {
+          yield { type: "content_block_delta", index: openBlock.index, delta: { type: "signature_delta", signature: event.signature } };
+        }
+        continue;
+      }
       if (event.type === "text_delta") {
-        if (openTextBlock === undefined) {
-          openTextBlock = index;
+        if (openBlock?.type !== "text") {
+          if (openBlock !== undefined) {
+            yield { type: "content_block_stop", index: openBlock.index };
+            index += 1;
+          }
+          openBlock = { index, type: "text" };
           yield { type: "content_block_start", index, content_block: { type: "text", text: "" } };
         }
-        yield { type: "content_block_delta", index: openTextBlock, delta: { type: "text_delta", text: event.text } };
+        yield { type: "content_block_delta", index: openBlock.index, delta: { type: "text_delta", text: event.text } };
         continue;
       }
       if (event.type === "tool_use") {
-        if (openTextBlock !== undefined) {
-          yield { type: "content_block_stop", index: openTextBlock };
+        if (openBlock !== undefined) {
+          yield { type: "content_block_stop", index: openBlock.index };
           index += 1;
-          openTextBlock = undefined;
+          openBlock = undefined;
         }
         const toolIndex = index;
         yield { type: "content_block_start", index: toolIndex, content_block: { type: "tool_use", id: event.id, name: event.name, input: {} } };
@@ -165,7 +188,7 @@ export class GoogleGatewayProvider implements Provider {
         index += 1;
       }
     }
-    if (openTextBlock !== undefined) yield { type: "content_block_stop", index: openTextBlock };
+    if (openBlock !== undefined) yield { type: "content_block_stop", index: openBlock.index };
     yield { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage };
     yield { type: "message_stop" };
   }

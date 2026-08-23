@@ -17,7 +17,8 @@ describe("launchClaude", () => {
       defaultModelId: "gemini-3-pro",
       contextWindowTokens: 1_000_000,
       extraEnv: { POLYCODE_GATEWAY_URL: "http://127.0.0.1:4317" },
-      environment: { ANTHROPIC_API_KEY: "leak", AWS_PROFILE: "wrong", PATH: "/bin" },
+      scrubEnvironmentKeys: ["CUSTOM_GOOGLE_KEY"],
+      environment: { ANTHROPIC_API_KEY: "leak", GEMINI_API_KEY: "leak", CUSTOM_GOOGLE_KEY: "leak", AWS_PROFILE: "wrong", PATH: "/bin" },
       spawner: async (next) => { request = next; return 17; },
     });
 
@@ -35,6 +36,8 @@ describe("launchClaude", () => {
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
     });
     expect(request?.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(request?.env.GEMINI_API_KEY).toBeUndefined();
+    expect(request?.env.CUSTOM_GOOGLE_KEY).toBeUndefined();
     expect(request?.env.AWS_PROFILE).toBeUndefined();
     await rm(configDir, { recursive: true, force: true });
   });

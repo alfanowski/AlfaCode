@@ -1,4 +1,4 @@
-import { once } from "node:events";
+import { getEventListeners, once } from "node:events";
 import { request as httpRequest } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { createGatewayServer, listenLocalGateway } from "../src/gateway.js";
@@ -166,5 +166,23 @@ describe("Anthropic gateway", () => {
     } finally {
       await server.close();
     }
+  });
+
+  it("removes per-chunk abort listeners after successful streaming", async () => {
+    let signal: AbortSignal | undefined;
+    const response = await app(fakeProvider({
+      async *streamMessage(_request, context) {
+        signal = context.signal;
+        for (let index = 0; index < 25; index += 1) yield events[2]!;
+      },
+    })).inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 1 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(signal).toBeDefined();
+    expect(getEventListeners(signal!, "abort")).toHaveLength(0);
   });
 });

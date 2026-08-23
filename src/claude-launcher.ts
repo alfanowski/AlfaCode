@@ -20,6 +20,7 @@ export interface ClaudeLaunchOptions {
   readonly defaultModelId?: string;
   readonly contextWindowTokens?: number;
   readonly extraEnv?: Readonly<Record<string, string>>;
+  readonly scrubEnvironmentKeys?: readonly string[];
   readonly environment?: NodeJS.ProcessEnv;
   readonly spawner?: ClaudeSpawner;
 }
@@ -37,6 +38,7 @@ const inheritedSecretKeys = new Set([
   "AWS_REGION",
   "AWS_DEFAULT_REGION",
   "GOOGLE_API_KEY",
+  "GEMINI_API_KEY",
   "GOOGLE_APPLICATION_CREDENTIALS",
   "GOOGLE_CLOUD_PROJECT",
   "VERTEX_PROJECT",
@@ -45,12 +47,13 @@ const inheritedSecretKeys = new Set([
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {
   const base = options.environment ?? process.env;
+  const secretKeys = new Set([...inheritedSecretKeys, ...(options.scrubEnvironmentKeys ?? [])]);
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
-    if (!inheritedSecretKeys.has(key) && !key.startsWith("ANTHROPIC_")) environment[key] = value;
+    if (!secretKeys.has(key) && !key.startsWith("ANTHROPIC_")) environment[key] = value;
   }
   Object.assign(environment, options.extraEnv);
-  for (const key of inheritedSecretKeys) delete environment[key];
+  for (const key of secretKeys) delete environment[key];
   for (const key of Object.keys(environment)) {
     if (key.startsWith("ANTHROPIC_") && key !== "ANTHROPIC_CUSTOM_HEADERS") delete environment[key];
   }

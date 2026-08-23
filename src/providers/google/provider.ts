@@ -61,18 +61,27 @@ export class GoogleProvider {
       let finishReason: string | undefined;
       let usage: GoogleGenerateResponse['usageMetadata'];
       const emittedToolCalls = new Set<string>();
-      let functionCallOrdinal = 0;
 
       for await (const chunk of responseStream) {
         usage = chunk.usageMetadata ?? usage;
         const candidate = chunk.candidates?.[0];
         if (!candidate) continue;
         finishReason = candidate.finishReason ?? finishReason;
+        const fallbackOccurrences = new Map<string, number>();
         for (const part of candidate.content?.parts ?? []) {
           if (part.text && !part.thought) yield { type: 'text_delta', text: part.text };
+          if (part.thought && (part.text || part.thoughtSignature)) {
+            yield {
+              type: 'thinking_delta',
+              thinking: part.text ?? '',
+              ...(part.thoughtSignature ? { signature: part.thoughtSignature } : {}),
+            };
+          }
           if (part.functionCall) {
-            const tool = await this.normaliseFunctionCall(part, context, functionCallOrdinal);
-            functionCallOrdinal += 1;
+            const fingerprint = JSON.stringify([part.functionCall.name, part.functionCall.args ?? {}]);
+            const fallbackOrdinal = fallbackOccurrences.get(fingerprint) ?? 0;
+            fallbackOccurrences.set(fingerprint, fallbackOrdinal + 1);
+            const tool = await this.normaliseFunctionCall(part, context, fallbackOrdinal);
             // Gemini can repeat a complete function call in a later stream chunk.
             if (!emittedToolCalls.has(tool.id)) {
               emittedToolCalls.add(tool.id);
@@ -153,6 +162,11 @@ export class GoogleProvider {
       const block = content[blockIndex];
       if (!block) continue;
       if (block.type === 'text') parts.push({ text: block.text });
+      else if (block.type === 'thinking') parts.push({
+        text: block.thinking,
+        thought: true,
+        ...(block.signature ? { thoughtSignature: block.signature } : {}),
+      });
       else if (block.type === 'image') parts.push({ inlineData: { mimeType: block.source.media_type, data: block.source.data } });
       else if (block.type === 'tool_use') {
         const id = block.id ?? stableToolId(context, messageIndex, blockIndex, block.name, block.input);

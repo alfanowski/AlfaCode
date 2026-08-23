@@ -10,6 +10,7 @@ export interface RuntimeHandle {
   readonly authToken: string;
   readonly defaultModelId?: string;
   readonly contextWindowTokens?: number;
+  readonly secretEnvironmentNames?: readonly string[];
   close(): Promise<void>;
 }
 
@@ -84,6 +85,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
         authToken: runtime.authToken,
         ...(runtime.defaultModelId === undefined ? {} : { defaultModelId: runtime.defaultModelId }),
         ...(runtime.contextWindowTokens === undefined ? {} : { contextWindowTokens: runtime.contextWindowTokens }),
+        ...(runtime.secretEnvironmentNames === undefined ? {} : { scrubEnvironmentKeys: runtime.secretEnvironmentNames }),
       };
       const exitCode = await (options.launch ?? launchClaude)(launchOptions);
       process.exitCode = exitCode;
