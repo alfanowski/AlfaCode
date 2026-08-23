@@ -40,6 +40,7 @@ describe("launchClaude", () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_SONNET_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "gemini-3-pro",
+      ANTHROPIC_MODEL: "gemini-3-pro",
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144",
     });
     expect(request?.env.ANTHROPIC_API_KEY).toBeUndefined();

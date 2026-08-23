@@ -81,6 +81,7 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
   });
   if (options.defaultModelId !== undefined) {
+    environment.ANTHROPIC_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_OPUS_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_SONNET_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_HAIKU_MODEL = options.defaultModelId;
