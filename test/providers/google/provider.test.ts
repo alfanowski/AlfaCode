@@ -169,17 +169,22 @@ describe('GoogleProvider', () => {
     ] }]);
   });
 
-  it('filters model pages and maps model metadata', async () => {
+  it('retains every Generate Content model without name or token-limit heuristics', async () => {
     const mock = client({ models: [
       { name: 'models/gemini-good', displayName: 'Good', inputTokenLimit: 262144, outputTokenLimit: 32768, supportedActions: ['generateContent'] },
       { name: 'models/gemini-2.5-flash-preview-tts', displayName: 'TTS', inputTokenLimit: 8192, outputTokenLimit: 16384, supportedActions: ['generateContent'] },
       { name: 'models/gemini-3-pro-image', displayName: 'Image', inputTokenLimit: 131072, outputTokenLimit: 32768, supportedActions: ['generateContent'] },
+      { name: 'models/opaque-x7', displayName: 'Opaque', inputTokenLimit: 4096, outputTokenLimit: 256, supportedActions: ['generateContent'] },
       { name: 'models/embed', supportedActions: ['embedContent'] },
       { name: 'models/also-good', supportedActions: ['generate_content'] },
     ] });
     const provider = new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() });
     expect(await provider.listModels()).toEqual([
       { id: 'gemini-good', displayName: 'Good', contextWindow: 262144, maxOutputTokens: 32768 },
+      { id: 'gemini-2.5-flash-preview-tts', displayName: 'TTS', contextWindow: 8192, maxOutputTokens: 16384 },
+      { id: 'gemini-3-pro-image', displayName: 'Image', contextWindow: 131072, maxOutputTokens: 32768 },
+      { id: 'opaque-x7', displayName: 'Opaque', contextWindow: 4096, maxOutputTokens: 256 },
+      { id: 'also-good', displayName: 'models/also-good' },
     ]);
   });
 

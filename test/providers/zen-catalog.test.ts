@@ -25,9 +25,9 @@ describe("OpenCode Zen catalog", () => {
       ["gpt-5", "openai-responses", "best-effort"],
       ["claude-tool", "anthropic-messages", "best-effort"],
       ["gemini-fast", "gemini-generate-content", "best-effort"],
-      ["unknown-proxy", "openai-chat", "best-effort"],
+      ["unknown-proxy", "unsupported", "best-effort"],
     ]);
-    expect(classifyZenModel({ id: "qwen3" })).toBe("anthropic-messages");
+    expect(classifyZenModel({ id: "qwen3" })).toBeUndefined();
   });
 
   it("does not expose the API key in discovery errors", async () => {

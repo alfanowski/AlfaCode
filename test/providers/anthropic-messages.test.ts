@@ -27,8 +27,9 @@ describe("Anthropic Messages adapter", () => {
     const controller = new AbortController();
     const events = await collect(adapter.streamMessage(request, { signal: controller.signal, session: "s", agent: "a" }));
     expect(signal).toBe(controller.signal);
-    expect(events.map((event) => event.type)).toEqual(["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+    expect(events.map((event) => event.type)).toEqual(["message_start", "content_block_start", "content_block_delta", "content_block_stop", "usage", "message_delta", "message_stop"]);
     expect(events[2]).toEqual({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"city":"Rome"}' } });
+    expect(events[4]).toEqual({ type: "usage", usage: { semantics: "cumulative", stage: "final", source: "provider", inputTokens: 3, outputTokens: 2 } });
   });
 
   it("maps auth failures without leaking the key", async () => {

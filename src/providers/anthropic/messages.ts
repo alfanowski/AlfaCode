@@ -27,7 +27,10 @@ export class AnthropicMessagesAdapter implements Provider {
   private readonly requestFetch: typeof fetch;
 
   public constructor(private readonly options: AnthropicMessagesAdapterOptions) {
-    this.models = options.models.map((model) => ({ id: model.id, displayName: model.displayName }));
+    this.models = options.models.map((model) => ({ id: model.id, displayName: model.displayName,
+      limits: { ...(model.contextWindow === undefined ? {} : { maxInputTokens: model.contextWindow }), ...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }), contextIncludesOutput: false },
+      capabilities: { tokenCounting: "exact" as const, usageReporting: "final" as const },
+    }));
     this.endpoint = (options.baseUrl ?? "https://api.anthropic.com/v1").replace(/\/$/, "");
     this.requestFetch = options.fetch ?? fetch;
   }
@@ -50,6 +53,7 @@ export class AnthropicMessagesAdapter implements Provider {
       });
       if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey);
       let sawStart = false;
+      let inputTokens = 0;
       for await (const frame of readSse(response)) {
         if (frame.event === "ping") continue;
         const payload = parsePayload(frame.data, this.options.apiKey);
@@ -57,6 +61,13 @@ export class AnthropicMessagesAdapter implements Provider {
         const event = toCanonicalEvent(payload);
         if (!event) continue;
         sawStart ||= event.type === "message_start";
+        if (event.type === "message_start") inputTokens = event.message.usage.input_tokens;
+        if (event.type === "message_delta") yield { type: "usage", usage: {
+          semantics: "cumulative", stage: "final", source: "provider", inputTokens,
+          outputTokens: event.usage.output_tokens,
+          ...(event.usage.cache_read_input_tokens === undefined ? {} : { cachedInputTokens: event.usage.cache_read_input_tokens }),
+          ...(event.usage.cache_creation_input_tokens === undefined ? {} : { cacheWriteTokens: event.usage.cache_creation_input_tokens }),
+        } };
         yield event;
       }
       if (!sawStart) throw new Error("Anthropic stream ended before message_start");
