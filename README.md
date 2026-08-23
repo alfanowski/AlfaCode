@@ -116,7 +116,11 @@ Configuration directories and files are owner-only (`0700`/`0600`), written atom
 
 ### Terminal behavior
 
-The native Ink UI uses a restrained cyan/magenta AlfaCode palette, keyboard navigation, searchable models, masked secret entry, explicit permission cards, live tool/subagent events, and a local content-free usage view. Interactive setup refuses to run outside a TTY; CI keeps the environment-variable workflow.
+The native Ink UI uses an adaptive graphite/teal/violet AlfaCode palette, keyboard navigation, searchable live models and engine commands, masked secret entry, explicit permission cards, live tool/subagent events, and a local content-free usage view. Model output is rendered as safe terminal-native Markdown, including headings, emphasis, quotes, task lists, responsive tables, links, and fenced code with line numbers.
+
+The composer supports cursor editing, paste, prompt history, Unix editing shortcuts, multiline prompts, a filtered `/` palette, and Claude Code's engine-generated follow-up suggestions (accept with `Tab`). Its footer refreshes the exact engine context left and local token accounting after every turn. `AskUserQuestion` has a dedicated interactive surface with single choice, multi-select, option previews, custom answers, and consecutive questions; answers are returned through the engine's structured tool contract rather than injected as chat text.
+
+Theme and motion defaults adapt to the terminal. They can be made deterministic with `ALFACODE_THEME=dark|light` and `ALFACODE_REDUCED_MOTION=1`. `CI`, `TERM=dumb`, and reduced-motion mode disable animation automatically. Interactive setup refuses to run outside a TTY; CI keeps the environment-variable workflow.
 
 Launch the isolated runtime:
 
