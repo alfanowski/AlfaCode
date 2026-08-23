@@ -43,6 +43,19 @@ describe("UsageLedger", () => {
     await store.close();
   });
 
+  it("returns rolling usage without turning missing provider totals into zero", async () => {
+    const { ledger: store } = await ledger();
+    const reported = await store.start({ session: "session", agent: "main", providerId: "google", routeModelId: "route-a", upstreamModel: model.id, model, extendedContext: false });
+    await store.observe(reported, { semantics: "cumulative", stage: "final", source: "provider", totalTokens: 19 });
+    await store.finish(reported, "completed", true);
+    const missing = await store.start({ session: "session", agent: "main", providerId: "google", routeModelId: "route-b", upstreamModel: "other", model, extendedContext: false });
+    await store.finish(missing, "failed", false);
+
+    expect(await store.rollingUsage({ since: 0, providerId: "google", upstreamModel: model.id })).toEqual({ attempts: 1, totalTokens: 19 });
+    expect(await store.rollingUsage({ since: 0, providerId: "google", upstreamModel: "other" })).toEqual({ attempts: 1 });
+    await store.close();
+  });
+
   it("persists only pseudonymous metadata and recovers a corrupt database", async () => {
     const { directory, ledger: store } = await ledger();
     const secret = "prompt body and API key AIzaDontPersist";
