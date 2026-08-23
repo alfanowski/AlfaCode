@@ -205,6 +205,13 @@ describe('GoogleProvider', () => {
       .toEqual([{ type: 'error', error: { type: 'Error', message: 'quota exhausted', statusCode: 429 } }]);
   });
 
+  it('preserves Google quota retry delays for precise cooldown learning', async () => {
+    const mock = client();
+    mock.client.models.generateContentStream = async () => { throw Object.assign(new Error('Please retry in 14.125306991s.'), { status: 429 }); };
+    expect(await collect(new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() }).stream(baseRequest, context)))
+      .toEqual([{ type: 'error', error: { type: 'Error', message: 'Please retry in 14.125306991s.', statusCode: 429, retryAfterMs: 14_126 } }]);
+  });
+
   it('persists state with atomic valid JSON', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'alfacode-google-'));
     const path = join(dir, 'state.json');

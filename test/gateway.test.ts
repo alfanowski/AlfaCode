@@ -61,6 +61,14 @@ function authorizedHeaders() {
   return { authorization: "Bearer test-token" };
 }
 
+function systemText(request: unknown): string {
+  if (typeof request !== "object" || request === null || !("system" in request)) return "";
+  const system = request.system;
+  if (typeof system === "string") return system;
+  if (!Array.isArray(system)) return "";
+  return system.flatMap((block) => typeof block === "object" && block !== null && "text" in block && typeof block.text === "string" ? [block.text] : []).join("\n");
+}
+
 describe("Anthropic gateway", () => {
   it("rejects absent, malformed, and invalid credentials without exposing details", async () => {
     for (const headers of [{}, { authorization: "Basic test-token" }, { "x-api-key": "wrong" }]) {
@@ -153,34 +161,39 @@ describe("Anthropic gateway", () => {
   });
 
   it("feeds live 404 and 429 outcomes back to automatic selection", async () => {
-    const outcomes: Array<{ providerId: string; modelId: string; statusCode: 404 | 429 }> = [];
+    const outcomes: Array<{ providerId: string; modelId: string; statusCode: 404 | 429; retryAfter?: string | number }> = [];
     const server = createGatewayServer({
       token: "test-token",
-      providers: [fakeProvider({ async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429 }; } })],
+      providers: [fakeProvider({ async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429, retryAfter: 14_125 }; } })],
       onProviderOutcome: async (outcome) => { outcomes.push(outcome); },
     });
     try {
       const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
       expect(response.statusCode).toBe(429);
-      expect(response.headers["retry-after"]).toBe("600");
-      expect(outcomes).toEqual([{ providerId: "mock", modelId: "claude-test", statusCode: 429 }]);
+      expect(response.headers["retry-after"]).toBe("15");
+      expect(outcomes).toEqual([{ providerId: "mock", modelId: "claude-test", statusCode: 429, retryAfter: 14_125 }]);
     } finally { await server.close(); }
   });
 
-  it("fails over before emitting bytes when the selected model is exhausted", async () => {
-    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429 }; } });
-    const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }] });
+  it("fails over before model output even after keepalive pings", async () => {
+    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { await new Promise((resolve) => setTimeout(resolve, 10)); throw { kind: "rate_limit", message: "busy", statusCode: 429 }; } });
+    let receivedByFallback: unknown;
+    const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }], async *streamMessage(request) { receivedByFallback = request; yield* events; } });
     const failures: string[] = [];
     const server = createGatewayServer({
-      token: "test-token", providers: [exhausted, healthy],
+      token: "test-token", providers: [exhausted, healthy], pingIntervalMs: 1,
       onProviderOutcome: async (failure) => { failures.push(`${failure.providerId}/${failure.modelId}`); },
       selectFallback: async () => ({ provider: healthy, model: healthy.models[0]! }),
     });
     try {
       const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: encodeModelId("exhausted", "model-a"), messages: [], max_tokens: 10, stream: true } });
       expect(response.statusCode).toBe(200);
+      expect(response.body).toContain("event: ping");
       expect(response.body).toContain('"text":"hello"');
       expect(failures).toEqual(["exhausted/model-a"]);
+      expect(systemText(receivedByFallback)).toContain('Active provider ID: "healthy"');
+      expect(systemText(receivedByFallback)).toContain('Active model ID: "model-b"');
+      expect(systemText(receivedByFallback)).not.toContain('Active model ID: "model-a"');
     } finally { await server.close(); }
   });
 
@@ -195,11 +208,15 @@ describe("Anthropic gateway", () => {
       method: "POST",
       url: "/v1/messages?beta=true",
       headers: authorizedHeaders(),
-      payload: { model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 10, stream: true, experimental: { x: 1 } },
+      payload: { model: modelId, messages: [{ role: "user", content: "hi" }], system: "Original system", max_tokens: 10, stream: true, experimental: { x: 1 } },
     });
 
     expect(response.statusCode).toBe(200);
     expect(received).toMatchObject({ model: "claude-test", experimental: { x: 1 } });
+    expect(systemText(received)).toContain("Original system");
+    expect(systemText(received)).toContain("You are AlfaCode");
+    expect(systemText(received)).toContain('Active provider ID: "mock"');
+    expect(systemText(received)).toContain('Active model ID: "claude-test"');
     expect(response.body.match(/^event: .+$/gm)).toEqual([
       "event: message_start",
       "event: content_block_start",

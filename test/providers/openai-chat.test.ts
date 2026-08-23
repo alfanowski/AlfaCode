@@ -33,6 +33,15 @@ describe("OpenAI Chat adapter", () => {
     await expect(collect(adapter.streamMessage({ model: "model-a", messages: [] }, context()))).rejects.toMatchObject({ kind: "authentication" });
     await expect(collect(adapter.streamMessage({ model: "model-a", messages: [] }, context()))).rejects.not.toThrow("chat-secret");
   });
+
+  it("preserves upstream Retry-After headers for automatic cooldowns", async () => {
+    const adapter = new OpenAIChatAdapter({
+      id: "compat", apiKey: "chat-secret", models, baseUrl: "https://chat.example/v1",
+      fetch: async () => new Response("quota exhausted", { status: 429, headers: { "retry-after": "23" } }),
+    });
+    await expect(collect(adapter.streamMessage({ model: "model-a", messages: [] }, context())))
+      .rejects.toMatchObject({ kind: "rate_limit", statusCode: 429, retryAfter: "23" });
+  });
 });
 
 function sse(chunks: readonly string[]): Response { const encoder = new TextEncoder(); return new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(encoder.encode(chunk)); controller.close(); } }), { headers: { "content-type": "text/event-stream" } }); }

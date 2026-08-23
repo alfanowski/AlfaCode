@@ -48,7 +48,7 @@ export type CanonicalStreamEvent =
       cached_input_tokens?: number; cache_write_tokens?: number;
       reasoning_tokens?: number; tool_tokens?: number; total_tokens?: number;
     }
-  | { type: 'error'; error: { type: string; message: string; statusCode?: number } };
+  | { type: 'error'; error: { type: string; message: string; statusCode?: number; retryAfterMs?: number } };
 
 export interface ProviderModel {
   id: string;

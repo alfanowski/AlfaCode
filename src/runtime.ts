@@ -312,7 +312,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       providers,
       usageLedger: ledger,
       ...(activeSelector === undefined ? {} : {
-        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: 404 | 429 }) => activeSelector.recordOutcome(outcome),
+        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: 404 | 429; retryAfter?: string | number }) => activeSelector.recordOutcome(outcome),
         selectFallback: async () => {
           const fallback = (await activeSelector.select(candidates, { streaming: true, tools: true })).selected;
           if (fallback === undefined) return undefined;
@@ -480,7 +480,7 @@ function toGoogleRequest(request: ProviderMessageRequest): GoogleRequest {
 
 function googleProviderError(event: Extract<GoogleEvent, { type: "error" }>): ProviderError {
   const status = event.error.statusCode;
-  if (status === 429) return { kind: "rate_limit", message: event.error.message, statusCode: status };
+  if (status === 429) return { kind: "rate_limit", message: event.error.message, statusCode: status, ...(event.error.retryAfterMs === undefined ? {} : { retryAfter: event.error.retryAfterMs }) };
   if (status === 401) return { kind: "authentication", message: event.error.message, statusCode: status };
   if (status === 403) return { kind: "permission", message: event.error.message, statusCode: status };
   if (status === 404 || status === 410) return { kind: "not_found", message: event.error.message, statusCode: status };

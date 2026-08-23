@@ -107,7 +107,8 @@ export class GoogleProvider {
       yield { type: 'message_delta', stop_reason: mapFinishReason(finishReason, sawToolUse) };
     } catch (error: unknown) {
       const statusCode = errorStatus(error);
-      yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error), ...(statusCode === undefined ? {} : { statusCode }) } };
+      const retryAfterMs = errorRetryAfter(error);
+      yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error), ...(statusCode === undefined ? {} : { statusCode }), ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
     }
   }
 
@@ -284,4 +285,14 @@ function errorStatus(error: unknown): number | undefined {
   if (typeof value === 'number' && Number.isInteger(value)) return value;
   if (typeof value === 'string' && /^\d{3}$/.test(value)) return Number(value);
   return undefined;
+}
+
+function errorRetryAfter(error: unknown): number | undefined {
+  if (isRecord(error)) {
+    const value = error.retryAfter ?? error.retryAfterMs;
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.ceil(value);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const match = /(?:please\s+)?retry\s+in\s+([0-9]+(?:\.[0-9]+)?)s/i.exec(message);
+  return match?.[1] === undefined ? undefined : Math.ceil(Number(match[1]) * 1000);
 }

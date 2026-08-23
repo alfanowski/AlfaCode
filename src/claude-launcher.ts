@@ -60,6 +60,7 @@ const safeClaudeDefaults: Readonly<Record<string, string>> = {
   DISABLE_FEEDBACK_COMMAND: "1",
   CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "0",
+  CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
 };
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {

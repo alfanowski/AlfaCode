@@ -131,6 +131,8 @@ export interface ProviderError {
     | "api";
   readonly message: string;
   readonly statusCode?: number;
+  /** Provider retry delay as an HTTP Retry-After value or milliseconds. */
+  readonly retryAfter?: string | number;
 }
 
 export interface Provider {

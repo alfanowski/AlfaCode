@@ -27,7 +27,7 @@ export class OpenAIResponsesAdapter implements Provider {
     try {
       const prior = await this.options.stateStore?.get({ protocol: "openai-responses", session: context.session, agent: context.agent, model: request.model });
       const response = await this.requestFetch(`${this.endpoint}/responses`, { method: "POST", signal: context.signal, headers: { "content-type": "application/json", accept: "text/event-stream", Authorization: `Bearer ${this.options.apiKey}` }, body: JSON.stringify(toResponsesRequest(request, prior)) });
-      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey);
+      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey, response.headers.get("retry-after") ?? undefined);
       let started = false; let textOpen = false; let usage = { input_tokens: 0, output_tokens: 0 }; let stop = "end_turn"; const calls = new Map<string, { name?: string; arguments: string }>(); let rawOutput: unknown[] = [];
       for await (const frame of readSse(response)) {
         if (frame.data === "[DONE]") break;

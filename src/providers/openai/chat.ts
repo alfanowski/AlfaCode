@@ -56,7 +56,7 @@ export class OpenAIChatAdapter implements Provider {
         headers: { "content-type": "application/json", accept: "text/event-stream", Authorization: `Bearer ${this.options.apiKey}` },
         body: JSON.stringify(toChatRequest(request)),
       });
-      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey);
+      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey, response.headers.get("retry-after") ?? undefined);
       let messageStarted = false;
       let textBlockOpen = false;
       let textBlockIndex = 0;

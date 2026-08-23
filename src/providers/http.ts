@@ -2,14 +2,17 @@ import type { ProviderError } from "../provider-contract.js";
 
 export class UpstreamProviderError extends Error implements ProviderError {
   public readonly statusCode?: number;
+  public readonly retryAfter?: string | number;
   public constructor(
     public readonly kind: ProviderError["kind"],
     message: string,
     statusCode?: number,
+    retryAfter?: string | number,
   ) {
     super(message);
     this.name = "UpstreamProviderError";
     if (statusCode !== undefined) this.statusCode = statusCode;
+    if (retryAfter !== undefined) this.retryAfter = retryAfter;
   }
 }
 
@@ -45,7 +48,7 @@ export async function* readSse(response: Response): AsyncGenerator<SseFrame> {
   }
 }
 
-export function upstreamError(status: number, body: string, secret: string): UpstreamProviderError {
+export function upstreamError(status: number, body: string, secret: string, retryAfter?: string | number): UpstreamProviderError {
   const lower = body.toLowerCase();
   const kind: ProviderError["kind"] = status === 401 || lower.includes("api key") || lower.includes("authentication")
     ? "authentication"
@@ -55,7 +58,7 @@ export function upstreamError(status: number, body: string, secret: string): Ups
           : status === 400 || status === 422 ? "invalid_request"
             : status >= 500 ? "overloaded"
               : "api";
-  return new UpstreamProviderError(kind, redactSecret(body || `Upstream request failed (${status})`, secret), status);
+  return new UpstreamProviderError(kind, redactSecret(body || `Upstream request failed (${status})`, secret), status, retryAfter);
 }
 
 export function redactSecret(value: string, secret: string): string {

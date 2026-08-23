@@ -31,8 +31,8 @@ export interface GatewayOptions {
   readonly providers: readonly Provider[];
   readonly pingIntervalMs?: number;
   readonly usageLedger?: UsageLedger;
-  readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429 }) => Promise<void> | void;
-  readonly selectFallback?: (failure: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429 }) => Promise<{ readonly provider: Provider; readonly model: ProviderModel } | undefined>;
+  readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429; readonly retryAfter?: string | number }) => Promise<void> | void;
+  readonly selectFallback?: (failure: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429; readonly retryAfter?: string | number }) => Promise<{ readonly provider: Provider; readonly model: ProviderModel } | undefined>;
 }
 
 interface AnthropicErrorEnvelope {
@@ -99,11 +99,12 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       const controller = new AbortController();
       request.raw.once("aborted", () => controller.abort());
       const context = providerContext(request, controller.signal);
-      const tracker = await startAttempt(options.usageLedger, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, context);
+      const effectiveRequest = withAlfaCodeIdentity(resolved.request, resolved.provider, resolved.model);
+      const tracker = await startAttempt(options.usageLedger, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, effectiveRequest, context);
       try {
         const response = await collectResponse(
           resolved.provider,
-          resolved.request,
+          effectiveRequest,
           context,
           async (usage) => tracker.observe(usage),
         );
@@ -112,7 +113,8 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       } catch (error) {
         await tracker.finish(controller.signal.aborted ? "cancelled" : "failed", false, errorClass(error));
         const normalized = normalizeProviderError(error);
-        await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status);
+        await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status, normalized.retryAfter);
+        if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
         return reply.code(normalized.status).send(normalized.body);
       }
     }
@@ -135,11 +137,12 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     const controller = new AbortController();
     request.raw.once("aborted", () => controller.abort());
     try {
-      const usage = await resolved.provider.countTokens(resolved.request, providerContext(request, controller.signal));
+      const usage = await resolved.provider.countTokens(withAlfaCodeIdentity(resolved.request, resolved.provider, resolved.model), providerContext(request, controller.signal));
       return { input_tokens: usage.inputTokens };
     } catch (error) {
       const normalized = normalizeProviderError(error);
-      await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status);
+      await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status, normalized.retryAfter);
+      if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
       return reply.code(normalized.status).send(normalized.body);
     }
   });
@@ -308,57 +311,69 @@ async function streamResponse(
   response.setHeader("connection", "keep-alive");
   response.setHeader("x-accel-buffering", "no");
   const context = providerContext(request, controller.signal);
+  let wireStarted = false;
   let outputStarted = false;
   let provider = initialProvider;
   let providerModel = initialProviderModel;
   let routeModelId = initialRouteModelId;
-  let providerRequest = initialProviderRequest;
   try {
     while (!controller.signal.aborted) {
+      const providerRequest = withAlfaCodeIdentity(
+        { ...initialProviderRequest, model: providerModel.id },
+        provider,
+        providerModel,
+      );
       const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, extendedContext, providerRequest, context);
       const iterator = provider.streamMessage(providerRequest, context)[Symbol.asyncIterator]();
       let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
+      let attemptOutputStarted = false;
       try {
         while (!controller.signal.aborted) {
           pendingNext ??= iterator.next();
           const next = await nextOrPing(pendingNext, pingIntervalMs, controller.signal);
           if (next === "ping") {
-            outputStarted = true;
+            wireStarted = true;
             await write(response, sse("ping", { type: "ping" }), controller.signal);
             continue;
           }
           pendingNext = undefined;
           if (next.done) {
-            await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", outputStarted);
+            await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", attemptOutputStarted);
             return;
           }
           if (next.value.type === "usage") await tracker.observe(next.value.usage);
           else {
+            wireStarted = true;
             outputStarted = true;
+            attemptOutputStarted = true;
             await write(response, serializeEvent(next.value), controller.signal);
           }
         }
-        await tracker.finish("cancelled", outputStarted);
+        await tracker.finish("cancelled", attemptOutputStarted);
         return;
       } catch (error) {
         const normalized = normalizeProviderError(error);
-        await tracker.finish(controller.signal.aborted ? "cancelled" : outputStarted ? "partial" : "failed", outputStarted, errorClass(error));
+        await tracker.finish(controller.signal.aborted ? "cancelled" : attemptOutputStarted ? "partial" : "failed", attemptOutputStarted, errorClass(error));
         if (controller.signal.aborted) return;
         if (!outputStarted && (normalized.status === 404 || normalized.status === 429)) {
-          const failure = { providerId: provider.id, modelId: providerModel.id, statusCode: normalized.status } as const;
+          const failure = {
+            providerId: provider.id,
+            modelId: providerModel.id,
+            statusCode: normalized.status,
+            ...(normalized.retryAfter === undefined ? {} : { retryAfter: normalized.retryAfter }),
+          } as const;
           await onProviderOutcome?.(failure);
           const fallback = await selectFallback?.(failure);
           if (fallback !== undefined) {
             provider = fallback.provider;
             providerModel = fallback.model;
             routeModelId = encodeModelId(provider.id, providerModel.id);
-            providerRequest = { ...providerRequest, model: providerModel.id };
             continue;
           }
         }
-        if (!outputStarted) {
+        if (!wireStarted) {
           response.statusCode = normalized.status;
-          if (normalized.status === 429) response.setHeader("retry-after", "600");
+          if (normalized.status === 429) response.setHeader("retry-after", retryAfterHeader(normalized.retryAfter));
           response.setHeader("content-type", "application/json; charset=utf-8");
           response.end(JSON.stringify(normalized.body));
         } else {
@@ -376,8 +391,10 @@ async function streamResponse(
   }
 }
 
-async function recordProviderOutcome(options: GatewayOptions, providerId: string, modelId: string, status: number): Promise<void> {
-  if (status === 404 || status === 429) await options.onProviderOutcome?.({ providerId, modelId, statusCode: status });
+async function recordProviderOutcome(options: GatewayOptions, providerId: string, modelId: string, status: number, retryAfter?: string | number): Promise<void> {
+  if (status === 404 || status === 429) {
+    await options.onProviderOutcome?.({ providerId, modelId, statusCode: status, ...(retryAfter === undefined ? {} : { retryAfter }) });
+  }
 }
 
 function providerContext(request: FastifyRequest, signal: AbortSignal): import("./provider-contract.js").ProviderRequestContext {
@@ -491,7 +508,7 @@ function anthropicError(type: string, message: string): AnthropicErrorEnvelope {
   return { type: "error", error: { type, message } };
 }
 
-function normalizeProviderError(error: unknown): { readonly status: number; readonly body: AnthropicErrorEnvelope } {
+function normalizeProviderError(error: unknown): { readonly status: number; readonly body: AnthropicErrorEnvelope; readonly retryAfter?: string | number } {
   const known = providerError(error);
   const failure: ProviderError = known ?? { kind: "api", message: "Upstream provider failed" };
   const mapping: Record<ProviderError["kind"], readonly [number, string]> = {
@@ -507,5 +524,34 @@ function normalizeProviderError(error: unknown): { readonly status: number; read
   const status = failure.statusCode !== undefined && failure.statusCode >= 400 && failure.statusCode <= 599
     ? failure.statusCode
     : defaultStatus;
-  return { status, body: anthropicError(errorType, failure.message) };
+  return { status, body: anthropicError(errorType, failure.message), ...(failure.retryAfter === undefined ? {} : { retryAfter: failure.retryAfter }) };
+}
+
+function retryAfterHeader(value: string | number | undefined): string {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return String(Math.max(1, Math.ceil(value / 1000)));
+  }
+  if (typeof value === "string" && (/^\d+$/.test(value) || Number.isFinite(Date.parse(value)))) {
+    return value;
+  }
+  return "600";
+}
+
+function withAlfaCodeIdentity(request: ProviderMessageRequest, provider: Provider, model: ProviderModel): ProviderMessageRequest {
+  const identity = [
+    "AlfaCode runtime identity (authoritative for this request):",
+    "You are AlfaCode, a multi-provider coding assistant running through the Claude Code terminal runtime.",
+    `Active provider ID: ${safeIdentityValue(provider.id)}.`,
+    `Active model ID: ${safeIdentityValue(model.id)}.`,
+    "When asked who you are or which model powers you, report AlfaCode and these exact runtime values.",
+    "Do not describe AlfaCode as the official Anthropic Claude Code assistant.",
+  ].join("\n");
+  const system = request.system;
+  if (typeof system === "string") return { ...request, model: model.id, system: `${system}\n\n${identity}` };
+  if (Array.isArray(system)) return { ...request, model: model.id, system: [...system, { type: "text", text: identity }] };
+  return { ...request, model: model.id, system: [{ type: "text", text: identity }] };
+}
+
+function safeIdentityValue(value: string): string {
+  return JSON.stringify(value.replace(/[\u0000-\u001F\u007F]/g, "").slice(0, 256));
 }

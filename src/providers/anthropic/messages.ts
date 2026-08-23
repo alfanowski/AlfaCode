@@ -51,7 +51,7 @@ export class AnthropicMessagesAdapter implements Provider {
         },
         body: JSON.stringify({ ...request, stream: true }),
       });
-      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey);
+      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey, response.headers.get("retry-after") ?? undefined);
       let sawStart = false;
       let inputTokens = 0;
       for await (const frame of readSse(response)) {
@@ -84,7 +84,7 @@ export class AnthropicMessagesAdapter implements Provider {
         headers: { "content-type": "application/json", "x-api-key": this.options.apiKey, "anthropic-version": "2023-06-01" },
         body: JSON.stringify(request),
       });
-      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey);
+      if (!response.ok) throw upstreamError(response.status, await response.text(), this.options.apiKey, response.headers.get("retry-after") ?? undefined);
       const body: unknown = await response.json();
       if (!isRecord(body) || typeof body.input_tokens !== "number") throw new Error("Anthropic count_tokens response is invalid");
       return { inputTokens: body.input_tokens, source: "provider", exact: true };

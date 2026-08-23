@@ -55,7 +55,7 @@ Configure a Google provider explicitly using the macOS Keychain prompt:
 alfacode connect google --id google-personal
 ```
 
-With no credential flag, AlfaCode asks macOS Keychain to read the API key securely from the terminal. The key is never written to AlfaCode or Claude configuration.
+With no credential flag, AlfaCode opens its interactive provider picker and asks macOS Keychain to read the API key securely from the terminal. To add another provider later, exit the Claude runtime and run `alfacode connect` again. The key is never written to AlfaCode or Claude configuration and never enters a model transcript.
 
 Or reference an existing environment variable without persisting the key:
 
@@ -93,7 +93,7 @@ alfacode connect anthropic --id anthropic --api-key-env ANTHROPIC_API_KEY
 alfacode connect openai-compatible --id local --base-url http://127.0.0.1:4000/v1 --api-key-env LOCAL_API_KEY
 ```
 
-`alfacode models` displays live availability, advertised capabilities, quota state, and context/output headroom. Automatic selection first uses provider-reported normalized remaining capacity when it exists, then rolling local usage and fair scheduling. A 404 removes a model from consideration and a 429 puts it on cooldown. Google AI Studio does not expose exact remaining RPM/TPM/RPD through its model API, so AlfaCode deliberately reports that quota as unknown instead of inventing a number.
+`alfacode models` displays live availability, advertised capabilities, quota state, and context/output headroom. Automatic selection first uses provider-reported normalized remaining capacity when it exists, then rolling local usage and fair scheduling. A 404 removes a model from consideration. A 429 applies the provider's precise `Retry-After` delay when available, otherwise a conservative fallback cooldown, and transparently tries the next eligible model before any response content is emitted. Google AI Studio does not expose exact remaining RPM/TPM/RPD through its model API, so AlfaCode deliberately reports that quota as unknown instead of inventing a number.
 
 `alfacode` and `alfacode launch` pass subsequent Claude Code arguments through unchanged. `alfacode run` is the non-interactive alias; use `--` before Claude flags that could otherwise be interpreted by AlfaCode.
 
@@ -116,6 +116,8 @@ alfacode -- --model alfacode-anthropic/google-personal/<model-id>
 
 Inside the session, `/model` shows only currently callable, tool-capable models discovered from configured providers.
 Use `alfacode default <model-id>` to persist a manual AlfaCode pin, or `alfacode default auto` to return to automatic selection.
+
+Claude Code may still print that a project `.claude/settings.json` model pin applies on restart. That message describes Claude's own project setting; AlfaCode's launch-time `ANTHROPIC_MODEL` has higher precedence and automatic selection is recalculated on the next AlfaCode launch. AlfaCode also appends an authoritative runtime identity with the actual provider and model to every request, including requests retried through automatic failover.
 
 ## Data and cost warning
 
