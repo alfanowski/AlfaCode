@@ -1,0 +1,85 @@
+name: Provider compatibility report
+description: Report a model transport, streaming, tool-calling, or usage-mapping failure.
+title: "provider: "
+labels:
+  - "status: needs-triage"
+  - "area: providers"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Provider compatibility requires more than a successful text response. Please isolate the exact structured behavior that failed and redact all sensitive content.
+  - type: input
+    id: revision
+    attributes:
+      label: AlfaCode revision
+      placeholder: Output of `git rev-parse --short HEAD`
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider type
+      options:
+        - Google AI Studio
+        - OpenCode Zen public
+        - OpenCode Zen API key
+        - Anthropic
+        - OpenAI-compatible
+        - models.dev catalog connector
+    validations:
+      required: true
+  - type: input
+    id: endpoint
+    attributes:
+      label: Endpoint host
+      description: Hostname only. Do not include query strings, credentials, or private network details.
+      placeholder: generativelanguage.googleapis.com
+  - type: input
+    id: model
+    attributes:
+      label: Model identifier
+      description: The public upstream model ID. Redact it if account-sensitive.
+    validations:
+      required: true
+  - type: dropdown
+    id: capability
+    attributes:
+      label: Failing capability
+      options:
+        - Catalog discovery
+        - Authentication
+        - Text streaming
+        - Function or tool calling
+        - Parallel tool calls
+        - Tool-result continuation
+        - Reasoning or signature state
+        - Token or context accounting
+        - Cancellation
+        - Error or retry handling
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal safe reproduction
+      description: Use a synthetic prompt and disposable test project wherever possible.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed protocol behavior
+      description: Describe event types and ordering. Do not attach raw authenticated traffic.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private source, prompts, responses, headers, and customer data.
+          required: true
+        - label: I confirmed the model is currently listed by the configured provider.
+          required: true

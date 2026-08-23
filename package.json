@@ -2,7 +2,7 @@
   "name": "alfacode",
   "version": "0.1.0",
   "private": true,
-  "description": "A native multi-provider coding-agent TUI powered by a pinned Claude Code engine.",
+  "description": "A polished multi-provider AI coding agent for the terminal, powered by a pinned Claude Code engine.",
   "type": "module",
   "bin": {
     "alfacode": "./dist/cli.js"
@@ -10,6 +10,28 @@
   "engines": {
     "node": ">=24"
   },
+  "packageManager": "pnpm@10.30.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alfanowski/AlfaCode.git"
+  },
+  "homepage": "https://github.com/alfanowski/AlfaCode#readme",
+  "bugs": {
+    "url": "https://github.com/alfanowski/AlfaCode/issues"
+  },
+  "author": "Andrea Alfano",
+  "keywords": [
+    "ai-coding-agent",
+    "claude-code",
+    "gemini",
+    "google-ai-studio",
+    "llm",
+    "multi-provider",
+    "opencode-zen",
+    "terminal",
+    "tool-use",
+    "tui"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts",

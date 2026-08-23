@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a focused product or engineering improvement.
+title: "feat: "
+labels:
+  - enhancement
+  - "status: needs-triage"
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem is not solved today? Describe the workflow, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Explain the behavior from the user's point of view.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds and why they are insufficient.
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Compatibility and security constraints
+      description: Note affected providers, protocols, credentials, engine behavior, or terminal environments.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This proposal does not require hardcoded model IDs or model-name heuristics.
+          required: true
+        - label: I searched existing issues and discussions for the same request.
+          required: true

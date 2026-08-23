@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title description">
+  <title id="title">AlfaCode</title>
+  <desc id="description">A terminal preview showing AlfaCode routing a coding task through a dynamic multi-provider model catalog.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0e14"/>
+      <stop offset="0.55" stop-color="#111827"/>
+      <stop offset="1" stop-color="#151122"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+    <clipPath id="frame">
+      <rect x="54" y="54" width="1092" height="412" rx="20"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="520" rx="28" fill="url(#background)"/>
+  <circle cx="184" cy="92" r="120" fill="#2dd4bf" opacity="0.08" filter="url(#glow)"/>
+  <circle cx="1060" cy="428" r="150" fill="#8b5cf6" opacity="0.10" filter="url(#glow)"/>
+  <rect x="53" y="53" width="1094" height="414" rx="21" fill="none" stroke="url(#accent)" stroke-width="2" opacity="0.8"/>
+
+  <g clip-path="url(#frame)">
+    <rect x="54" y="54" width="1092" height="48" fill="#161b25"/>
+    <circle cx="82" cy="78" r="6" fill="#fb7185"/>
+    <circle cx="103" cy="78" r="6" fill="#fbbf24"/>
+    <circle cx="124" cy="78" r="6" fill="#34d399"/>
+    <text x="600" y="84" text-anchor="middle" fill="#768198" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">alfacode — ~/project</text>
+
+    <text x="90" y="149" fill="#2dd4bf" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="26" font-weight="700">α</text>
+    <text x="122" y="149" fill="#f8fafc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="24" font-weight="700">AlfaCode</text>
+    <rect x="269" y="127" width="69" height="27" rx="13" fill="#2dd4bf" opacity="0.14"/>
+    <text x="303" y="145" text-anchor="middle" fill="#5eead4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">AUTO</text>
+    <text x="1110" y="146" text-anchor="end" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">82% context left</text>
+
+    <text x="90" y="201" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">YOU</text>
+    <text x="151" y="201" fill="#e2e8f0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">Review the auth flow, fix the race, and run the focused tests.</text>
+
+    <text x="90" y="251" fill="#a78bfa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">ROUTE</text>
+    <text x="151" y="251" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">live catalog</text>
+    <text x="264" y="251" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">→</text>
+    <text x="290" y="251" fill="#5eead4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">google / selected-model</text>
+    <text x="515" y="251" fill="#475569" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">· tools verified · quota available</text>
+
+    <rect x="88" y="278" width="1024" height="105" rx="12" fill="#0b1018" stroke="#273244"/>
+    <text x="111" y="310" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">✓ Read</text>
+    <text x="202" y="310" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">src/auth/session.ts</text>
+    <text x="111" y="340" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">✓ Edit</text>
+    <text x="202" y="340" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">guard token refresh with a shared in-flight promise</text>
+    <text x="111" y="370" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">✓ Test</text>
+    <text x="202" y="370" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">12 passed · 0 failed · 1.8s</text>
+
+    <text x="90" y="426" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">›</text>
+    <text x="114" y="426" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">Ask a follow-up, request a change, or type /</text>
+    <rect x="88" y="443" width="1024" height="2" fill="url(#accent)" opacity="0.65"/>
+  </g>
+</svg>
