@@ -176,7 +176,7 @@ describe('GoogleProvider', () => {
   });
 
   it('persists state with atomic valid JSON', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'polycode-google-'));
+    const dir = await mkdtemp(join(tmpdir(), 'alfacode-google-'));
     const path = join(dir, 'state.json');
     const store = new FileGoogleStateStore(path);
     await Promise.all([

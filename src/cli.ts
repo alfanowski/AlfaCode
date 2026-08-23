@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { ConfigStore, type ProviderRecord, type SecretReference } from "./config.js";
+import { ConfigStore, type AlfaCodeConfig, type ProviderRecord, type SecretReference } from "./config.js";
 import { launchClaude, type ClaudeLaunchOptions } from "./claude-launcher.js";
 import { MacOSKeychain } from "./secrets.js";
 import { startRuntime } from "./runtime.js";
@@ -9,12 +9,11 @@ export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
   readonly defaultModelId?: string;
-  readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   close(): Promise<void>;
 }
 
-export type StartRuntime = (input: { provider: ProviderRecord; config: import("./config.js").PolycodeConfig }) => Promise<RuntimeHandle>;
+export type StartRuntime = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<RuntimeHandle>;
 
 export interface CreateCliOptions {
   readonly configStore?: ConfigStore;
@@ -27,8 +26,8 @@ export function createCli(options: CreateCliOptions = {}): Command {
   const configStore = options.configStore ?? new ConfigStore();
   const keychain = options.keychain ?? new MacOSKeychain();
   const program = new Command();
-  program.name("polycode")
-    .description("Run Claude Code through a local Polycode gateway")
+  program.name("alfacode")
+    .description("Run Claude Code through the local AlfaCode gateway")
     .argument("[args...]", "Arguments passed unchanged to Claude")
     .allowUnknownOption(true);
 
@@ -43,9 +42,9 @@ export function createCli(options: CreateCliOptions = {}): Command {
       const id = flags.id ?? type;
       const useKeychain = flags.keychain || flags.apiKeyEnv === undefined;
       const apiKey: SecretReference | undefined = flags.apiKeyEnv === undefined
-        ? { kind: "keychain", service: "polycode", account: id }
+        ? { kind: "keychain", service: "alfacode", account: id }
         : { kind: "env", name: flags.apiKeyEnv };
-      if (useKeychain) await keychain.store(id, "polycode");
+      if (useKeychain) await keychain.store(id, "alfacode");
       await configStore.update((config) => {
         if (config.providers.some((existing) => existing.id === id)) throw new Error(`Provider already exists: ${id}`);
         const record: ProviderRecord = apiKey === undefined ? { id, type } : { id, type, apiKey };
@@ -76,7 +75,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const config = await configStore.read();
     const providerId = config.defaultProviderId;
     const selected = config.providers.find((item) => item.id === providerId);
-    if (selected === undefined) throw new Error("No default provider configured. Run: polycode provider add google");
+    if (selected === undefined) throw new Error("No default provider configured. Run: alfacode connect");
     const runtime = await options.startRuntime({ provider: selected, config });
     try {
       const launchOptions: ClaudeLaunchOptions = {
@@ -84,7 +83,6 @@ export function createCli(options: CreateCliOptions = {}): Command {
         baseUrl: runtime.baseUrl,
         authToken: runtime.authToken,
         ...(runtime.defaultModelId === undefined ? {} : { defaultModelId: runtime.defaultModelId }),
-        ...(runtime.contextWindowTokens === undefined ? {} : { contextWindowTokens: runtime.contextWindowTokens }),
         ...(runtime.secretEnvironmentNames === undefined ? {} : { scrubEnvironmentKeys: runtime.secretEnvironmentNames }),
       };
       const exitCode = await (options.launch ?? launchClaude)(launchOptions);
@@ -103,7 +101,7 @@ export async function main(argv = process.argv): Promise<void> {
 if (import.meta.url === `file://${process.argv[1]}`) {
   void main().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`polycode: ${message}\n`);
+    process.stderr.write(`alfacode: ${message}\n`);
     process.exitCode = 1;
   });
 }

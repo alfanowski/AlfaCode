@@ -6,7 +6,7 @@ import { buildClaudeEnvironment, launchClaude } from "../src/claude-launcher.js"
 
 describe("launchClaude", () => {
   it("uses isolated config and replaces inherited cloud routing credentials", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "polycode-claude-test-"));
+    const configDir = await mkdtemp(join(tmpdir(), "alfacode-claude-test-"));
     let request: Parameters<NonNullable<Parameters<typeof launchClaude>[0]["spawner"]>>[0] | undefined;
     const exitCode = await launchClaude({
       claudePath: "/test/claude",
@@ -15,8 +15,7 @@ describe("launchClaude", () => {
       authToken: "ephemeral-token",
       configDir,
       defaultModelId: "gemini-3-pro",
-      contextWindowTokens: 1_000_000,
-      extraEnv: { POLYCODE_GATEWAY_URL: "http://127.0.0.1:4317" },
+      extraEnv: { ALFACODE_GATEWAY_URL: "http://127.0.0.1:4317" },
       scrubEnvironmentKeys: ["CUSTOM_GOOGLE_KEY"],
       environment: { ANTHROPIC_API_KEY: "leak", GEMINI_API_KEY: "leak", CUSTOM_GOOGLE_KEY: "leak", AWS_PROFILE: "wrong", PATH: "/bin" },
       spawner: async (next) => { request = next; return 17; },
@@ -33,12 +32,12 @@ describe("launchClaude", () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_SONNET_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "gemini-3-pro",
-      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
     });
     expect(request?.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(request?.env.GEMINI_API_KEY).toBeUndefined();
     expect(request?.env.CUSTOM_GOOGLE_KEY).toBeUndefined();
     expect(request?.env.AWS_PROFILE).toBeUndefined();
+    expect(request?.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
     await rm(configDir, { recursive: true, force: true });
   });
 

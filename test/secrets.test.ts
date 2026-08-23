@@ -11,14 +11,14 @@ describe("MacOSKeychain", () => {
     await new MacOSKeychain(runner).store("google-main");
     expect(calls).toEqual([{
       command: "/usr/bin/security",
-      args: ["add-generic-password", "-U", "-a", "google-main", "-s", "polycode", "-w"],
+      args: ["add-generic-password", "-U", "-a", "google-main", "-s", "alfacode", "-w"],
       options: { interactive: true },
     }]);
   });
 
   it("resolves portable env references without invoking Keychain", async () => {
     const keychain = { retrieve: async () => { throw new Error("must not run"); } };
-    const resolver = new SecretResolver({ environment: { POLYCODE_KEY: "test-value" }, keychain });
-    await expect(resolver.resolve({ kind: "env", name: "POLYCODE_KEY" })).resolves.toBe("test-value");
+    const resolver = new SecretResolver({ environment: { ALFACODE_KEY: "test-value" }, keychain });
+    await expect(resolver.resolve({ kind: "env", name: "ALFACODE_KEY" })).resolves.toBe("test-value");
   });
 });

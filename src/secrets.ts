@@ -25,7 +25,7 @@ export const systemCommandRunner: CommandRunner = {
   },
 };
 
-export const keychainService = "polycode";
+export const keychainService = "alfacode";
 
 export class MacOSKeychain {
   constructor(private readonly runner: CommandRunner = systemCommandRunner) {}

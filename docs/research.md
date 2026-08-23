@@ -1,13 +1,13 @@
 # Research and product decisions
 
-Research snapshot: 2026-08-23. Polycode intentionally wraps the installed Claude Code executable; it does not copy or reimplement its terminal UX.
+Research snapshot: 2026-08-23. AlfaCode intentionally wraps the installed Claude Code executable; it does not copy or reimplement its terminal UX.
 
 ## Verified Claude Code contract
 
 - Claude Code officially supports an Anthropic Messages gateway selected by `ANTHROPIC_BASE_URL`, while Anthropic explicitly does not support non-Claude models behind third-party gateways.
 - The required inference endpoint is `POST /v1/messages`. `POST /v1/messages/count_tokens`, `HEAD /api/hello`, and `GET /v1/models?limit=1000` cover token counting, warm-up, and model discovery.
 - Inference must be streamed as SSE. Silent streams time out after 300 seconds, so the gateway emits pings during upstream pauses.
-- Discovery has a three-second deadline, follows no redirects, and accepts only IDs containing `claude` or `anthropic`. Polycode therefore prewarms model catalogs and uses `polycode-anthropic/<provider>/<model>` routing IDs.
+- Discovery has a three-second deadline, follows no redirects, and accepts only IDs containing `claude` or `anthropic`. AlfaCode therefore prewarms model catalogs and uses `alfacode-anthropic/<provider>/<model>` routing IDs.
 - `x-claude-code-session-id` and `x-claude-code-agent-id` provide the stable scope required for provider-side reasoning and tool metadata.
 - `CLAUDE_CONFIG_DIR` relocates sessions, settings, plugins, and the discovered-model cache, allowing complete isolation from the normal `claude` command.
 
@@ -41,7 +41,7 @@ References:
 
 The initial provider uses the official `@google/genai` SDK and the stateless Generate Content API. Claude Code already sends full history, so stateless translation is natural and does not require a remote conversation store.
 
-Gemini thought signatures are the hard compatibility edge. Gemini 3 requires the signature from a function-call response to be replayed in the exact part on the next tool step; parallel calls carry the signature only on the first function call. Polycode persists that opaque metadata by Claude session, agent, and tool-call ID using atomic mode-0600 files.
+Gemini thought signatures are the hard compatibility edge. Gemini 3 requires the signature from a function-call response to be replayed in the exact part on the next tool step; parallel calls carry the signature only on the first function call. AlfaCode persists that opaque metadata by Claude session, agent, and tool-call ID using atomic mode-0600 files.
 
 References:
 
@@ -50,7 +50,7 @@ References:
 
 ## Privacy and cost constraints
 
-Polycode never enables billing and does not implement fallback routing that could silently select a paid provider. Costs and quotas remain controlled by each provider account.
+AlfaCode never enables billing and does not implement fallback routing that could silently select a paid provider. Costs and quotas remain controlled by each provider account.
 
 Google's current terms distinguish unpaid and paid processing. In the EEA, Switzerland, and the UK, paid-service data terms apply even to unpaid quota; outside those regions, unpaid-service prompts and responses may be used for product improvement and reviewed by humans. Repository content must therefore never be sent until its employer/client policy permits that provider and account.
 

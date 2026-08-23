@@ -11,7 +11,7 @@ import type {
   ProviderMessageRequest,
   ProviderRequestContext,
 } from "./provider-contract.js";
-import type { PolycodeConfig, ProviderRecord } from "./config.js";
+import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import { SecretResolver } from "./secrets.js";
 import { GoogleProvider } from "./providers/google/provider.js";
 import type {
@@ -24,14 +24,13 @@ export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
   readonly defaultModelId?: string;
-  readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   close(): Promise<void>;
 }
 
 export interface StartRuntimeInput {
   readonly provider: ProviderRecord;
-  readonly config: PolycodeConfig;
+  readonly config: AlfaCodeConfig;
 }
 
 export interface RuntimeDependencies {
@@ -61,7 +60,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       if (apiKey === undefined || apiKey.length === 0) throw new Error(`API key unavailable for provider '${record.id}'`);
       const google = (dependencies.createGoogle ?? ((options) => new GoogleProvider(options)))({
         apiKey,
-        statePath: join(homeDirectory, ".polycode", "state", `${record.id}-google-tools.json`),
+        statePath: join(homeDirectory, ".alfacode", "state", `${record.id}-google-tools.json`),
       });
       const models = await google.listModels();
       if (models.length === 0) throw new Error(`Provider '${record.id}' returned no Generate Content models`);
@@ -78,15 +77,10 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
 
     const authToken = randomBytes(32).toString("base64url");
     const gateway = await listenLocalGateway({ token: authToken, providers });
-    const contextWindows = providers.flatMap((provider) => (provider as GoogleGatewayProvider).googleModels
-      .map((model) => model.contextWindow)
-      .filter((window): window is number => window !== undefined));
-    const contextWindowTokens = contextWindows.length === 0 ? undefined : Math.min(...contextWindows);
     return {
       baseUrl: gateway.address,
       authToken,
       defaultModelId: encodeModelId(selectedProvider.id, selectedModel.id),
-      ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => gateway.app.close(),
     };
@@ -120,7 +114,7 @@ export class GoogleGatewayProvider implements Provider {
     yield {
       type: "message_start",
       message: {
-        id: `msg_polycode_${randomUUID().replaceAll("-", "")}`,
+        id: `msg_alfacode_${randomUUID().replaceAll("-", "")}`,
         type: "message",
         role: "assistant",
         model,

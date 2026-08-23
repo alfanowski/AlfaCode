@@ -93,7 +93,7 @@ describe("Anthropic gateway", () => {
       upstreamModel: "vendor/model:1",
     });
     expect(decodeModelId("claude-test")).toBeUndefined();
-    expect(decodeModelId("polycode-anthropic/a/%ZZ")).toBeUndefined();
+    expect(decodeModelId("alfacode-anthropic/a/%ZZ")).toBeUndefined();
   });
 
   it("forwards unknown fields and translates canonical events in exact SSE order", async () => {

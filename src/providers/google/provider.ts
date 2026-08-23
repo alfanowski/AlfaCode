@@ -31,7 +31,7 @@ export class GoogleProvider {
 
   public constructor(options: GoogleProviderOptions = {}) {
     this.client = options.client ?? new GoogleGenAI(options.apiKey === undefined ? {} : { apiKey: options.apiKey }) as unknown as GoogleSdkClient;
-    this.stateStore = options.stateStore ?? new FileGoogleStateStore(options.statePath ?? '.polycode/google-tool-state.json');
+    this.stateStore = options.stateStore ?? new FileGoogleStateStore(options.statePath ?? '.alfacode/google-tool-state.json');
   }
 
   public async listModels(): Promise<ProviderModel[]> {

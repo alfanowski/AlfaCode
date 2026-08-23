@@ -56,7 +56,7 @@ export type CanonicalStreamEvent =
   | { readonly type: "message_stop" };
 
 export interface ProviderModel {
-  /** The provider-native model name, without the polycode-anthropic prefix. */
+  /** The provider-native model name, without the alfacode-anthropic prefix. */
   readonly id: string;
   readonly displayName?: string;
   readonly createdAt?: string;

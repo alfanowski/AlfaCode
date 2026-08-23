@@ -1,6 +1,6 @@
 # Security policy
 
-Polycode handles provider credentials and repository content. Security reports should not contain real API keys, prompts, source code, or customer data.
+AlfaCode handles provider credentials and repository content. Security reports should not contain real API keys, prompts, source code, or customer data.
 
 ## Defaults
 

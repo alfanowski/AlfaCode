@@ -7,7 +7,7 @@ import { ConfigStore } from "../src/config.js";
 const temporaryDirectories: string[] = [];
 
 async function createTemporaryDirectory(): Promise<string> {
-  const directory = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(join(tmpdir(), "polycode-test-")));
+  const directory = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(join(tmpdir(), "alfacode-test-")));
   temporaryDirectories.push(directory);
   return directory;
 }
@@ -44,7 +44,7 @@ describe("ConfigStore", () => {
   it("refuses symlinked config directories and files", async () => {
     const home = await createTemporaryDirectory();
     const outside = await createTemporaryDirectory();
-    await symlink(outside, join(home, ".polycode"));
+    await symlink(outside, join(home, ".alfacode"));
     await expect(new ConfigStore({ homeDirectory: home }).write({ version: 1, providers: [] })).rejects.toThrow("symbolic link");
 
     const directory = join(home, "safe");

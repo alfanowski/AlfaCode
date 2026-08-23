@@ -8,16 +8,16 @@ import type { CanonicalStreamEvent, Provider } from "../src/provider-contract.js
 
 const upstreamModel = "gemini-smoke";
 const routedModel = encodeModelId("smoke", upstreamModel);
-const token = "polycode-local-smoke-token";
-const configDir = await mkdtemp(join(tmpdir(), "polycode-claude-smoke-"));
+const token = "alfacode-local-smoke-token";
+const configDir = await mkdtemp(join(tmpdir(), "alfacode-claude-smoke-"));
 const provider: Provider = {
   id: "smoke",
-  models: [{ id: upstreamModel, displayName: "Polycode Smoke Model" }],
+  models: [{ id: upstreamModel, displayName: "AlfaCode Smoke Model" }],
   async *streamMessage(): AsyncIterable<CanonicalStreamEvent> {
     yield {
       type: "message_start",
       message: {
-        id: "msg_polycode_smoke",
+        id: "msg_alfacode_smoke",
         type: "message",
         role: "assistant",
         model: routedModel,
@@ -28,7 +28,7 @@ const provider: Provider = {
       },
     };
     yield { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } };
-    yield { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "POLYCODE_SMOKE_OK" } };
+    yield { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ALFACODE_SMOKE_OK" } };
     yield { type: "content_block_stop", index: 0 };
     yield { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { input_tokens: 1, output_tokens: 1 } };
     yield { type: "message_stop" };

@@ -16,7 +16,7 @@ const providerSchema = z.object({
   options: z.record(z.string(), z.unknown()).optional(),
 }).strict();
 
-export const polycodeConfigSchema = z.object({
+export const alfacodeConfigSchema = z.object({
   version: z.literal(1),
   defaultProviderId: z.string().min(1).optional(),
   providers: z.array(providerSchema),
@@ -35,9 +35,9 @@ export const polycodeConfigSchema = z.object({
 
 export type SecretReference = z.infer<typeof secretReferenceSchema>;
 export type ProviderRecord = z.infer<typeof providerSchema>;
-export type PolycodeConfig = z.infer<typeof polycodeConfigSchema>;
+export type AlfaCodeConfig = z.infer<typeof alfacodeConfigSchema>;
 
-export const emptyConfig = (): PolycodeConfig => ({ version: 1, providers: [] });
+export const emptyConfig = (): AlfaCodeConfig => ({ version: 1, providers: [] });
 
 export interface ConfigStoreOptions {
   readonly homeDirectory?: string;
@@ -50,24 +50,24 @@ export class ConfigStore {
   readonly directory: string;
 
   constructor(options: ConfigStoreOptions = {}) {
-    this.path = options.configPath ?? join(options.homeDirectory ?? homedir(), ".polycode", "config.json");
+    this.path = options.configPath ?? join(options.homeDirectory ?? homedir(), ".alfacode", "config.json");
     this.directory = dirname(this.path);
   }
 
-  async read(): Promise<PolycodeConfig> {
+  async read(): Promise<AlfaCodeConfig> {
     try {
       await this.assertSafePath(this.directory, true);
       await this.assertRegularFile(this.path);
       const raw = await readFile(this.path, "utf8");
-      return polycodeConfigSchema.parse(JSON.parse(raw));
+      return alfacodeConfigSchema.parse(JSON.parse(raw));
     } catch (error: unknown) {
       if (isNotFound(error)) return emptyConfig();
       throw error;
     }
   }
 
-  async write(config: PolycodeConfig): Promise<void> {
-    const validated = polycodeConfigSchema.parse(config);
+  async write(config: AlfaCodeConfig): Promise<void> {
+    const validated = alfacodeConfigSchema.parse(config);
     await this.ensureSafeDirectory();
     try {
       await this.assertRegularFile(this.path);
@@ -90,7 +90,7 @@ export class ConfigStore {
     }
   }
 
-  async update(mutator: (config: PolycodeConfig) => PolycodeConfig): Promise<PolycodeConfig> {
+  async update(mutator: (config: AlfaCodeConfig) => AlfaCodeConfig): Promise<AlfaCodeConfig> {
     const next = mutator(await this.read());
     await this.write(next);
     return next;

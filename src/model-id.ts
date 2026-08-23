@@ -1,4 +1,4 @@
-const PREFIX = "polycode-anthropic";
+const PREFIX = "alfacode-anthropic";
 const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]*$/i;
 
 export interface DecodedModelId {
