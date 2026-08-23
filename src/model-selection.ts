@@ -49,6 +49,8 @@ export interface QuotaReporter {
 
 export interface ModelUsage {
   readonly attempts: number;
+  readonly completedAttempts?: number;
+  readonly failedAttempts?: number;
   readonly totalTokens?: number;
 }
 
@@ -318,6 +320,12 @@ function isQuotaExhausted(quota: ModelSelectionHealth["quota"]): boolean {
 function compareCandidates(left: Candidate, right: Candidate): number {
   const quotaOrder = compareQuotaCapacity(left.quota, right.quota);
   if (quotaOrder !== 0) return quotaOrder;
+  const leftValidated = (left.usage.completedAttempts ?? 0) > 0;
+  const rightValidated = (right.usage.completedAttempts ?? 0) > 0;
+  if (leftValidated !== rightValidated) return leftValidated ? -1 : 1;
+  const leftFailures = left.usage.failedAttempts ?? 0;
+  const rightFailures = right.usage.failedAttempts ?? 0;
+  if (leftFailures !== rightFailures) return leftFailures - rightFailures;
   if (left.usage.attempts !== right.usage.attempts) return left.usage.attempts - right.usage.attempts;
   if (left.usage.totalTokens !== undefined && right.usage.totalTokens !== undefined && left.usage.totalTokens !== right.usage.totalTokens) return left.usage.totalTokens - right.usage.totalTokens;
   if (left.health.selections !== right.health.selections) return left.health.selections - right.health.selections;

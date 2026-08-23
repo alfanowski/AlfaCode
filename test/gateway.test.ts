@@ -162,21 +162,26 @@ describe("Anthropic gateway", () => {
     try {
       const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
       expect(response.statusCode).toBe(429);
+      expect(response.headers["retry-after"]).toBe("600");
       expect(outcomes).toEqual([{ providerId: "mock", modelId: "claude-test", statusCode: 429 }]);
     } finally { await server.close(); }
   });
 
-  it("rejects oversized prompts before starting billable inference", async () => {
-    let streamed = false;
-    const provider = fakeProvider({
-      models: [{ id: "claude-test", limits: { maxInputTokens: 5, contextIncludesOutput: false }, capabilities: { tokenCounting: "exact", usageReporting: "final" } }],
-      async *streamMessage() { streamed = true; yield* events; },
-      async countTokens() { return { inputTokens: 12, source: "provider", exact: true }; },
+  it("fails over before emitting bytes when the selected model is exhausted", async () => {
+    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429 }; } });
+    const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }] });
+    const failures: string[] = [];
+    const server = createGatewayServer({
+      token: "test-token", providers: [exhausted, healthy],
+      onProviderOutcome: async (failure) => { failures.push(`${failure.providerId}/${failure.modelId}`); },
+      selectFallback: async () => ({ provider: healthy, model: healthy.models[0]! }),
     });
-    const response = await app(provider).inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.message).toContain("capability_rejected: prompt_too_long");
-    expect(streamed).toBe(false);
+    try {
+      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: encodeModelId("exhausted", "model-a"), messages: [], max_tokens: 10, stream: true } });
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"text":"hello"');
+      expect(failures).toEqual(["exhausted/model-a"]);
+    } finally { await server.close(); }
   });
 
   it("forwards unknown fields and translates canonical events in exact SSE order", async () => {

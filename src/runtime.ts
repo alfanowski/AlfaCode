@@ -311,7 +311,16 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       token: authToken,
       providers,
       usageLedger: ledger,
-      ...(activeSelector === undefined ? {} : { onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: 404 | 429 }) => activeSelector.recordOutcome(outcome) }),
+      ...(activeSelector === undefined ? {} : {
+        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: 404 | 429 }) => activeSelector.recordOutcome(outcome),
+        selectFallback: async () => {
+          const fallback = (await activeSelector.select(candidates, { streaming: true, tools: true })).selected;
+          if (fallback === undefined) return undefined;
+          const provider = providers.find((item) => item.id === fallback.providerId);
+          const model = provider?.models.find((item) => item.id === fallback.id);
+          return provider === undefined || model === undefined ? undefined : { provider, model };
+        },
+      }),
     });
     return {
       baseUrl: gateway.address,
@@ -359,20 +368,7 @@ export class GoogleGatewayProvider implements Provider {
     let openBlock: { index: number; type: "text" | "thinking" } | undefined;
     let usage: AnthropicUsage = { input_tokens: 0, output_tokens: 0 };
     let stopReason = "end_turn";
-
-    yield {
-      type: "message_start",
-      message: {
-        id: `msg_alfacode_${randomUUID().replaceAll("-", "")}`,
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage,
-      },
-    };
+    let started = false;
 
     for await (const event of this.upstream.stream(toGoogleRequest(request), {
       session: context.session,
@@ -381,6 +377,16 @@ export class GoogleGatewayProvider implements Provider {
     })) {
       if (event.type === "warning") continue;
       if (event.type === "error") throw googleProviderError(event);
+      if (!started) {
+        started = true;
+        yield {
+          type: "message_start",
+          message: {
+            id: `msg_alfacode_${randomUUID().replaceAll("-", "")}`,
+            type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage,
+          },
+        };
+      }
       if (event.type === "usage") {
         usage = {
           input_tokens: event.input_tokens,
@@ -448,6 +454,7 @@ export class GoogleGatewayProvider implements Provider {
         index += 1;
       }
     }
+    if (!started) throw { kind: "api", message: "Upstream provider returned an empty response" } satisfies ProviderError;
     if (openBlock !== undefined) yield { type: "content_block_stop", index: openBlock.index };
     yield { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage };
     yield { type: "message_stop" };

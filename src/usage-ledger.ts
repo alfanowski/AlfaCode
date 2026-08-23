@@ -75,6 +75,8 @@ export interface RollingUsageQuery {
 
 export interface RollingUsage {
   readonly attempts: number;
+  readonly completedAttempts: number;
+  readonly failedAttempts: number;
   /** Undefined means the providers did not report a total for any matching attempt. */
   readonly totalTokens?: number;
 }
@@ -194,11 +196,16 @@ export class UsageLedger {
     if (query.providerId !== undefined) { where.push("provider_id = ?"); values.push(query.providerId); }
     if (query.upstreamModel !== undefined) { where.push("upstream_model = ?"); values.push(query.upstreamModel); }
     const row = this.database.prepare(`
-      SELECT COUNT(*) AS attempts, SUM(total_tokens) AS total_tokens, COUNT(total_tokens) AS reported_totals
+      SELECT COUNT(*) AS attempts,
+        SUM(CASE WHEN outcome = 'completed' THEN 1 ELSE 0 END) AS completed_attempts,
+        SUM(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END) AS failed_attempts,
+        SUM(total_tokens) AS total_tokens, COUNT(total_tokens) AS reported_totals
       FROM attempts WHERE ${where.join(" AND ")}
-    `).get(...values) as { attempts?: number; total_tokens?: number; reported_totals?: number };
+    `).get(...values) as { attempts?: number; completed_attempts?: number; failed_attempts?: number; total_tokens?: number; reported_totals?: number };
     return {
       attempts: row.attempts ?? 0,
+      completedAttempts: row.completed_attempts ?? 0,
+      failedAttempts: row.failed_attempts ?? 0,
       ...(row.reported_totals === undefined || row.reported_totals === 0 || row.total_tokens === undefined ? {} : { totalTokens: row.total_tokens }),
     };
   }

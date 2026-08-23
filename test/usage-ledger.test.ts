@@ -51,8 +51,8 @@ describe("UsageLedger", () => {
     const missing = await store.start({ session: "session", agent: "main", providerId: "google", routeModelId: "route-b", upstreamModel: "other", model, extendedContext: false });
     await store.finish(missing, "failed", false);
 
-    expect(await store.rollingUsage({ since: 0, providerId: "google", upstreamModel: model.id })).toEqual({ attempts: 1, totalTokens: 19 });
-    expect(await store.rollingUsage({ since: 0, providerId: "google", upstreamModel: "other" })).toEqual({ attempts: 1 });
+    expect(await store.rollingUsage({ since: 0, providerId: "google", upstreamModel: model.id })).toEqual({ attempts: 1, completedAttempts: 1, failedAttempts: 0, totalTokens: 19 });
+    expect(await store.rollingUsage({ since: 0, providerId: "google", upstreamModel: "other" })).toEqual({ attempts: 1, completedAttempts: 0, failedAttempts: 1 });
     await store.close();
   });
 

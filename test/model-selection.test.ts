@@ -110,6 +110,14 @@ describe("AutomaticModelSelector", () => {
     expect((await selector.select([model("used"), model("fresh")])).selected?.id).toBe("fresh");
   });
 
+  it("prefers a route proven compatible with Claude Code over an untested catalog entry", async () => {
+    const history: ModelUsageHistory = {
+      rollingUsage: async (candidate) => candidate.id === "validated" ? { attempts: 2, completedAttempts: 2, failedAttempts: 0 } : { attempts: 0, completedAttempts: 0, failedAttempts: 0 },
+    };
+    const selector = new AutomaticModelSelector({ usageHistory: history });
+    expect((await selector.select([model("untested"), model("validated")])).selected?.id).toBe("validated");
+  });
+
   it("bounds concurrent non-billable availability probes and honors their result", async () => {
     let active = 0;
     let maximum = 0;

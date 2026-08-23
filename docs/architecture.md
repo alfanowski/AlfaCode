@@ -21,8 +21,8 @@ Claude Code sends Anthropic Messages API traffic to a single endpoint. The gatew
 - Provider-owned account catalogs are authoritative for additions and removals.
 - AlfaCode verifies availability with non-inference endpoints before routing.
 - models.dev supplies refreshable protocol/capability metadata, never credentials or a default-model policy.
-- Selection never parses a model ID, version, display name, or catalog position. Known normalized quota headroom wins; otherwise the privacy-preserving local usage ledger provides fair scheduling.
-- Provider 404/429 outcomes persist into future selection, so retired or exhausted routes are not repeatedly chosen.
+- Selection never parses a model ID, version, display name, or catalog position. Known normalized quota headroom wins; otherwise the privacy-preserving local usage ledger prioritizes routes already proven compatible and fairly schedules comparable candidates.
+- Provider 404/429 outcomes persist into future selection. Before any response bytes are emitted, AlfaCode transparently fails over to the next eligible route; an exhausted catalog returns a cooldown instead of repeatedly choosing the same model.
 - The context limit passed to Claude Code belongs to the selected model. It is never the smallest unrelated entry in a heterogeneous provider catalog.
 
 ## Model identifiers

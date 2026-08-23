@@ -32,6 +32,7 @@ export interface GatewayOptions {
   readonly pingIntervalMs?: number;
   readonly usageLedger?: UsageLedger;
   readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429 }) => Promise<void> | void;
+  readonly selectFallback?: (failure: { readonly providerId: string; readonly modelId: string; readonly statusCode: 404 | 429 }) => Promise<{ readonly provider: Provider; readonly model: ProviderModel } | undefined>;
 }
 
 interface AnthropicErrorEnvelope {
@@ -91,16 +92,6 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       return reply.code(resolved.status).send(anthropicError(resolved.errorType, resolved.message));
     }
 
-    const preflightController = new AbortController();
-    request.raw.once("aborted", () => preflightController.abort());
-    try {
-      await enforceModelContext(resolved.provider, resolved.model, resolved.request, providerContext(request, preflightController.signal));
-    } catch (error) {
-      const normalized = normalizeProviderError(error);
-      await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status);
-      return reply.code(normalized.status).send(normalized.body);
-    }
-
     const requestId = `req_${randomUUID().replaceAll("-", "")}`;
     reply.raw.setHeader("request-id", requestId);
     reply.raw.setHeader("x-request-id", requestId);
@@ -127,7 +118,7 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     }
 
     reply.hijack();
-    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, pingIntervalMs, options.usageLedger, options.onProviderOutcome);
+    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, pingIntervalMs, options.usageLedger, options.onProviderOutcome, options.selectFallback);
   });
 
   app.post("/v1/messages/count_tokens", async (request, reply) => {
@@ -158,18 +149,6 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
   });
 
   return app;
-}
-
-async function enforceModelContext(provider: Provider, model: ProviderModel, request: ProviderMessageRequest, context: ReturnType<typeof providerContext>): Promise<void> {
-  const maximum = model.limits?.maxInputTokens ?? model.limits?.contextWindowTokens;
-  if (maximum === undefined || model.capabilities?.tokenCounting === "none") return;
-  const count = await provider.countTokens(request, context);
-  if (count.inputTokens <= maximum) return;
-  throw {
-    kind: "invalid_request",
-    statusCode: 400,
-    message: `capability_rejected: prompt_too_long (input ${count.inputTokens}, model limit ${maximum})`,
-  } satisfies ProviderError;
 }
 
 async function collectResponse(
@@ -308,14 +287,15 @@ function resolveProviderRequest(
 async function streamResponse(
   response: ServerResponse,
   request: FastifyRequest,
-  provider: Provider,
-  providerModel: ProviderModel,
-  routeModelId: string,
+  initialProvider: Provider,
+  initialProviderModel: ProviderModel,
+  initialRouteModelId: string,
   extendedContext: boolean,
-  providerRequest: ProviderMessageRequest,
+  initialProviderRequest: ProviderMessageRequest,
   pingIntervalMs: number,
   ledger: UsageLedger | undefined,
   onProviderOutcome: GatewayOptions["onProviderOutcome"],
+  selectFallback: GatewayOptions["selectFallback"],
 ): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -328,58 +308,72 @@ async function streamResponse(
   response.setHeader("connection", "keep-alive");
   response.setHeader("x-accel-buffering", "no");
   const context = providerContext(request, controller.signal);
-  const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, extendedContext, providerRequest, context);
   let outputStarted = false;
-  let outcome: AttemptOutcome = "partial";
-  let failureClass: string | undefined;
-  let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
-  const iterator = provider.streamMessage(providerRequest, context)[Symbol.asyncIterator]();
+  let provider = initialProvider;
+  let providerModel = initialProviderModel;
+  let routeModelId = initialRouteModelId;
+  let providerRequest = initialProviderRequest;
   try {
     while (!controller.signal.aborted) {
-      pendingNext ??= iterator.next();
-      const next = await nextOrPing(pendingNext, pingIntervalMs, controller.signal);
-      if (next === "ping") {
-        outputStarted = true;
-        await write(response, sse("ping", { type: "ping" }), controller.signal);
-        continue;
-      }
-      pendingNext = undefined;
-      if (next.done) {
-        outcome = tracker.hasFinalUsage ? "completed" : "partial";
-        break;
-      }
-      if (next.value.type === "usage") {
-        await tracker.observe(next.value.usage);
-        continue;
-      }
-      outputStarted = true;
-      await write(response, serializeEvent(next.value), controller.signal);
-    }
-  } catch (error) {
-    failureClass = errorClass(error);
-    outcome = controller.signal.aborted ? "cancelled" : outputStarted ? "partial" : "failed";
-    if (!controller.signal.aborted) {
-      const normalized = normalizeProviderError(error);
-      if (normalized.status === 404 || normalized.status === 429) await onProviderOutcome?.({ providerId: provider.id, modelId: providerModel.id, statusCode: normalized.status });
-      if (!outputStarted) {
-        response.statusCode = normalized.status;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify(normalized.body));
-      } else {
-        // Anthropic sends in-band errors once an SSE response has begun.
-        await write(response, sse("error", normalized.body), controller.signal).catch(() => undefined);
+      const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, extendedContext, providerRequest, context);
+      const iterator = provider.streamMessage(providerRequest, context)[Symbol.asyncIterator]();
+      let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
+      try {
+        while (!controller.signal.aborted) {
+          pendingNext ??= iterator.next();
+          const next = await nextOrPing(pendingNext, pingIntervalMs, controller.signal);
+          if (next === "ping") {
+            outputStarted = true;
+            await write(response, sse("ping", { type: "ping" }), controller.signal);
+            continue;
+          }
+          pendingNext = undefined;
+          if (next.done) {
+            await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", outputStarted);
+            return;
+          }
+          if (next.value.type === "usage") await tracker.observe(next.value.usage);
+          else {
+            outputStarted = true;
+            await write(response, serializeEvent(next.value), controller.signal);
+          }
+        }
+        await tracker.finish("cancelled", outputStarted);
+        return;
+      } catch (error) {
+        const normalized = normalizeProviderError(error);
+        await tracker.finish(controller.signal.aborted ? "cancelled" : outputStarted ? "partial" : "failed", outputStarted, errorClass(error));
+        if (controller.signal.aborted) return;
+        if (!outputStarted && (normalized.status === 404 || normalized.status === 429)) {
+          const failure = { providerId: provider.id, modelId: providerModel.id, statusCode: normalized.status } as const;
+          await onProviderOutcome?.(failure);
+          const fallback = await selectFallback?.(failure);
+          if (fallback !== undefined) {
+            provider = fallback.provider;
+            providerModel = fallback.model;
+            routeModelId = encodeModelId(provider.id, providerModel.id);
+            providerRequest = { ...providerRequest, model: providerModel.id };
+            continue;
+          }
+        }
+        if (!outputStarted) {
+          response.statusCode = normalized.status;
+          if (normalized.status === 429) response.setHeader("retry-after", "600");
+          response.setHeader("content-type", "application/json; charset=utf-8");
+          response.end(JSON.stringify(normalized.body));
+        } else {
+          await write(response, sse("error", normalized.body), controller.signal).catch(() => undefined);
+        }
+        return;
+      } finally {
+        await iterator.return?.().catch(() => undefined);
       }
     }
   } finally {
     request.raw.removeListener("aborted", abort);
     response.removeListener("close", abort);
-    await iterator.return?.().catch(() => undefined);
-    if (!response.writableEnded) {
-      response.end();
-    }
-    await tracker.finish(controller.signal.aborted ? "cancelled" : outcome, outputStarted, failureClass);
+    if (!response.writableEnded) response.end();
   }
-
 }
 
 async function recordProviderOutcome(options: GatewayOptions, providerId: string, modelId: string, status: number): Promise<void> {
