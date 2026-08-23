@@ -115,6 +115,7 @@ export class AgentSession {
         includePartialMessages: true,
         forwardSubagentText: true,
         agentProgressSummaries: true,
+        promptSuggestions: true,
         systemPrompt: { type: "preset", preset: "claude_code" },
         tools: { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project", "local"],

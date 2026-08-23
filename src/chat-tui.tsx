@@ -1,12 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
+import type { Key } from "ink";
 import type { PermissionMode, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
-import { encodeModelId } from "./model-id.js";
+import { decodeModelId, encodeModelId } from "./model-id.js";
 import type { AgentSession, AgentSessionIdentity } from "./agent-session.js";
-import type { PermissionBroker, PermissionRequest } from "./permission-broker.js";
+import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
 import type { UsageSummary } from "./usage-ledger.js";
+import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
+import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
+import { usePulse, useSpinner } from "./ui/motion.js";
+import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { resolveTheme, type Theme } from "./ui/theme.js";
 
 export type ChatAction =
   | { readonly type: "exit" }
@@ -24,15 +30,30 @@ export interface ChatTuiOptions {
   readonly loadUsage: () => Promise<UsageSummary>;
 }
 
-interface TranscriptItem {
+export interface TranscriptItem {
   readonly id: string;
   readonly role: "user" | "assistant" | "tool" | "system";
   readonly text: string;
+  readonly status?: "running" | "completed" | "failed";
+  readonly detail?: string;
 }
 
 type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help";
+type ContextUsage = { readonly totalTokens: number; readonly maxTokens: number; readonly percentage: number; readonly model: string; readonly categories?: readonly { readonly name: string; readonly tokens: number; readonly isDeferred?: boolean }[] };
+interface Command { readonly name: string; readonly description: string; readonly shortcut?: string }
+
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
-const palette = { accent: "cyan", secondary: "magenta", muted: "gray", danger: "red", success: "green" } as const;
+const commands: readonly Command[] = [
+  { name: "/model", description: "Switch across every live model", shortcut: "⌘M" },
+  { name: "/providers", description: "Manage connected providers" },
+  { name: "/connect", description: "Connect another provider" },
+  { name: "/usage", description: "Inspect context and token usage" },
+  { name: "/agents", description: "List available subagents" },
+  { name: "/permissions", description: "Change tool permission mode" },
+  { name: "/clear", description: "Clear this transcript" },
+  { name: "/help", description: "Show commands and shortcuts" },
+  { name: "/exit", description: "Close AlfaCode" },
+];
 
 export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let resolveAction!: (action: ChatAction) => void;
@@ -48,8 +69,9 @@ export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
 function ChatTui({ session, identity, config, models, permissions, loadUsage, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
+  const theme = useMemo(() => resolveTheme(), []);
   const [screen, setScreen] = useState<Screen>("chat");
-  const [input, setInput] = useState("");
+  const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
   const [busy, setBusy] = useState(false);
   const [modelCursor, setModelCursor] = useState(0);
@@ -57,24 +79,59 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [providerCursor, setProviderCursor] = useState(0);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string>();
   const [usage, setUsage] = useState<UsageSummary>();
-  const [contextUsage, setContextUsage] = useState<{ readonly totalTokens: number; readonly maxTokens: number; readonly percentage: number; readonly model: string }>();
+  const [lastTurnTokens, setLastTurnTokens] = useState<number>();
+  const [contextUsage, setContextUsage] = useState<ContextUsage>();
   const [permissionCursor, setPermissionCursor] = useState(1);
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest>();
+  const [pendingQuestion, setPendingQuestion] = useState<UserQuestionRequest>();
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const [questionCursor, setQuestionCursor] = useState(0);
+  const [questionSelections, setQuestionSelections] = useState<Readonly<Record<number, readonly string[]>>>({});
+  const [questionOtherMode, setQuestionOtherMode] = useState(false);
+  const [questionOtherEditor, setQuestionOtherEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [permissionMode, setPermissionModeState] = useState<PermissionMode>(identity.compatibility.compatible ? "default" : "dontAsk");
   const [activeModel, setActiveModel] = useState(identity.model);
+  const [commandCursor, setCommandCursor] = useState(0);
+  const [history, setHistory] = useState<string[]>([]);
+  const [historyCursor, setHistoryCursor] = useState(-1);
+  const [promptSuggestion, setPromptSuggestion] = useState<string>();
+  const [engineCommands, setEngineCommands] = useState<readonly Command[]>([]);
+  const pendingTurns = useRef(0);
+
+  const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
+  const filteredModels = useMemo(() => {
+    const query = modelFilter.toLowerCase();
+    return callableModels.filter((model) => `${model.displayName} ${model.providerId} ${model.id}`.toLowerCase().includes(query));
+  }, [callableModels, modelFilter]);
+  const availableCommands = useMemo(() => mergeCommands(commands, engineCommands), [engineCommands]);
+  const commandMatches = useMemo(() => commandSuggestions(editor.value, availableCommands), [availableCommands, editor.value]);
+  const width = Math.max(48, stdout.columns ?? 100);
+  const blockingPanelRows = pendingQuestion === undefined ? pendingPermission === undefined ? 0 : 8 : 16;
+  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows);
+  const visibleMessages = useMemo(() => tailItemsByRows(messages, transcriptRows, width - 6), [messages, transcriptRows, width]);
+  const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
 
   useEffect(() => session.subscribe((message) => {
     setMessages((current) => reduceSdkMessage(current, message));
     const routedModel = routedModelFromMessage(message);
     if (routedModel !== undefined) setActiveModel(routedModel);
-    if (message.type === "result") setBusy(false);
-  }), [session]);
+    if (message.type === "prompt_suggestion") setPromptSuggestion(sanitizeTerminalText(message.suggestion));
+    if (message.type === "system" && message.subtype === "commands_changed") setEngineCommands(toCommands(message.commands));
+    if (message.type === "result") {
+      pendingTurns.current = Math.max(0, pendingTurns.current - 1);
+      setBusy(pendingTurns.current > 0);
+      void refreshTelemetry(session, loadUsage, setContextUsage, setUsage, setLastTurnTokens);
+    }
+  }), [loadUsage, session]);
+
   useEffect(() => {
     let active = true;
     void session.identity().then((resolved) => {
       if (!active) return;
       setActiveModel(resolved.model);
       if (!resolved.compatibility.compatible) appendSystem(setMessages, resolved.compatibility.reason ?? "Unsupported Claude Code engine version.");
+      void refreshTelemetry(session, loadUsage, setContextUsage, setUsage);
+      void session.supportedCommands().then((supported) => setEngineCommands(toCommands(supported))).catch(() => undefined);
     }).catch((error: unknown) => {
       if (active) {
         setBusy(false);
@@ -82,24 +139,32 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       }
     });
     return () => { active = false; };
-  }, [session]);
-  useEffect(() => permissions.subscribe(setPendingPermission), [permissions]);
+  }, [loadUsage, session]);
 
-  const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
-  const filteredModels = useMemo(() => {
-    const query = modelFilter.toLowerCase();
-    return callableModels.filter((model) => `${model.displayName} ${model.providerId} ${model.id}`.toLowerCase().includes(query));
-  }, [callableModels, modelFilter]);
-  const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
+  useEffect(() => permissions.subscribe((request) => {
+    setPendingPermission(request);
+    if (request !== undefined) setPermissionCursor(1);
+  }), [permissions]);
+
+  useEffect(() => permissions.subscribeQuestions((request) => {
+    setPendingQuestion(request);
+    if (request !== undefined) {
+      setQuestionIndex(0);
+      setQuestionCursor(0);
+      setQuestionSelections({});
+      setQuestionOtherMode(false);
+      setQuestionOtherEditor({ value: "", cursor: 0 });
+    }
+  }), [permissions]);
 
   useInput((text, key) => {
+    if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
     if (pendingPermission !== undefined) {
       if (key.leftArrow) setPermissionCursor((current) => Math.max(0, current - 1));
       else if (key.rightArrow) setPermissionCursor((current) => Math.min(pendingPermission.suggestions.length > 0 ? 2 : 1, current + 1));
       else if (key.return) {
         if (permissionCursor === 0) permissions.deny();
         else permissions.allow(permissionCursor === 2);
-        setPermissionCursor(1);
       }
       return;
     }
@@ -112,59 +177,172 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       if (busy) reportFailure("Interrupt", session.interrupt()); else finish({ type: "exit" });
       return;
     }
-    if (key.escape && screen !== "chat") { setScreen("chat"); setInput(""); return; }
-    if (screen === "models") {
-      if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
-      else if (key.downArrow) setModelCursor((current) => Math.min(filteredModels.length - 1, current + 1));
-      else if (key.backspace || key.delete) { setModelFilter((current) => current.slice(0, -1)); setModelCursor(0); }
-      else if (key.return) {
-        const selected = filteredModels[modelCursor];
-        if (selected !== undefined) {
-          const route = encodeModelId(selected.providerId, selected.id);
-          reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${selected.providerId}] ${selected.displayName}`); });
-        }
-      } else if (!key.ctrl && !key.meta && text) { setModelFilter((current) => current + text); setModelCursor(0); }
-      return;
-    }
-    if (screen === "providers") {
-      const providers = config.providers;
-      if (key.upArrow) setProviderCursor((current) => Math.max(0, current - 1));
-      else if (key.downArrow) setProviderCursor((current) => Math.min(providers.length - 1, current + 1));
-      else if (text === "a") finish({ type: "connect" });
-      else if (text === "d" && providers[providerCursor] !== undefined) setConfirmDeleteId(providers[providerCursor]!.id);
-      else if (text === "r" && providers[providerCursor] !== undefined) finish({ type: "reconnect-provider", providerId: providers[providerCursor]!.id });
-      else if (key.return && providers[providerCursor] !== undefined) finish({ type: "set-default-provider", providerId: providers[providerCursor]!.id });
-      return;
-    }
-    if (screen === "permissions") {
-      const index = modes.indexOf(permissionMode);
-      if (key.upArrow) setPermissionModeState(modes[Math.max(0, index - 1)] ?? "default");
-      else if (key.downArrow) setPermissionModeState(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
-      else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
-      return;
-    }
-    if (screen === "help") return;
-    if (screen === "usage") return;
+    if (key.escape && screen !== "chat") { setScreen("chat"); clearEditor(); return; }
+    if (screen === "models") { handleModelInput(text, key); return; }
+    if (screen === "providers") { handleProviderInput(text, key); return; }
+    if (screen === "permissions") { handlePermissionModeInput(key); return; }
+    if (screen === "help" || screen === "usage") return;
+
     if (key.tab && key.shift) {
       const index = modes.indexOf(permissionMode);
       const next = modes[(index + 1) % modes.length] ?? "default";
-      setPermissionModeState(next); reportFailure("Permission mode", session.setPermissionMode(next));
+      setPermissionModeState(next);
+      reportFailure("Permission mode", session.setPermissionMode(next));
       return;
     }
-    if (key.backspace || key.delete) { setInput((current) => current.slice(0, -1)); return; }
-    if (key.return) {
-      const prompt = input.trim();
-      if (!prompt) return;
-      setInput("");
-      if (prompt.startsWith("/")) { void handleCommand(prompt); return; }
-      setMessages((current) => [...current, { id: `user-${Date.now()}`, role: "user", text: prompt }]);
-      setBusy(true);
-      try { session.sendPrompt(prompt); } catch (error: unknown) { setBusy(false); appendSystem(setMessages, error instanceof Error ? error.message : String(error)); }
+    if (commandMatches.length > 0 && key.upArrow) { setCommandCursor((current) => Math.max(0, current - 1)); return; }
+    if (commandMatches.length > 0 && key.downArrow) { setCommandCursor((current) => Math.min(commandMatches.length - 1, current + 1)); return; }
+    if (commandMatches.length > 0 && key.tab) {
+      const completion = commandMatches[commandCursor]?.name;
+      if (completion !== undefined) setEditor({ value: completion, cursor: completion.length });
       return;
     }
-    if (!key.ctrl && !key.meta && text) setInput((current) => current + text);
+    if (key.tab && editor.value.length === 0 && promptSuggestion !== undefined) {
+      setEditor({ value: promptSuggestion, cursor: promptSuggestion.length });
+      setPromptSuggestion(undefined);
+      return;
+    }
+    if (key.upArrow) { navigateHistory(1); return; }
+    if (key.downArrow) { navigateHistory(-1); return; }
+    if (key.leftArrow) { applyEdit({ type: "left" }); return; }
+    if (key.rightArrow) { applyEdit({ type: "right" }); return; }
+    if (key.home || (key.ctrl && text === "a")) { applyEdit({ type: "home" }); return; }
+    if (key.end || (key.ctrl && text === "e")) { applyEdit({ type: "end" }); return; }
+    if (key.ctrl && text === "u") { applyEdit({ type: "delete-to-start" }); return; }
+    if (key.ctrl && text === "k") { applyEdit({ type: "delete-to-end" }); return; }
+    if (key.ctrl && text === "w") { applyEdit({ type: "delete-word" }); return; }
+    if (key.backspace) { applyEdit({ type: "backspace" }); setCommandCursor(0); return; }
+    if (key.delete) { applyEdit({ type: "delete" }); setCommandCursor(0); return; }
+    if (key.escape && editor.value.length > 0) { clearEditor(); return; }
+    if (key.return && key.shift) { applyEdit({ type: "insert", text: "\n" }); return; }
+    if (key.return) { submitEditor(); return; }
+    if (!key.ctrl && !key.meta && text) {
+      setPromptSuggestion(undefined);
+      applyEdit({ type: "insert", text: sanitizeTerminalText(text) });
+      setCommandCursor(0);
+      setHistoryCursor(-1);
+    }
   });
 
+  function applyEdit(operation: Parameters<typeof editInput>[1]): void { setEditor((current) => editInput(current, operation)); }
+  function clearEditor(): void { setEditor({ value: "", cursor: 0 }); setCommandCursor(0); setHistoryCursor(-1); }
+  function navigateHistory(direction: 1 | -1): void {
+    if (history.length === 0) return;
+    const next = Math.max(-1, Math.min(history.length - 1, historyCursor + direction));
+    setHistoryCursor(next);
+    const value = next === -1 ? "" : (history[next] ?? "");
+    setEditor({ value, cursor: value.length });
+  }
+  function submitEditor(): void {
+    const prompt = editor.value.trim();
+    if (!prompt) return;
+    clearEditor();
+    setHistory((current) => [prompt, ...current.filter((item) => item !== prompt)].slice(0, 100));
+    if (prompt.startsWith("/")) { void handleCommand(prompt); return; }
+    sendPrompt(prompt);
+  }
+  function sendPrompt(prompt: string): void {
+    setPromptSuggestion(undefined);
+    setMessages((current) => [...current, { id: `user-${Date.now()}`, role: "user", text: prompt }]);
+    pendingTurns.current += 1;
+    setBusy(true);
+    try { session.sendPrompt(prompt); }
+    catch (error: unknown) { pendingTurns.current = Math.max(0, pendingTurns.current - 1); setBusy(pendingTurns.current > 0); appendSystem(setMessages, error instanceof Error ? error.message : String(error)); }
+  }
+  function handleModelInput(text: string, key: Key): void {
+    if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
+    else if (key.downArrow) setModelCursor((current) => Math.min(Math.max(0, filteredModels.length - 1), current + 1));
+    else if (key.backspace || key.delete) { setModelFilter((current) => current.slice(0, -1)); setModelCursor(0); }
+    else if (key.return) {
+      const selected = filteredModels[modelCursor];
+      if (selected !== undefined) {
+        const route = encodeModelId(selected.providerId, selected.id);
+        reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${selected.providerId}] ${selected.displayName}`); });
+      }
+    } else if (!key.ctrl && !key.meta && text) { setModelFilter((current) => current + sanitizeTerminalText(text)); setModelCursor(0); }
+  }
+  function handleProviderInput(text: string, key: Key): void {
+    const providers = config.providers;
+    if (key.upArrow) setProviderCursor((current) => Math.max(0, current - 1));
+    else if (key.downArrow) setProviderCursor((current) => Math.min(Math.max(0, providers.length - 1), current + 1));
+    else if (text === "a") finish({ type: "connect" });
+    else if (text === "d" && providers[providerCursor] !== undefined) setConfirmDeleteId(providers[providerCursor]!.id);
+    else if (text === "r" && providers[providerCursor] !== undefined) finish({ type: "reconnect-provider", providerId: providers[providerCursor]!.id });
+    else if (key.return && providers[providerCursor] !== undefined) finish({ type: "set-default-provider", providerId: providers[providerCursor]!.id });
+  }
+  function handlePermissionModeInput(key: Key): void {
+    const index = modes.indexOf(permissionMode);
+    if (key.upArrow) setPermissionModeState(modes[Math.max(0, index - 1)] ?? "default");
+    else if (key.downArrow) setPermissionModeState(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
+    else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
+  }
+  function handleQuestionInput(text: string, key: Key, request: UserQuestionRequest): void {
+    const question = request.questions[questionIndex];
+    if (question === undefined) return;
+    if (questionOtherMode) {
+      if (key.escape) { setQuestionOtherMode(false); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
+      if (key.return) {
+        const answer = questionOtherEditor.value.trim();
+        if (answer.length === 0) return;
+        const current = question.multiSelect ? (questionSelections[questionIndex] ?? []) : [];
+        completeQuestion(request, [...current, answer]);
+        return;
+      }
+      applyQuestionEditorKey(text, key);
+      return;
+    }
+    const otherIndex = question.options.length;
+    if (key.escape) { permissions.cancelQuestions(); return; }
+    if (key.upArrow) { setQuestionCursor((current) => Math.max(0, current - 1)); return; }
+    if (key.downArrow) { setQuestionCursor((current) => Math.min(otherIndex, current + 1)); return; }
+    if (key.tab) { setQuestionCursor((current) => (current + 1) % (otherIndex + 1)); return; }
+    if (text === " " && questionCursor < question.options.length) {
+      const label = question.options[questionCursor]?.label;
+      if (label === undefined) return;
+      if (!question.multiSelect) setQuestionSelections((current) => ({ ...current, [questionIndex]: [label] }));
+      else setQuestionSelections((current) => {
+        const selected = current[questionIndex] ?? [];
+        return { ...current, [questionIndex]: selected.includes(label) ? selected.filter((item) => item !== label) : [...selected, label] };
+      });
+      return;
+    }
+    if (!key.return) return;
+    if (questionCursor === otherIndex) { setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
+    const focused = question.options[questionCursor]?.label;
+    if (focused === undefined) return;
+    if (question.multiSelect) {
+      const selected = questionSelections[questionIndex] ?? [];
+      if (selected.length === 0) completeQuestion(request, [focused]);
+      else completeQuestion(request, selected);
+    } else completeQuestion(request, [focused]);
+  }
+  function applyQuestionEditorKey(text: string, key: Key): void {
+    let operation: Parameters<typeof editInput>[1] | undefined;
+    if (key.leftArrow) operation = { type: "left" };
+    else if (key.rightArrow) operation = { type: "right" };
+    else if (key.home || (key.ctrl && text === "a")) operation = { type: "home" };
+    else if (key.end || (key.ctrl && text === "e")) operation = { type: "end" };
+    else if (key.ctrl && text === "u") operation = { type: "delete-to-start" };
+    else if (key.ctrl && text === "k") operation = { type: "delete-to-end" };
+    else if (key.ctrl && text === "w") operation = { type: "delete-word" };
+    else if (key.backspace) operation = { type: "backspace" };
+    else if (key.delete) operation = { type: "delete" };
+    else if (!key.ctrl && !key.meta && text.length > 0) operation = { type: "insert", text: sanitizeTerminalText(text).replace(/\r?\n/gu, " ") };
+    if (operation !== undefined) setQuestionOtherEditor((current) => editInput(current, operation));
+  }
+  function completeQuestion(request: UserQuestionRequest, values: readonly string[]): void {
+    const nextSelections = { ...questionSelections, [questionIndex]: values };
+    setQuestionSelections(nextSelections);
+    if (questionIndex < request.questions.length - 1) {
+      setQuestionIndex((current) => current + 1);
+      setQuestionCursor(0);
+      setQuestionOtherMode(false);
+      setQuestionOtherEditor({ value: "", cursor: 0 });
+      return;
+    }
+    const answers = Object.fromEntries(request.questions.map((question, index) => [question.question, (nextSelections[index] ?? []).join(", ")]));
+    permissions.answerQuestions(answers);
+  }
   async function handleCommand(command: string): Promise<void> {
     const name = command.split(/\s+/, 1)[0];
     if (name === "/connect") return finish({ type: "connect" });
@@ -174,17 +352,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (name === "/help") { setScreen("help"); return; }
     if (name === "/clear") { setMessages([]); return; }
     if (name === "/exit" || name === "/quit") return finish({ type: "exit" });
-    if (name === "/usage") {
-      try {
-        const [ledger, context] = await Promise.all([loadUsage(), session.contextUsage()]);
-        setUsage(ledger);
-        setContextUsage(context);
-        setScreen("usage");
-      } catch (error: unknown) {
-        appendSystem(setMessages, `Unable to load usage: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      return;
-    }
+    if (name === "/usage") { await refreshTelemetry(session, loadUsage, setContextUsage, setUsage); setScreen("usage"); return; }
     if (name === "/agents") {
       try {
         const agents = await session.supportedAgents();
@@ -192,51 +360,51 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       } catch (error: unknown) { appendSystem(setMessages, `Unable to list subagents: ${error instanceof Error ? error.message : String(error)}`); }
       return;
     }
-    setMessages((current) => [...current, { id: `user-${Date.now()}`, role: "user", text: command }]);
-    setBusy(true);
-    try { session.sendPrompt(command); } catch (error: unknown) { setBusy(false); appendSystem(setMessages, error instanceof Error ? error.message : String(error)); }
+    sendPrompt(command);
   }
-
   function reportFailure(label: string, promise: Promise<unknown>, onSuccess?: () => void): void {
     void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
-  const transcriptRows = Math.max(6, (stdout.rows ?? 28) - 11);
-  return <Box flexDirection="column" paddingX={1}>
-    <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={identity.compatibility.compatible} />
-    <Box flexDirection="column" minHeight={transcriptRows}>
-      {screen === "chat" ? <Transcript items={messages.slice(-transcriptRows)} /> : null}
-      {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} /> : null}
-      {screen === "providers" ? confirmDeleteId === undefined
-        ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} />
-        : <DeleteConfirmation providerId={confirmDeleteId} /> : null}
-      {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} /> : null}
-      {screen === "permissions" ? <PermissionPicker selected={permissionMode} /> : null}
-      {screen === "help" ? <Help /> : null}
+  return <Box flexDirection="column" paddingX={1} width={width}>
+    <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={identity.compatibility.compatible} busy={busy} theme={theme} width={width} />
+    <Box flexDirection="column" minHeight={transcriptRows} paddingX={1}>
+      {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={width - 6} busy={busy} /> : null}
+      {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
+      {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
+      {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} theme={theme} width={width - 6} /> : null}
+      {screen === "permissions" ? <PermissionPicker selected={permissionMode} theme={theme} /> : null}
+      {screen === "help" ? <Help theme={theme} commands={availableCommands} /> : null}
     </Box>
-    {pendingPermission === undefined ? <Composer value={input} busy={busy} screen={screen} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} />}
+    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
+    {pendingQuestion !== undefined
+      ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
+      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
   </Box>;
 }
 
 export function reduceSdkMessage(current: readonly TranscriptItem[], message: SDKMessage): TranscriptItem[] {
-  const items = [...current];
+  let items = [...current];
   if (message.type === "stream_event") {
     const event = message.event as unknown;
     if (!isRecord(event)) return items;
     const delta = isRecord(event.delta) ? event.delta : undefined;
-    if (event.type === "content_block_delta" && typeof delta?.text === "string") return appendAssistantDelta(items, delta.text, message.parent_tool_use_id);
+    if (event.type === "content_block_delta" && typeof delta?.text === "string") return appendAssistantDelta(items, sanitizeTerminalText(delta.text), message.parent_tool_use_id);
     if (event.type === "content_block_start" && isRecord(event.content_block) && event.content_block.type === "tool_use") {
       const name = typeof event.content_block.name === "string" ? event.content_block.name : "tool";
-      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: `${message.parent_tool_use_id ? "subagent · " : ""}${name}` }];
+      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }) }];
     }
   }
-  if (message.type === "system" && message.subtype === "notification") return [...items, { id: message.uuid, role: "system", text: message.text }];
-  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: message.uuid, role: "tool", text: `Subagent started: ${message.description}` }];
-  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return [...items, { id: message.uuid, role: "tool", text: message.summary }];
-  if (message.type === "system" && message.subtype === "task_notification") return [...items, { id: message.uuid, role: "tool", text: `Subagent ${message.status}: ${message.summary}` }];
-  if (message.type === "result" && message.is_error) {
-    const text = message.subtype === "success" ? message.result : message.errors.join(" · ");
-    return [...items, { id: message.uuid, role: "system", text: text || "The engine stopped with an error." }];
+  if (message.type === "system" && message.subtype === "notification") return [...items, { id: message.uuid, role: "system", text: sanitizeTerminalText(message.text) }];
+  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running" }];
+  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent");
+  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent");
+  if (message.type === "result") {
+    items = items.map((item) => item.role === "tool" && item.status === "running" ? { ...item, status: message.is_error ? "failed" as const : "completed" as const } : item);
+    if (message.is_error) {
+      const text = message.subtype === "success" ? message.result : message.errors.join(" · ");
+      return [...items, { id: message.uuid, role: "system", text: sanitizeTerminalText(text || "The engine stopped with an error.") }];
+    }
   }
   return items;
 }
@@ -247,85 +415,149 @@ function appendAssistantDelta(items: TranscriptItem[], text: string, parent: str
   if (last?.role === "assistant" && last.id === id) return [...items.slice(0, -1), { ...last, text: last.text + text }];
   return [...items, { id, role: "assistant", text }];
 }
+function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string): TranscriptItem[] {
+  const index = items.findIndex((item) => item.id === id);
+  if (index < 0) return [...items, { id, role: "tool", text, status, detail }];
+  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail } : item);
+}
 
-function Header({ model, mode, providers, compatible }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean }): React.JSX.Element {
-  return <Box justifyContent="space-between" borderStyle="single" borderColor={palette.accent} paddingX={1}>
-    <Text bold color={palette.accent}>◆ AlfaCode</Text>
-    <Text><Text color={palette.secondary}>{shortModel(model)}</Text><Text color={palette.muted}> · {providers} provider{providers === 1 ? "" : "s"} · {mode}{compatible ? "" : " · engine mismatch"}</Text></Text>
+function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+  const pulse = usePulse(busy);
+  const modelWidth = Math.max(16, Math.min(34, width - 48));
+  return <Box justifyContent="space-between" borderStyle="round" borderColor={busy ? theme.secondary : theme.border} paddingX={1} marginBottom={1}>
+    <Box width={12}><Brand theme={theme} compact /></Box>
+    <Box columnGap={2} justifyContent="flex-end" flexGrow={1}>
+      <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
+      <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
+      <Text color={theme.faint} wrap="truncate-end">{providers}P · {mode}{compatible ? "" : " · mismatch"}</Text>
+    </Box>
   </Box>;
 }
 
-function Transcript({ items }: { readonly items: readonly TranscriptItem[] }): React.JSX.Element {
-  return <>{items.map((item, index) => <Box key={`${item.id}-${index}`} marginTop={item.role === "user" ? 1 : 0}>
-    <Text {...(item.role === "user" ? { color: palette.secondary } : item.role === "tool" ? { color: palette.muted } : item.role === "system" ? { color: "yellow" } : {})}>
-      {item.role === "user" ? "❯ " : item.role === "tool" ? "↳ " : item.role === "system" ? "! " : "  "}{item.text}
-    </Text>
-  </Box>)}</>;
+function Transcript({ items, theme, width, busy }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean }): React.JSX.Element {
+  if (items.length === 0) return <EmptyState theme={theme} />;
+  return <>{items.map((item, index) => {
+    if (item.role === "assistant") return <Box key={`${item.id}-${index}`} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
+    if (item.role === "user") return <Box key={`${item.id}-${index}`} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
+    if (item.role === "tool") return <ToolActivity key={`${item.id}-${index}`} item={item} theme={theme} />;
+    return <Box key={`${item.id}-${index}`} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
+  })}{busy && items.at(-1)?.role !== "tool" ? <ThinkingLine theme={theme} /> : null}</>;
 }
+function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly theme: Theme }): React.JSX.Element {
+  const spinner = useSpinner(item.status === "running");
+  const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
+  const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
+  return <Box paddingLeft={2}><Text color={color}>{icon}</Text><Text color={theme.muted}> {item.detail === undefined ? "tool" : item.detail} · </Text><Text color={theme.text}>{item.text}</Text></Box>;
+}
+function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
 
-function Composer({ value, busy, screen }: { readonly value: string; readonly busy: boolean; readonly screen: Screen }): React.JSX.Element {
-  return <Box flexDirection="column">
-    <Box borderStyle="round" borderColor={busy ? palette.secondary : palette.accent} paddingX={1}><Text>{screen === "chat" ? value : ""}</Text><Text color={palette.accent}>▌</Text></Box>
-    <Text color={palette.muted}>{busy ? "working · ctrl+c interrupt" : screen === "chat" ? "/help · shift+tab permissions · ctrl+c exit" : "esc back"}</Text>
+function Composer({ editor, busy, screen, context, lastTurnTokens, messages, suggestion, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+  const split = splitAtCursor(editor);
+  const promptTokens = estimateTokens(editor.value);
+  const contextLeft = context === undefined ? undefined : Math.max(0, context.maxTokens - context.totalTokens);
+  const compact = width < 96;
+  const leftHint = screen !== "chat" ? "esc back" : suggestion !== undefined && editor.value.length === 0 ? "tab accept · type dismisses" : busy ? "ctrl+c stop · type to queue" : compact ? "↵ send · ⇧↵ newline · / commands" : "enter send · shift+enter newline · / commands";
+  const rightHint = `${promptTokens > 0 ? `~${formatCompact(promptTokens)} draft · ` : ""}${lastTurnTokens === undefined ? "" : `${formatCompact(lastTurnTokens)} turn · `}${contextLeft === undefined ? "ctx —" : `${formatCompact(contextLeft)} ctx left`}`;
+  return <Box flexDirection="column" marginTop={1}>
+    <Box borderStyle="round" borderColor={busy ? theme.secondary : screen === "chat" ? theme.accent : theme.border} paddingX={1} minHeight={3}>
+      <Text bold color={theme.accent}>❯ </Text>
+      {screen !== "chat" ? <Text color={theme.faint}>Press Esc to return to chat</Text> : editor.value.length === 0 ? <Text><Text inverse color={theme.text}> </Text><Text color={suggestion === undefined ? theme.faint : theme.muted}>{suggestion ?? contextualHint(messages, busy)}</Text></Text> : <Text wrap="wrap"><Text color={theme.text}>{split.before}</Text><Text inverse color={theme.text}>{split.cursor}</Text><Text color={theme.text}>{split.after}</Text></Text>}
+    </Box>
+    <Box paddingX={1} columnGap={2}><Box flexGrow={1}><Text color={theme.faint} wrap="truncate-end">{leftHint}</Text></Box><Text color={theme.faint}>{rightHint}</Text></Box>
   </Box>;
 }
 
-function ModelPicker({ models, cursor, filter }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string }): React.JSX.Element {
-  const start = Math.max(0, Math.min(cursor - 5, models.length - 11));
-  return <Box flexDirection="column"><Text bold>Models <Text color={palette.muted}>filter: {filter || "type to search"}</Text></Text>
-    {models.slice(start, start + 11).map((model) => <Text key={`${model.providerId}/${model.id}`} {...(models[cursor] === model ? { color: palette.secondary } : {})}>{models[cursor] === model ? "❯ " : "  "}[{model.providerId}] {model.displayName}<Text color={palette.muted}> · {model.contextWindow ?? "?"} ctx</Text></Text>)}
-    {models.length === 0 ? <Text color={palette.muted}>No verified tool-capable model matches this filter.</Text> : null}
-  </Box>;
+function CommandPalette({ commands: matches, cursor, theme }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+  const start = Math.max(0, Math.min(cursor - 2, Math.max(0, matches.length - 6)));
+  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
 }
 
-function ProviderManager({ providers, models, cursor, defaultId }: { readonly providers: readonly ProviderRecord[]; readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly defaultId?: string }): React.JSX.Element {
-  return <Box flexDirection="column"><Text bold>Providers <Text color={palette.success}>automatic routing</Text></Text>{providers.map((provider, index) => {
-    const available = models.filter((model) => model.providerId === provider.id && model.availability === "available" && model.capabilities.tools).length;
-    return <Text key={provider.id} {...(cursor === index ? { color: palette.secondary } : {})}>{cursor === index ? "❯ " : "  "}{provider.id} <Text color={available > 0 ? palette.muted : palette.danger}>{provider.type} · {provider.apiKey === undefined ? "public" : provider.apiKey.kind} · {available > 0 ? `${available} callable model${available === 1 ? "" : "s"}` : "unavailable"}{provider.id === defaultId ? " · preferred" : ""}</Text></Text>;
-  })}<Text color={palette.muted}>a add · d delete · r reconnect · enter preferred · esc back</Text></Box>;
+function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
+  const visibleRows = Math.max(5, height - 4);
+  const start = Math.max(0, Math.min(cursor - Math.floor(visibleRows / 2), Math.max(0, models.length - visibleRows)));
+  return <Box flexDirection="column"><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{model.displayName}</Text><Text color={theme.muted}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>↑↓ navigate · enter switch · esc back</HintBar></Box>;
 }
 
-function DeleteConfirmation({ providerId }: { readonly providerId: string }): React.JSX.Element {
-  return <Box flexDirection="column" borderStyle="round" borderColor={palette.danger} paddingX={1}><Text bold color={palette.danger}>Delete provider “{providerId}”?</Text><Text>The configuration and its AlfaCode Keychain credential will be removed.</Text><Text color={palette.muted}>y delete permanently · n cancel</Text></Box>;
+function ProviderManager({ providers, models, cursor, defaultId, theme }: { readonly providers: readonly ProviderRecord[]; readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly defaultId?: string; readonly theme: Theme }): React.JSX.Element {
+  return <Box flexDirection="column"><SectionTitle title="Providers" detail="all active simultaneously · routing is automatic" theme={theme} />{providers.map((provider, index) => { const available = models.filter((model) => model.providerId === provider.id && model.availability === "available" && model.capabilities.tools).length; const active = cursor === index; return <Box key={provider.id} flexDirection="column" borderStyle="round" borderColor={active ? theme.accent : theme.border} paddingX={1} marginBottom={1}><Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{provider.id}</Text><StatusBadge label={available > 0 ? "ready" : "unavailable"} tone={available > 0 ? "success" : "danger"} theme={theme} /></Box><Text color={theme.muted}>{provider.type} · {provider.apiKey === undefined ? "public access" : provider.apiKey.kind === "keychain" ? "Keychain" : `env ${provider.apiKey.name}`} · {available} callable model{available === 1 ? "" : "s"}{provider.id === defaultId ? " · preferred tie-breaker" : ""}</Text></Box>; })}{providers.length === 0 ? <Text color={theme.muted}>No provider connected. Press a to add one.</Text> : null}<HintBar theme={theme}>a add · d delete · r reconnect · enter prefer · esc back</HintBar></Box>;
 }
+function DeleteConfirmation({ providerId, theme }: { readonly providerId: string; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column" borderStyle="double" borderColor={theme.danger} paddingX={2} paddingY={1}><Text bold color={theme.danger}>Delete “{providerId}”?</Text><Text color={theme.text}>Its AlfaCode configuration and Keychain credential will be removed.</Text><Box marginTop={1} columnGap={2}><KeyHint shortcut="y" label="delete permanently" theme={theme} /><KeyHint shortcut="n" label="cancel" theme={theme} /></Box></Box>; }
 
-function UsagePanel({ usage, context }: { readonly usage: UsageSummary | undefined; readonly context: { readonly totalTokens: number; readonly maxTokens: number; readonly percentage: number; readonly model: string } | undefined }): React.JSX.Element {
-  if (usage === undefined || context === undefined) return <Text color={palette.muted}>Loading usage…</Text>;
+function UsagePanel({ usage, context, theme, width }: { readonly usage: UsageSummary | undefined; readonly context: ContextUsage | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+  if (usage === undefined || context === undefined) return <Text color={theme.muted}>Usage is not available yet. Send a prompt first.</Text>;
   const trackedTokens = usage.attempts.reduce((total, attempt) => total + attemptTokenCount(attempt), 0);
-  const providers = [...new Set(usage.attempts.map((attempt) => attempt.providerId))].map((providerId) => {
-    const attempts = usage.attempts.filter((attempt) => attempt.providerId === providerId);
-    return { providerId, attempts: attempts.length, completed: attempts.filter((attempt) => attempt.outcome === "completed").length, failed: attempts.filter((attempt) => attempt.outcome === "failed").length, tokens: attempts.reduce((total, attempt) => total + attemptTokenCount(attempt), 0) };
-  });
-  return <Box flexDirection="column"><Text bold>Usage <Text color={palette.muted}>latest {usage.attempts.length} attempts</Text></Text><Text>Context <Text color={palette.secondary}>{formatNumber(context.totalTokens)} / {formatNumber(context.maxTokens)}</Text> · {context.percentage.toFixed(1)}% · {shortModel(context.model)}</Text><Text>Tracked tokens <Text color={palette.secondary}>{formatNumber(trackedTokens)}</Text> · input {formatNumber(usage.totals.inputTokens)} · output {formatNumber(usage.totals.outputTokens)}</Text><Box marginTop={1} flexDirection="column">{providers.map((provider) => <Text key={provider.providerId}>[{provider.providerId}] {formatNumber(provider.tokens)} tokens <Text color={palette.muted}>· {provider.completed}/{provider.attempts} completed{provider.failed > 0 ? ` · ${provider.failed} failed` : ""}</Text></Text>)}</Box><Box marginTop={1} flexDirection="column"><Text color={palette.muted}>Recent attempts</Text>{usage.attempts.slice(0, 6).map((attempt) => <Text key={attempt.id}>{attempt.outcome === "completed" ? "✓" : attempt.outcome === "failed" ? "×" : "·"} [{attempt.providerId}] {shortModel(attempt.upstreamModel)} <Text color={palette.muted}>{attemptHasUsage(attempt) ? `${formatNumber(attemptTokenCount(attempt))} tokens` : "usage unavailable"}{attempt.errorClass === undefined ? "" : ` · ${attempt.errorClass}`}</Text></Text>)}</Box><Text color={palette.muted}>esc back · accounting is local and content-free</Text></Box>;
+  const providers = [...new Set(usage.attempts.map((attempt) => attempt.providerId))].map((providerId) => { const attempts = usage.attempts.filter((attempt) => attempt.providerId === providerId); return { providerId, attempts: attempts.length, completed: attempts.filter((attempt) => attempt.outcome === "completed").length, failed: attempts.filter((attempt) => attempt.outcome === "failed").length, tokens: attempts.reduce((total, attempt) => total + attemptTokenCount(attempt), 0) }; });
+  const categories = (context.categories ?? []).filter((category) => category.tokens > 0).slice(0, 6);
+  return <Box flexDirection="column">
+    <SectionTitle title="Usage" detail="local, content-free accounting" theme={theme} />
+    <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}>
+      <Box justifyContent="space-between"><Text bold>Context window</Text><Text color={theme.secondarySoft}>{formatCompact(context.totalTokens)} / {formatCompact(context.maxTokens)} · {context.percentage.toFixed(1)}%</Text></Box>
+      <ProgressBar value={context.percentage / 100} width={Math.max(10, Math.min(64, width - 4))} theme={theme} />
+      <Text color={theme.faint}>{formatCompact(Math.max(0, context.maxTokens - context.totalTokens))} tokens left · {shortModel(context.model)}</Text>
+      {categories.length === 0 ? null : <Box flexDirection="column" marginTop={1}>{categories.map((category) => <Box key={category.name} justifyContent="space-between"><Text color={theme.muted}>{category.name}{category.isDeferred ? " · deferred" : ""}</Text><Text color={theme.text}>{formatCompact(category.tokens)}</Text></Box>)}</Box>}
+    </Box>
+    <Box columnGap={3} marginBottom={1}><Metric label="tracked" value={trackedTokens} theme={theme} /><Metric label="input" value={usage.totals.inputTokens} theme={theme} /><Metric label="output" value={usage.totals.outputTokens} theme={theme} /><Metric label="cache" value={usage.totals.cachedInputTokens} theme={theme} /></Box>
+    {providers.map((provider) => <Box key={provider.providerId} justifyContent="space-between"><Text bold>[{provider.providerId}]</Text><Text>{formatCompact(provider.tokens)} tokens <Text color={theme.faint}>· {provider.completed}/{provider.attempts} completed{provider.failed > 0 ? ` · ${provider.failed} failed` : ""}</Text></Text></Box>)}
+    <Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>RECENT ATTEMPTS</Text>{usage.attempts.slice(0, 6).map((attempt) => <Text key={attempt.id} color={attempt.outcome === "failed" ? theme.danger : theme.text}>{attempt.outcome === "completed" ? "✓" : attempt.outcome === "failed" ? "×" : "·"} [{attempt.providerId}] {shortModel(attempt.upstreamModel)} <Text color={theme.faint}>{attemptHasUsage(attempt) ? `${formatCompact(attemptTokenCount(attempt))} tokens` : "usage unavailable"}{attempt.errorClass === undefined ? "" : ` · ${attempt.errorClass}`}</Text></Text>)}</Box>
+    <HintBar theme={theme}>esc back · no prompt or response content is stored</HintBar>
+  </Box>;
 }
-
-function PermissionPicker({ selected }: { readonly selected: PermissionMode }): React.JSX.Element {
-  return <Box flexDirection="column"><Text bold>Permission mode</Text>{modes.map((mode) => <Text key={mode} {...(selected === mode ? { color: palette.secondary } : {})}>{selected === mode ? "❯ " : "  "}{mode}</Text>)}</Box>;
+function Metric({ label, value, theme }: { readonly label: string; readonly value: number; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column"><Text bold color={theme.secondarySoft}>{formatCompact(value)}</Text><Text color={theme.faint}>{label}</Text></Box>; }
+function PermissionPicker({ selected, theme }: { readonly selected: PermissionMode; readonly theme: Theme }): React.JSX.Element {
+  const descriptions: Partial<Record<PermissionMode, string>> = { default: "Ask before sensitive actions", acceptEdits: "Accept file edits", plan: "Read-only planning", dontAsk: "Deny unapproved actions", bypassPermissions: "Bypass every prompt", auto: "Engine evaluates risk automatically" };
+  return <Box flexDirection="column"><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.text}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>↑↓ select · enter apply · esc back</HintBar></Box>;
 }
-
-function PermissionCard({ request, cursor }: { readonly request: PermissionRequest; readonly cursor: number }): React.JSX.Element {
+function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+  const question = request.questions[questionIndex];
+  if (question === undefined) return <></>;
+  const selected = selections[questionIndex] ?? [];
+  const focused = question.options[cursor];
+  const preview = focused?.preview === undefined ? undefined : truncatePreview(focused.preview);
+  const split = splitAtCursor(otherEditor);
+  return <Box flexDirection="column" borderStyle="double" borderColor={theme.secondary} paddingX={2} paddingY={1} marginTop={1}>
+    <Box justifyContent="space-between"><Text bold color={theme.secondarySoft}>◆ {question.header.toUpperCase()}</Text><Text color={theme.faint}>{questionIndex + 1} / {request.questions.length} · {question.multiSelect ? "multiple choice" : "single choice"}</Text></Box>
+    <Box marginTop={1}><Text bold color={theme.text}>{question.question}</Text></Box>
+    <Box flexDirection="column" marginTop={1}>{question.options.map((option, index) => {
+      const active = cursor === index && !otherMode;
+      const checked = selected.includes(option.label);
+      return <Box key={option.label} flexDirection="column" paddingLeft={active ? 0 : 2}>
+        <Text color={active ? theme.accent : checked ? theme.success : theme.text}>{active ? "❯ " : ""}{question.multiSelect ? checked ? "[✓] " : "[ ] " : checked ? "◉ " : "○ "}<Text bold={active || checked}>{option.label}</Text></Text>
+        {active ? <Text color={theme.muted}>    {option.description}</Text> : null}
+      </Box>;
+    })}
+      <Box flexDirection="column" paddingLeft={cursor === question.options.length && !otherMode ? 0 : 2}>
+        <Text color={cursor === question.options.length || otherMode ? theme.accent : theme.text}>{cursor === question.options.length && !otherMode ? "❯ " : ""}○ <Text bold={otherMode}>Other</Text><Text color={theme.faint}>  type a custom answer</Text></Text>
+      </Box>
+    </Box>
+    {preview === undefined || otherMode ? null : <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginTop={1}><Text bold color={theme.faint}>PREVIEW</Text><Markdown theme={theme} width={Math.max(20, width - 8)}>{preview}</Markdown></Box>}
+    {otherMode ? <Box flexDirection="column" marginTop={1}><Text bold color={theme.muted}>YOUR ANSWER</Text><Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box><Text color={theme.faint}>enter confirm · esc return to choices</Text></Box> : <Text color={theme.faint}>{question.multiSelect ? "space toggle · enter confirm · " : "enter select · "}↑↓ navigate · tab next · esc dismiss</Text>}
+  </Box>;
+}
+function PermissionCard({ request, cursor, theme }: { readonly request: PermissionRequest; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
   const options = request.suggestions.length > 0 ? ["Deny", "Allow once", "Always allow"] : ["Deny", "Allow once"];
-  return <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}><Text bold>{request.title ?? `${request.toolName} requests permission`}</Text>{request.description ? <Text>{request.description}</Text> : null}<Text color={palette.muted}>{permissionInputSummary(request)}</Text>{request.reason ? <Text color={palette.muted}>{request.reason}</Text> : null}<Text>{options.map((option, index) => `${index === cursor ? "[" : " "}${option}${index === cursor ? "]" : " "}`).join("  ")}</Text></Box>;
+  return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}><Text bold color={theme.warning}>⚠ {request.title ?? `${request.toolName} requests permission`}</Text>{request.description ? <Text color={theme.text}>{request.description}</Text> : null}<Text color={theme.muted} wrap="truncate-end">{permissionInputSummary(request)}</Text>{request.reason ? <Text color={theme.faint}>{request.reason}</Text> : null}<Box marginTop={1} columnGap={2}>{options.map((option, index) => <Text key={option} bold={index === cursor} inverse={index === cursor} color={index === 0 ? theme.danger : theme.success}> {option} </Text>)}</Box><Text color={theme.faint}>←→ choose · enter confirm</Text></Box>;
 }
+function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>shift+tab cycles permission mode · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
 
-function Help(): React.JSX.Element {
-  return <Box flexDirection="column"><Text bold>Commands</Text><Text>/connect       add a provider</Text><Text>/providers     manage every configured provider</Text><Text>/model         switch across the aggregated live catalog</Text><Text>/usage         inspect context usage</Text><Text>/agents        list Claude Code subagents</Text><Text>/permissions   change tool permission mode</Text><Text>/clear         clear the visible transcript</Text><Text>/exit          close AlfaCode</Text></Box>;
+export function commandSuggestions(value: string, available: readonly Command[] = commands): readonly Command[] { if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return []; const needle = value.toLowerCase(); return available.filter((command) => command.name.startsWith(needle)); }
+function mergeCommands(local: readonly Command[], engine: readonly Command[]): readonly Command[] { const merged = new Map(engine.map((command) => [command.name, command])); for (const command of local) merged.set(command.name, command); return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name)); }
+function toCommands(supported: readonly { readonly name: string; readonly description: string; readonly argumentHint: string; readonly aliases?: readonly string[] }[]): readonly Command[] { return supported.flatMap((command) => { const name = safeCommandName(command.name); if (name === undefined) return []; const primary: Command = { name, description: sanitizeTerminalText(command.description).slice(0, 240), ...(command.argumentHint.length === 0 ? {} : { shortcut: sanitizeTerminalText(command.argumentHint).slice(0, 80) }) }; return [primary, ...(command.aliases ?? []).flatMap((alias) => { const aliasName = safeCommandName(alias); return aliasName === undefined ? [] : [{ name: aliasName, description: `Alias for ${name}` }]; })]; }); }
+export function tailItemsByRows(items: readonly TranscriptItem[], rows: number, width: number): readonly TranscriptItem[] {
+  let used = 0; const output: TranscriptItem[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) { const item = items[index]; if (item === undefined) continue; const estimated = Math.max(1, item.text.split("\n").reduce((total, line) => total + Math.max(1, Math.ceil(line.length / Math.max(12, width))), 0)) + 1; if (output.length > 0 && used + estimated > rows) break; output.unshift(item); used += estimated; }
+  return output;
 }
-
-function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void {
-  setter((current) => [...current, { id: `system-${Date.now()}`, role: "system", text }]);
-}
-function shortModel(model: string): string { return model.split("/").at(-1) ?? model; }
-function formatNumber(value: number): string { return new Intl.NumberFormat("en-US").format(value); }
+async function refreshTelemetry(session: AgentSession, loadUsage: () => Promise<UsageSummary>, setContext: React.Dispatch<React.SetStateAction<ContextUsage | undefined>>, setUsage: React.Dispatch<React.SetStateAction<UsageSummary | undefined>>, setLatestTurn?: React.Dispatch<React.SetStateAction<number | undefined>>): Promise<void> { const [contextResult, usageResult] = await Promise.allSettled([session.contextUsage(), loadUsage()]); if (contextResult.status === "fulfilled") setContext(contextResult.value); if (usageResult.status === "fulfilled") { setUsage(usageResult.value); const latest = usageResult.value.attempts[0]; if (setLatestTurn !== undefined) setLatestTurn(latest === undefined || !attemptHasUsage(latest) ? undefined : attemptTokenCount(latest)); } }
+function contextualHint(messages: readonly TranscriptItem[], busy: boolean): string { if (busy) return "Queue your next request…"; const last = messages.at(-1); if (last === undefined) return "Ask AlfaCode anything, or type / for commands"; if (last.role === "system") return "Retry, switch /model, or inspect /usage"; if (last.role === "tool") return "Follow up on the tool result…"; return "Ask a follow-up, request a change, or type /"; }
+function truncatePreview(value: string): string { const lines = value.split("\n"); const visible = lines.slice(0, 8).join("\n").slice(0, 1_200); return visible.length < value.length ? `${visible}\n\n_…preview truncated_` : visible; }
+function safeCommandName(value: string): string | undefined { const sanitized = sanitizeTerminalText(value).trim().replace(/^\/+/, ""); return sanitized.length === 0 || /\s/u.test(sanitized) ? undefined : `/${sanitized.slice(0, 100)}`; }
+function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: `system-${Date.now()}`, role: "system", text: sanitizeTerminalText(text) }]); }
+function shortModel(model: string): string { return decodeModelId(model)?.upstreamModel ?? model.split("/").at(-1) ?? model; }
+function providerFromRoute(model: string): string { return decodeModelId(model)?.providerId ?? model.split("/")[0] ?? "auto"; }
+function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value); }
+function estimateTokens(value: string): number { return value.length === 0 ? 0 : Math.max(1, Math.ceil(value.length / 4)); }
 function attemptHasUsage(attempt: UsageSummary["attempts"][number]): boolean { return attempt.totalTokens !== undefined || attempt.inputTokens !== undefined || attempt.outputTokens !== undefined; }
 function attemptTokenCount(attempt: UsageSummary["attempts"][number]): number { return attempt.totalTokens ?? (attempt.inputTokens ?? 0) + (attempt.outputTokens ?? 0); }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
-function routedModelFromMessage(message: SDKMessage): string | undefined {
-  if (message.type !== "stream_event" || !isRecord(message.event) || message.event.type !== "message_start" || !isRecord(message.event.message)) return undefined;
-  return typeof message.event.message.model === "string" ? message.event.message.model : undefined;
-}
-function permissionInputSummary(request: PermissionRequest): string {
-  const serialized = JSON.stringify(request.input);
-  return sanitizeForTerminal(serialized.length > 500 ? `${serialized.slice(0, 497)}…` : serialized);
-}
-function sanitizeForTerminal(value: string): string { return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, " "); }
+function routedModelFromMessage(message: SDKMessage): string | undefined { if (message.type !== "stream_event" || !isRecord(message.event) || message.event.type !== "message_start" || !isRecord(message.event.message)) return undefined; return typeof message.event.message.model === "string" ? message.event.message.model : undefined; }
+function permissionInputSummary(request: PermissionRequest): string { const serialized = JSON.stringify(request.input); return sanitizeTerminalText(serialized.length > 500 ? `${serialized.slice(0, 497)}…` : serialized); }
