@@ -89,8 +89,9 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const descriptor = descriptors.find((item) => item.id === type);
     if (descriptor === undefined) throw new Error(`Unsupported provider type: ${type}. Use: ${descriptors.map((item) => item.id).join(", ")}`);
     if (flags.apiKeyEnv !== undefined && flags.keychain) throw new Error("Use either --api-key-env or --keychain, not both");
-    const id = flags.id ?? (ui.interactive ? await ui.ask("Provider id", descriptor.id) : descriptor.id);
-    if (id.length === 0) throw new Error("Provider id is required");
+    const config = await loadConfig();
+    const id = flags.id ?? availableProviderId(localProviderId(descriptor.id), config.providers);
+    validateProviderId(id);
     const baseUrl = flags.baseUrl ?? (descriptor.requiresBaseUrl && ui.interactive ? await ui.ask(`${descriptor.displayName} base URL`, descriptor.suggestedBaseUrl) : undefined);
     if (descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) {
       throw new Error(`${descriptor.displayName} requires an absolute http(s) --base-url`);
@@ -100,7 +101,6 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const apiKey: SecretReference = flags.apiKeyEnv === undefined
       ? { kind: "keychain", service: "alfacode", account: id }
       : { kind: "env", name: flags.apiKeyEnv };
-    const config = await loadConfig();
     if (config.providers.some((item) => item.id === id)) throw new Error(`Provider already exists: ${id}`);
     if (useKeychain) await keychain.store(id, "alfacode");
     const provider: ProviderRecord = {
@@ -304,6 +304,31 @@ function isHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function validateProviderId(value: string): void {
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(value)) {
+    throw new Error("Provider id must be a short local label (1-64 letters, numbers, dots, underscores, or hyphens), not an API key");
+  }
+  if (/^(?:sk-|nvapi-|AIza)/i.test(value)) {
+    throw new Error("Provider id looks like an API key. Pass a local label with --id; AlfaCode collects the credential separately");
+  }
+}
+
+function localProviderId(descriptorId: string): string {
+  const normalized = descriptorId.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
+  return normalized.length === 0 ? "provider" : normalized;
+}
+
+function availableProviderId(base: string, providers: readonly ProviderRecord[]): string {
+  const existing = new Set(providers.map((provider) => provider.id));
+  if (!existing.has(base)) return base;
+  for (let sequence = 2; sequence < 10_000; sequence += 1) {
+    const suffix = `-${sequence}`;
+    const candidate = `${base.slice(0, 64 - suffix.length)}${suffix}`;
+    if (!existing.has(candidate)) return candidate;
+  }
+  throw new Error(`Unable to allocate a local provider id for ${base}`);
 }
 
 function renderModel(model: GatewayModel): string {

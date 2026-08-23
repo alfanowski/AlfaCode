@@ -9,8 +9,14 @@ const secretReferenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("keychain"), service: z.string().min(1), account: z.string().min(1) }).strict(),
 ]);
 
+const providerIdSchema = z.string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)
+  .refine((value) => !/^(?:sk-|nvapi-|AIza)/i.test(value), "Provider id must be a local label, not an API key");
+
 const providerSchema = z.object({
-  id: z.string().min(1).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+  id: providerIdSchema,
   type: z.string().min(1),
   apiKey: secretReferenceSchema.optional(),
   options: z.record(z.string(), z.unknown()).optional(),

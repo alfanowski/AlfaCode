@@ -41,6 +41,12 @@ describe("ConfigStore", () => {
     expect(await readFile(store.path, "utf8")).not.toContain("AIza");
   });
 
+  it("rejects credentials used as provider identifiers", async () => {
+    const store = new ConfigStore({ homeDirectory: await createTemporaryDirectory() });
+    await expect(store.write({ version: 1, providers: [{ id: "nvapi-this-is-a-secret-not-a-label", type: "catalog" }] }))
+      .rejects.toThrow("Provider id must be a local label");
+  });
+
   it("refuses symlinked config directories and files", async () => {
     const home = await createTemporaryDirectory();
     const outside = await createTemporaryDirectory();

@@ -55,7 +55,7 @@ Configure a Google provider explicitly using the macOS Keychain prompt:
 alfacode connect google --id google-personal
 ```
 
-With no credential flag, AlfaCode opens its interactive provider picker and asks macOS Keychain to read the API key securely from the terminal. To add another provider later, exit the Claude runtime and run `alfacode connect` again. The key is never written to AlfaCode or Claude configuration and never enters a model transcript.
+With no credential flag, AlfaCode opens its interactive provider picker, allocates a short local provider label automatically, and asks macOS Keychain to read the API key securely from the terminal. To add another provider later, exit the Claude runtime and run `alfacode connect` again. The key is never written to AlfaCode or Claude configuration and never enters a model transcript. `--id` accepts only a local label; values that look like credentials are rejected before anything is stored.
 
 Or reference an existing environment variable without persisting the key:
 

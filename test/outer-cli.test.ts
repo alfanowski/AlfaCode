@@ -47,6 +47,22 @@ describe("AlfaCode outer configuration CLI", () => {
     await expect(cli.parseAsync(["node", "alfacode", "connect", "google"], { from: "node" })).rejects.toThrow("interactive terminal");
   });
 
+  it("rejects API keys pasted into the provider id field", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal, keychain: { store: async () => { throw new Error("must not store"); } } });
+    await expect(cli.parseAsync(["node", "alfacode", "connect", "zen", "--id", "sk-this-is-a-secret-not-a-provider-label", "--api-key-env", "ZEN_KEY"], { from: "node" }))
+      .rejects.toThrow("looks like an API key");
+    expect((await configStore.read()).providers).toEqual([]);
+  });
+
+  it("allocates local provider labels without asking users for an id", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+    await cli.parseAsync(["node", "alfacode", "connect", "google", "--api-key-env", "GOOGLE_KEY_ONE"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "connect", "google", "--api-key-env", "GOOGLE_KEY_TWO"], { from: "node" });
+    expect((await configStore.read()).providers.map((provider) => provider.id)).toEqual(["google", "google-2"]);
+  });
+
   it("lists models and saves a selected default without secrets in output", async () => {
     const configStore = new ConfigStore({ homeDirectory: await home() });
     await configStore.write({ version: 1, defaultProviderId: "google", providers: [{ id: "google", type: "google", apiKey: { kind: "env", name: "PRIVATE_KEY" } }] });
