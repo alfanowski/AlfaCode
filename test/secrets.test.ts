@@ -21,4 +21,14 @@ describe("MacOSKeychain", () => {
     const resolver = new SecretResolver({ environment: { ALFACODE_KEY: "test-value" }, keychain });
     await expect(resolver.resolve({ kind: "env", name: "ALFACODE_KEY" })).resolves.toBe("test-value");
   });
+
+  it("deletes only the named Keychain record", async () => {
+    const calls: string[][] = [];
+    const runner: CommandRunner = { run: async (_command, args) => {
+      calls.push([...args]);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    } };
+    await new MacOSKeychain(runner).delete("google-work", "alfacode");
+    expect(calls).toEqual([["delete-generic-password", "-a", "google-work", "-s", "alfacode"]]);
+  });
 });

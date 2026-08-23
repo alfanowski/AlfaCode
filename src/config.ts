@@ -44,14 +44,37 @@ export interface ConfigStoreOptions {
   readonly configPath?: string;
 }
 
+export interface LegacyMigrationOptions {
+  readonly target: ConfigStore;
+  readonly legacyConfigPath?: string;
+}
+
+export interface LegacyMigrationResult {
+  readonly migrated: boolean;
+  readonly sourcePath: string;
+}
+
 /** Stores only non-secret provider metadata. Secret material belongs in Keychain or an environment variable. */
 export class ConfigStore {
+  readonly homeDirectory: string;
   readonly path: string;
   readonly directory: string;
 
   constructor(options: ConfigStoreOptions = {}) {
-    this.path = options.configPath ?? join(options.homeDirectory ?? homedir(), ".alfacode", "config.json");
+    this.homeDirectory = options.homeDirectory ?? homedir();
+    this.path = options.configPath ?? join(this.homeDirectory, ".alfacode", "config.json");
     this.directory = dirname(this.path);
+  }
+
+  async exists(): Promise<boolean> {
+    try {
+      await this.assertSafePath(this.directory, true);
+      await this.assertRegularFile(this.path);
+      return true;
+    } catch (error: unknown) {
+      if (isNotFound(error)) return false;
+      throw error;
+    }
   }
 
   async read(): Promise<AlfaCodeConfig> {
@@ -122,6 +145,20 @@ export class ConfigStore {
     if ((info.mode & 0o077) !== 0) throw new Error(`Refusing insecure permissions at ${path}`);
     if (process.getuid !== undefined && info.uid !== process.getuid()) throw new Error(`Refusing file not owned by the current user: ${path}`);
   }
+}
+
+/**
+ * Imports metadata only. Keychain references retain their original service/account,
+ * so no secret bytes are read, copied, or written during migration.
+ */
+export async function migrateLegacyConfig(options: LegacyMigrationOptions): Promise<LegacyMigrationResult> {
+  const sourcePath = options.legacyConfigPath ?? join(options.target.homeDirectory, ".polycode", "config.json");
+  if (await options.target.exists()) return { migrated: false, sourcePath };
+
+  const legacy = new ConfigStore({ configPath: sourcePath, homeDirectory: options.target.homeDirectory });
+  if (!await legacy.exists()) return { migrated: false, sourcePath };
+  await options.target.write(await legacy.read());
+  return { migrated: true, sourcePath };
 }
 
 function isNotFound(error: unknown): error is NodeJS.ErrnoException {

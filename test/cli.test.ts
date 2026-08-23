@@ -4,12 +4,24 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createCli } from "../src/cli.js";
 import { ConfigStore } from "../src/config.js";
+import type { TerminalUi } from "../src/terminal-ui.js";
 
 const directories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
+
+function fakeUi(overrides: Partial<TerminalUi> = {}): TerminalUi {
+  return {
+    interactive: true,
+    color: false,
+    write() {},
+    select: async (_message, choices) => choices[0]!.value,
+    ask: async (_message, fallback) => fallback ?? "",
+    ...overrides,
+  };
+}
 
 describe("createCli", () => {
   it("uses macOS Keychain by default when adding a provider", async () => {
@@ -20,6 +32,7 @@ describe("createCli", () => {
     const cli = createCli({
       configStore,
       keychain: { store: async (account) => { stored.push(account); } },
+      ui: fakeUi(),
     });
 
     await cli.parseAsync(["node", "alfacode", "provider", "add", "google", "--id", "personal"], { from: "node" });
