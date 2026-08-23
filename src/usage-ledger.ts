@@ -66,6 +66,19 @@ export interface UsageSummary {
   };
 }
 
+/** Aggregate only content-free, recorded usage within a rolling time window. */
+export interface RollingUsageQuery {
+  readonly since: number;
+  readonly providerId?: string;
+  readonly upstreamModel?: string;
+}
+
+export interface RollingUsage {
+  readonly attempts: number;
+  /** Undefined means the providers did not report a total for any matching attempt. */
+  readonly totalTokens?: number;
+}
+
 /** Local-only, content-free token accounting suitable for a UI. */
 export class UsageLedger {
   private constructor(
@@ -172,6 +185,21 @@ export class UsageLedger {
         toolTokens: total.toolTokens + (attempt.toolTokens ?? 0),
         totalTokens: total.totalTokens + (attempt.totalTokens ?? 0),
       }), { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, toolTokens: 0, totalTokens: 0 }),
+    };
+  }
+
+  async rollingUsage(query: RollingUsageQuery): Promise<RollingUsage> {
+    const values: Array<string | number> = [query.since];
+    const where = ["started_at >= ?"];
+    if (query.providerId !== undefined) { where.push("provider_id = ?"); values.push(query.providerId); }
+    if (query.upstreamModel !== undefined) { where.push("upstream_model = ?"); values.push(query.upstreamModel); }
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS attempts, SUM(total_tokens) AS total_tokens, COUNT(total_tokens) AS reported_totals
+      FROM attempts WHERE ${where.join(" AND ")}
+    `).get(...values) as { attempts?: number; total_tokens?: number; reported_totals?: number };
+    return {
+      attempts: row.attempts ?? 0,
+      ...(row.reported_totals === undefined || row.reported_totals === 0 || row.total_tokens === undefined ? {} : { totalTokens: row.total_tokens }),
     };
   }
 
