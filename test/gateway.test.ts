@@ -95,6 +95,12 @@ describe("Anthropic gateway", () => {
     expect(decodeModelId(encodeModelId("provider_1", "vendor/model:1"))).toEqual({
       providerId: "provider_1",
       upstreamModel: "vendor/model:1",
+      extendedContext: false,
+    });
+    expect(decodeModelId(`${encodeModelId("provider_1", "vendor/model:1")}[1m]`)).toEqual({
+      providerId: "provider_1",
+      upstreamModel: "vendor/model:1",
+      extendedContext: true,
     });
     expect(decodeModelId("claude-test")).toBeUndefined();
     expect(decodeModelId("alfacode-anthropic/a/%ZZ")).toBeUndefined();
