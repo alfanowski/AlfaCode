@@ -27,6 +27,43 @@ export interface AnthropicUsage {
   readonly cache_read_input_tokens?: number;
 }
 
+/**
+ * A provider-reported token snapshot. Values are cumulative for one upstream
+ * request, never deltas, so consumers must replace known fields instead of
+ * adding every streamed observation.
+ */
+export interface UsageSnapshot {
+  readonly semantics: "cumulative";
+  readonly stage: "interim" | "final";
+  readonly source: "provider" | "count_endpoint" | "estimated";
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly reasoningTokens?: number;
+  readonly toolTokens?: number;
+  readonly totalTokens?: number;
+}
+
+export interface TokenCount {
+  readonly inputTokens: number;
+  readonly source: "provider" | "estimated";
+  readonly exact: boolean;
+}
+
+export interface ModelLimits {
+  readonly contextWindowTokens?: number;
+  readonly maxInputTokens?: number;
+  readonly maxOutputTokens?: number;
+  /** True when output tokens consume the declared context window. */
+  readonly contextIncludesOutput: boolean;
+}
+
+export interface ModelCapabilities {
+  readonly tokenCounting: "exact" | "estimate" | "none";
+  readonly usageReporting: "final" | "partial" | "none";
+}
+
 export interface AnthropicMessageStart {
   readonly id: string;
   readonly type: "message";
@@ -48,6 +85,7 @@ export type CanonicalStreamEvent =
     }
   | { readonly type: "content_block_delta"; readonly index: number; readonly delta: AnthropicContentDelta }
   | { readonly type: "content_block_stop"; readonly index: number }
+  | { readonly type: "usage"; readonly usage: UsageSnapshot }
   | {
       readonly type: "message_delta";
       readonly delta: { readonly stop_reason?: string | null; readonly stop_sequence?: string | null };
@@ -60,6 +98,8 @@ export interface ProviderModel {
   readonly id: string;
   readonly displayName?: string;
   readonly createdAt?: string;
+  readonly limits?: ModelLimits;
+  readonly capabilities?: ModelCapabilities;
 }
 
 /** Unknown request properties are preserved deliberately for provider-specific options. */
@@ -77,6 +117,7 @@ export interface ProviderRequestContext {
   /** Claude Code session identifiers keep provider-side tool state isolated. */
   readonly session: string;
   readonly agent: string;
+  readonly parentAgent?: string;
 }
 
 export interface ProviderError {
@@ -100,7 +141,7 @@ export interface Provider {
     request: ProviderMessageRequest,
     context: ProviderRequestContext,
   ): AsyncIterable<CanonicalStreamEvent>;
-  countTokens(request: ProviderMessageRequest, context: ProviderRequestContext): Promise<AnthropicUsage>;
+  countTokens(request: ProviderMessageRequest, context: ProviderRequestContext): Promise<TokenCount>;
   close(): Promise<void> | void;
 }
 
