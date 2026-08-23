@@ -15,6 +15,7 @@ export interface UsageAttemptInput {
   readonly upstreamModel: string;
   readonly model: ProviderModel;
   readonly requestedOutputTokens?: number;
+  readonly extendedContext: boolean;
 }
 
 export interface UsageAttempt {
@@ -31,6 +32,7 @@ export interface UsageAttemptRecord {
   readonly upstreamModel: string;
   readonly contextWindowTokens?: number;
   readonly requestedOutputTokens?: number;
+  readonly extendedContext: boolean;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly cachedInputTokens?: number;
@@ -116,11 +118,11 @@ export class UsageLedger {
     const parentAgentKey = input.parentAgent === undefined ? null : this.pseudonym(input.parentAgent);
     const now = Date.now();
     this.database.prepare(`
-      INSERT INTO attempts (id, started_at, session_key, agent_key, parent_agent_key, provider_id, route_model_id, upstream_model, context_window_tokens, requested_output_tokens, usage_completeness, outcome, response_started)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 'partial', 0)
+      INSERT INTO attempts (id, started_at, session_key, agent_key, parent_agent_key, provider_id, route_model_id, upstream_model, context_window_tokens, requested_output_tokens, extended_context, usage_completeness, outcome, response_started)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 'partial', 0)
     `).run(
       id, now, sessionKey, agentKey, parentAgentKey, input.providerId, input.routeModelId, input.upstreamModel,
-      input.model.limits?.contextWindowTokens ?? null, input.requestedOutputTokens ?? null,
+      input.model.limits?.contextWindowTokens ?? null, input.requestedOutputTokens ?? null, input.extendedContext ? 1 : 0,
     );
     return { id };
   }
@@ -198,7 +200,7 @@ function openDatabase(path: string): DatabaseSync {
       id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, finished_at INTEGER,
       session_key TEXT NOT NULL, agent_key TEXT NOT NULL, parent_agent_key TEXT,
       provider_id TEXT NOT NULL, route_model_id TEXT NOT NULL, upstream_model TEXT NOT NULL,
-      context_window_tokens INTEGER, requested_output_tokens INTEGER,
+      context_window_tokens INTEGER, requested_output_tokens INTEGER, extended_context INTEGER NOT NULL DEFAULT 0,
       input_tokens INTEGER, output_tokens INTEGER, cached_input_tokens INTEGER, cache_write_tokens INTEGER,
       reasoning_tokens INTEGER, tool_tokens INTEGER, total_tokens INTEGER,
       usage_completeness TEXT NOT NULL, outcome TEXT NOT NULL, response_started INTEGER NOT NULL, error_class TEXT
@@ -209,6 +211,10 @@ function openDatabase(path: string): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS attempts_session_started ON attempts(session_key, started_at DESC);
   `);
+  const columns = database.prepare("PRAGMA table_info(attempts)").all() as Array<{ name?: string }>;
+  if (!columns.some((column) => column.name === "extended_context")) {
+    database.exec("ALTER TABLE attempts ADD COLUMN extended_context INTEGER NOT NULL DEFAULT 0");
+  }
   return database;
 }
 
@@ -240,6 +246,7 @@ function toAttemptRecord(row: Record<string, unknown>): UsageAttemptRecord {
   const parentAgentKey = stringOrUndefined(row.parent_agent_key);
   const contextWindowTokens = numberOrUndefined(row.context_window_tokens);
   const requestedOutputTokens = numberOrUndefined(row.requested_output_tokens);
+  const extendedContext = row.extended_context === 1;
   const inputTokens = numberOrUndefined(row.input_tokens);
   const outputTokens = numberOrUndefined(row.output_tokens);
   const cachedInputTokens = numberOrUndefined(row.cached_input_tokens);
@@ -254,6 +261,7 @@ function toAttemptRecord(row: Record<string, unknown>): UsageAttemptRecord {
     providerId: String(row.provider_id), routeModelId: String(row.route_model_id), upstreamModel: String(row.upstream_model),
     ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
     ...(requestedOutputTokens === undefined ? {} : { requestedOutputTokens }),
+    extendedContext,
     ...(inputTokens === undefined ? {} : { inputTokens }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),

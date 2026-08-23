@@ -97,7 +97,7 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       const controller = new AbortController();
       request.raw.once("aborted", () => controller.abort());
       const context = providerContext(request, controller.signal);
-      const tracker = await startAttempt(options.usageLedger, resolved.provider, resolved.model, parsed.data.model, resolved.request, context);
+      const tracker = await startAttempt(options.usageLedger, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, context);
       try {
         const response = await collectResponse(
           resolved.provider,
@@ -115,7 +115,7 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     }
 
     reply.hijack();
-    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.request, pingIntervalMs, options.usageLedger);
+    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, pingIntervalMs, options.usageLedger);
   });
 
   app.post("/v1/messages/count_tokens", async (request, reply) => {
@@ -265,7 +265,7 @@ function resolveProviderRequest(
   request: MessageRequest,
   providers: ReadonlyMap<string, Provider>,
 ):
-  | { readonly ok: true; readonly provider: Provider; readonly model: ProviderModel; readonly request: ProviderMessageRequest }
+  | { readonly ok: true; readonly provider: Provider; readonly model: ProviderModel; readonly extendedContext: boolean; readonly request: ProviderMessageRequest }
   | { readonly ok: false; readonly status: number; readonly errorType: string; readonly message: string } {
   const decoded = decodeModelId(request.model);
   if (decoded === undefined) {
@@ -277,7 +277,7 @@ function resolveProviderRequest(
     return { ok: false, status: 404, errorType: "not_found_error", message: "Model not found" };
   }
 
-  return { ok: true, provider, model, request: { ...request, model: decoded.upstreamModel } };
+  return { ok: true, provider, model, extendedContext: decoded.extendedContext, request: { ...request, model: decoded.upstreamModel } };
 }
 
 async function streamResponse(
@@ -286,6 +286,7 @@ async function streamResponse(
   provider: Provider,
   providerModel: ProviderModel,
   routeModelId: string,
+  extendedContext: boolean,
   providerRequest: ProviderMessageRequest,
   pingIntervalMs: number,
   ledger: UsageLedger | undefined,
@@ -301,7 +302,7 @@ async function streamResponse(
   response.setHeader("connection", "keep-alive");
   response.setHeader("x-accel-buffering", "no");
   const context = providerContext(request, controller.signal);
-  const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, providerRequest, context);
+  const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, extendedContext, providerRequest, context);
   let outputStarted = false;
   let outcome: AttemptOutcome = "partial";
   let failureClass: string | undefined;
@@ -375,6 +376,7 @@ async function startAttempt(
   provider: Provider,
   model: ProviderModel,
   routeModelId: string,
+  extendedContext: boolean,
   request: ProviderMessageRequest,
   context: ReturnType<typeof providerContext>,
 ): Promise<AttemptTracker> {
@@ -383,7 +385,7 @@ async function startAttempt(
   }
   const attempt = await ledger.start({
     session: context.session, agent: context.agent, ...(context.parentAgent === undefined ? {} : { parentAgent: context.parentAgent }),
-    providerId: provider.id, routeModelId, upstreamModel: model.id, model,
+    providerId: provider.id, routeModelId, upstreamModel: model.id, model, extendedContext,
     ...(request.max_tokens === undefined ? {} : { requestedOutputTokens: request.max_tokens }),
   });
   let hasFinalUsage = false;
