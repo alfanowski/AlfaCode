@@ -32,7 +32,7 @@ describe("launchClaude", () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_SONNET_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "gemini-3-pro",
-      POLYCODE_CONTEXT_WINDOW_TOKENS: "1000000",
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "1000000",
     });
     expect(request?.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(request?.env.AWS_PROFILE).toBeUndefined();

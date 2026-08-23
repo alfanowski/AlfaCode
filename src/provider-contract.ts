@@ -74,6 +74,9 @@ export interface ProviderMessageRequest {
 export interface ProviderRequestContext {
   /** Aborts immediately when the downstream Anthropic client disconnects. */
   readonly signal: AbortSignal;
+  /** Claude Code session identifiers keep provider-side tool state isolated. */
+  readonly session: string;
+  readonly agent: string;
 }
 
 export interface ProviderError {

@@ -81,7 +81,7 @@ describe('GoogleProvider', () => {
     ] }, context));
     expect(mock.calls[1]?.contents).toEqual([
       { role: 'model', parts: [{ functionCall: { id: 'call-1', name: 'weather', args: { city: 'Rome' } }, thoughtSignature: 'opaque-signature' }] },
-      { role: 'user', parts: [{ functionResponse: { id: 'call-1', name: 'weather', response: { result: 'sunny' } } }] },
+      { role: 'user', parts: [{ functionResponse: { id: 'call-1', name: 'weather', response: { output: 'sunny' } } }] },
     ]);
   });
 

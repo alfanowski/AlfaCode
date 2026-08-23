@@ -103,9 +103,9 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     }
 
     const controller = new AbortController();
-    request.raw.once("close", () => controller.abort());
+    request.raw.once("aborted", () => controller.abort());
     try {
-      const usage = await resolved.provider.countTokens(resolved.request, { signal: controller.signal });
+      const usage = await resolved.provider.countTokens(resolved.request, providerContext(request, controller.signal));
       return { input_tokens: usage.input_tokens };
     } catch (error) {
       const normalized = normalizeProviderError(error);
@@ -183,7 +183,7 @@ async function streamResponse(
 ): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
-  request.raw.once("close", abort);
+  request.raw.once("aborted", abort);
   response.once("close", abort);
 
   response.statusCode = 200;
@@ -193,8 +193,8 @@ async function streamResponse(
   response.setHeader("x-accel-buffering", "no");
   let outputStarted = false;
   let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
+  const iterator = provider.streamMessage(providerRequest, providerContext(request, controller.signal))[Symbol.asyncIterator]();
   try {
-    const iterator = provider.streamMessage(providerRequest, { signal: controller.signal })[Symbol.asyncIterator]();
     while (!controller.signal.aborted) {
       pendingNext ??= iterator.next();
       const next = await nextOrPing(pendingNext, pingIntervalMs, controller.signal);
@@ -223,13 +223,22 @@ async function streamResponse(
       }
     }
   } finally {
-    request.raw.removeListener("close", abort);
+    request.raw.removeListener("aborted", abort);
     response.removeListener("close", abort);
+    await iterator.return?.().catch(() => undefined);
     if (!response.writableEnded) {
       response.end();
     }
   }
 
+}
+
+function providerContext(request: FastifyRequest, signal: AbortSignal) {
+  return {
+    signal,
+    session: headerValue(request.headers["x-claude-code-session-id"]) ?? "default",
+    agent: headerValue(request.headers["x-claude-code-agent-id"]) ?? "main",
+  };
 }
 
 async function nextOrPing<T>(

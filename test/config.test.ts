@@ -17,6 +17,11 @@ afterEach(async () => {
 });
 
 describe("ConfigStore", () => {
+  it("returns an empty config before its directory exists", async () => {
+    const home = await createTemporaryDirectory();
+    expect(await new ConfigStore({ homeDirectory: home }).read()).toEqual({ version: 1, providers: [] });
+  });
+
   it("writes validated non-secret config atomically with private permissions", async () => {
     const home = await createTemporaryDirectory();
     const store = new ConfigStore({ homeDirectory: home });
@@ -47,5 +52,13 @@ describe("ConfigStore", () => {
     await chmod(directory, 0o700);
     await symlink(join(outside, "config.json"), join(directory, "config.json"));
     await expect(new ConfigStore({ configPath: join(directory, "config.json") }).read()).rejects.toThrow("symbolic link");
+  });
+
+  it("refuses group-readable config files", async () => {
+    const home = await createTemporaryDirectory();
+    const store = new ConfigStore({ homeDirectory: home });
+    await store.write({ version: 1, providers: [] });
+    await chmod(store.path, 0o640);
+    await expect(store.read()).rejects.toThrow("insecure permissions");
   });
 });

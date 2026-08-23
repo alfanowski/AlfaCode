@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { ConfigStore, type ProviderRecord, type SecretReference } from "./config.js";
 import { launchClaude, type ClaudeLaunchOptions } from "./claude-launcher.js";
 import { MacOSKeychain } from "./secrets.js";
+import { startRuntime } from "./runtime.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -39,10 +40,11 @@ export function createCli(options: CreateCliOptions = {}): Command {
       if (type !== "google") throw new Error(`Unsupported provider type: ${type}`);
       if (flags.apiKeyEnv !== undefined && flags.keychain) throw new Error("Use either --api-key-env or --keychain, not both");
       const id = flags.id ?? type;
+      const useKeychain = flags.keychain || flags.apiKeyEnv === undefined;
       const apiKey: SecretReference | undefined = flags.apiKeyEnv === undefined
-        ? flags.keychain ? { kind: "keychain", service: "polycode", account: id } : undefined
+        ? { kind: "keychain", service: "polycode", account: id }
         : { kind: "env", name: flags.apiKeyEnv };
-      if (flags.keychain) await keychain.store(id, "polycode");
+      if (useKeychain) await keychain.store(id, "polycode");
       await configStore.update((config) => {
         if (config.providers.some((existing) => existing.id === id)) throw new Error(`Provider already exists: ${id}`);
         const record: ProviderRecord = apiKey === undefined ? { id, type } : { id, type, apiKey };
@@ -93,7 +95,13 @@ export function createCli(options: CreateCliOptions = {}): Command {
 }
 
 export async function main(argv = process.argv): Promise<void> {
-  await createCli().parseAsync(argv);
+  await createCli({ startRuntime }).parseAsync(argv);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) void main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  void main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`polycode: ${message}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -1,5 +1,5 @@
 const PREFIX = "polycode-anthropic";
-const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]*$/i;
+const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]*$/i;
 
 export interface DecodedModelId {
   readonly providerId: string;

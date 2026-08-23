@@ -8,17 +8,17 @@ export interface CommandResult {
 }
 
 export interface CommandRunner {
-  run(command: string, args: readonly string[]): Promise<CommandResult>;
+  run(command: string, args: readonly string[], options?: { readonly interactive?: boolean }): Promise<CommandResult>;
 }
 
 export const systemCommandRunner: CommandRunner = {
-  run(command, args) {
+  run(command, args, options) {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, [...args], { stdio: ["inherit", "pipe", "pipe"] });
+      const child = spawn(command, [...args], { stdio: ["inherit", "pipe", options?.interactive ? "inherit" : "pipe"] });
       let stdout = "";
       let stderr = "";
-      child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
-      child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+      child.stdout?.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr?.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
       child.once("error", reject);
       child.once("close", (exitCode) => resolve({ stdout, stderr, exitCode: exitCode ?? 1 }));
     });
@@ -32,7 +32,7 @@ export class MacOSKeychain {
 
   /** security prompts on its TTY because -w is intentionally the final argument, with no password in argv. */
   async store(account: string, service = keychainService): Promise<void> {
-    const result = await this.runner.run("/usr/bin/security", ["add-generic-password", "-U", "-a", account, "-s", service, "-w"]);
+    const result = await this.runner.run("/usr/bin/security", ["add-generic-password", "-U", "-a", account, "-s", service, "-w"], { interactive: true });
     if (result.exitCode !== 0) throw new Error(`Unable to store secret in macOS Keychain: ${result.stderr.trim()}`);
   }
 

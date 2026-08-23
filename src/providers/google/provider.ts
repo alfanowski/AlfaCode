@@ -193,7 +193,7 @@ function toolResultResponse(block: Extract<AnthropicContentBlock, { type: 'tool_
   const text = typeof block.content === 'string' ? block.content : block.content
     .filter((entry): entry is Extract<AnthropicContentBlock, { type: 'text' }> => entry.type === 'text')
     .map((entry) => entry.text).join('\n');
-  return block.is_error ? { error: text } : { result: text };
+  return block.is_error ? { error: text } : { output: text };
 }
 
 function stableToolId(context: ProviderContext, messageIndex: number, blockIndex: number, name: string, input: JsonObject): string {

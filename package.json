@@ -16,6 +16,7 @@
     "start": "node dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "smoke:claude": "tsx scripts/smoke-claude.ts",
     "typecheck": "tsc --noEmit",
     "check": "pnpm typecheck && pnpm test && pnpm build"
   },

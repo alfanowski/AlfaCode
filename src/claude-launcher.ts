@@ -65,7 +65,7 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
     environment.ANTHROPIC_DEFAULT_SONNET_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_HAIKU_MODEL = options.defaultModelId;
   }
-  if (options.contextWindowTokens !== undefined) environment.POLYCODE_CONTEXT_WINDOW_TOKENS = String(options.contextWindowTokens);
+  if (options.contextWindowTokens !== undefined) environment.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(options.contextWindowTokens);
   return environment;
 }
 

@@ -12,6 +12,25 @@ afterEach(async () => {
 });
 
 describe("createCli", () => {
+  it("uses macOS Keychain by default when adding a provider", async () => {
+    const home = await mkdtemp(join(tmpdir(), "polycode-cli-test-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    const stored: string[] = [];
+    const cli = createCli({
+      configStore,
+      keychain: { store: async (account) => { stored.push(account); } },
+    });
+
+    await cli.parseAsync(["node", "polycode", "provider", "add", "google", "--id", "personal"], { from: "node" });
+    expect(stored).toEqual(["personal"]);
+    expect(await configStore.read()).toEqual({
+      version: 1,
+      defaultProviderId: "personal",
+      providers: [{ id: "personal", type: "google", apiKey: { kind: "keychain", service: "polycode", account: "personal" } }],
+    });
+  });
+
   it("passes unknown Claude arguments unchanged and closes the injected runtime", async () => {
     const home = await mkdtemp(join(tmpdir(), "polycode-cli-test-"));
     directories.push(home);

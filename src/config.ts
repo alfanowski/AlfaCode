@@ -55,8 +55,8 @@ export class ConfigStore {
   }
 
   async read(): Promise<PolycodeConfig> {
-    await this.assertSafePath(this.directory, true);
     try {
+      await this.assertSafePath(this.directory, true);
       await this.assertRegularFile(this.path);
       const raw = await readFile(this.path, "utf8");
       return polycodeConfigSchema.parse(JSON.parse(raw));
@@ -111,12 +111,16 @@ export class ConfigStore {
     const info = await lstat(path);
     if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link at ${path}`);
     if (directory && !info.isDirectory()) throw new Error(`Expected directory at ${path}`);
+    if ((info.mode & 0o077) !== 0) throw new Error(`Refusing insecure permissions at ${path}`);
+    if (process.getuid !== undefined && info.uid !== process.getuid()) throw new Error(`Refusing path not owned by the current user: ${path}`);
   }
 
   private async assertRegularFile(path: string): Promise<void> {
     const info = await lstat(path);
     if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link at ${path}`);
     if (!info.isFile()) throw new Error(`Expected regular file at ${path}`);
+    if ((info.mode & 0o077) !== 0) throw new Error(`Refusing insecure permissions at ${path}`);
+    if (process.getuid !== undefined && info.uid !== process.getuid()) throw new Error(`Refusing file not owned by the current user: ${path}`);
   }
 }
 

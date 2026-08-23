@@ -36,14 +36,18 @@ Requirements:
 pnpm install
 pnpm check
 pnpm build
-pnpm link --global
+pnpm smoke:claude
 ```
+
+For this checkout, install a local `polycode` launcher in a directory already on `PATH`, pointing it at `dist/cli.js`. A packaged installer is intentionally deferred until the CLI name and release scope are final.
 
 Configure a Google provider using the macOS Keychain prompt:
 
 ```bash
 polycode provider add google --id google-personal
 ```
+
+With no credential flag, Polycode asks macOS Keychain to read the API key securely from the terminal. The key is never written to Polycode or Claude configuration.
 
 Or reference an existing environment variable without persisting the key:
 
@@ -59,6 +63,7 @@ polycode -- --model polycode-anthropic/google-personal/<model-id>
 ```
 
 Inside the session, `/model` shows models discovered from configured providers.
+Press `d` on a model in Claude Code's picker to make it the default for future Polycode sessions; the choice is stored only under `~/.polycode/claude`.
 
 ## Data and cost warning
 

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 export interface ToolCallState {
@@ -29,7 +29,8 @@ export class FileGoogleStateStore implements GoogleStateStore {
     this.writeChain = this.writeChain.then(async () => {
       const data = await this.read();
       data[this.key(session, agent, toolUseId)] = value;
-      await mkdir(dirname(this.path), { recursive: true });
+      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+      await chmod(dirname(this.path), 0o700);
       const temporaryPath = `${this.path}.${randomUUID()}.tmp`;
       await writeFile(temporaryPath, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
       await rename(temporaryPath, this.path);

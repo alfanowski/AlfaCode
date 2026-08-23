@@ -3,15 +3,16 @@ import { MacOSKeychain, SecretResolver, type CommandRunner } from "../src/secret
 
 describe("MacOSKeychain", () => {
   it("prompts via security without putting the secret in argv", async () => {
-    const calls: Array<{ command: string; args: readonly string[] }> = [];
-    const runner: CommandRunner = { run: async (command, args) => {
-      calls.push({ command, args });
+    const calls: Array<{ command: string; args: readonly string[]; options?: { readonly interactive?: boolean } }> = [];
+    const runner: CommandRunner = { run: async (command, args, options) => {
+      calls.push({ command, args, ...(options === undefined ? {} : { options }) });
       return { stdout: "", stderr: "", exitCode: 0 };
     } };
     await new MacOSKeychain(runner).store("google-main");
     expect(calls).toEqual([{
       command: "/usr/bin/security",
       args: ["add-generic-password", "-U", "-a", "google-main", "-s", "polycode", "-w"],
+      options: { interactive: true },
     }]);
   });
 
