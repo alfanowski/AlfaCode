@@ -79,5 +79,5 @@ function modelCapabilities(model: ModelsDevModel, wireProtocol: Exclude<WireProt
 }
 
 function supportsTextConversation(model: ModelsDevModel): boolean {
-  return model.modalities.input.includes("text") && model.modalities.output.includes("text");
+  return model.modalities.input.includes("text") && model.modalities.output.length === 1 && model.modalities.output[0] === "text";
 }
