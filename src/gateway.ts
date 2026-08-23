@@ -7,9 +7,11 @@ import {
   type CanonicalStreamEvent,
   type Provider,
   type ProviderError,
+  type ProviderModel,
   type ProviderMessageRequest,
   providerError,
 } from "./provider-contract.js";
+import { type AttemptOutcome, type UsageLedger } from "./usage-ledger.js";
 
 const MESSAGE_REQUEST = z.object({
   model: z.string().min(1),
@@ -28,6 +30,7 @@ export interface GatewayOptions {
   readonly token: string;
   readonly providers: readonly Provider[];
   readonly pingIntervalMs?: number;
+  readonly usageLedger?: UsageLedger;
 }
 
 interface AnthropicErrorEnvelope {
@@ -93,20 +96,26 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     if (parsed.data.stream !== true) {
       const controller = new AbortController();
       request.raw.once("aborted", () => controller.abort());
+      const context = providerContext(request, controller.signal);
+      const tracker = await startAttempt(options.usageLedger, resolved.provider, resolved.model, parsed.data.model, resolved.request, context);
       try {
-        return await collectResponse(
+        const response = await collectResponse(
           resolved.provider,
           resolved.request,
-          providerContext(request, controller.signal),
+          context,
+          async (usage) => tracker.observe(usage),
         );
+        await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", true);
+        return response;
       } catch (error) {
+        await tracker.finish(controller.signal.aborted ? "cancelled" : "failed", false, errorClass(error));
         const normalized = normalizeProviderError(error);
         return reply.code(normalized.status).send(normalized.body);
       }
     }
 
     reply.hijack();
-    await streamResponse(reply.raw, request, resolved.provider, resolved.request, pingIntervalMs);
+    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.request, pingIntervalMs, options.usageLedger);
   });
 
   app.post("/v1/messages/count_tokens", async (request, reply) => {
@@ -124,7 +133,7 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
     request.raw.once("aborted", () => controller.abort());
     try {
       const usage = await resolved.provider.countTokens(resolved.request, providerContext(request, controller.signal));
-      return { input_tokens: usage.input_tokens };
+      return { input_tokens: usage.inputTokens };
     } catch (error) {
       const normalized = normalizeProviderError(error);
       return reply.code(normalized.status).send(normalized.body);
@@ -142,6 +151,7 @@ async function collectResponse(
   provider: Provider,
   providerRequest: ProviderMessageRequest,
   context: ReturnType<typeof providerContext>,
+  onUsage: (usage: import("./provider-contract.js").UsageSnapshot) => Promise<void>,
 ): Promise<Record<string, unknown>> {
   let id: string | undefined;
   let model = providerRequest.model;
@@ -154,6 +164,10 @@ async function collectResponse(
   }>();
 
   for await (const event of provider.streamMessage(providerRequest, context)) {
+    if (event.type === "usage") {
+      await onUsage(event.usage);
+      continue;
+    }
     if (event.type === "message_start") {
       id = event.message.id;
       model = event.message.model;
@@ -251,26 +265,30 @@ function resolveProviderRequest(
   request: MessageRequest,
   providers: ReadonlyMap<string, Provider>,
 ):
-  | { readonly ok: true; readonly provider: Provider; readonly request: ProviderMessageRequest }
+  | { readonly ok: true; readonly provider: Provider; readonly model: ProviderModel; readonly request: ProviderMessageRequest }
   | { readonly ok: false; readonly status: number; readonly errorType: string; readonly message: string } {
   const decoded = decodeModelId(request.model);
   if (decoded === undefined) {
     return { ok: false, status: 400, errorType: "invalid_request_error", message: "Invalid model identifier" };
   }
   const provider = providers.get(decoded.providerId);
-  if (provider === undefined || !provider.models.some((model) => model.id === decoded.upstreamModel)) {
+  const model = provider?.models.find((candidate) => candidate.id === decoded.upstreamModel);
+  if (provider === undefined || model === undefined) {
     return { ok: false, status: 404, errorType: "not_found_error", message: "Model not found" };
   }
 
-  return { ok: true, provider, request: { ...request, model: decoded.upstreamModel } };
+  return { ok: true, provider, model, request: { ...request, model: decoded.upstreamModel } };
 }
 
 async function streamResponse(
   response: ServerResponse,
   request: FastifyRequest,
   provider: Provider,
+  providerModel: ProviderModel,
+  routeModelId: string,
   providerRequest: ProviderMessageRequest,
   pingIntervalMs: number,
+  ledger: UsageLedger | undefined,
 ): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -282,9 +300,13 @@ async function streamResponse(
   response.setHeader("cache-control", "no-cache, no-transform");
   response.setHeader("connection", "keep-alive");
   response.setHeader("x-accel-buffering", "no");
+  const context = providerContext(request, controller.signal);
+  const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, providerRequest, context);
   let outputStarted = false;
+  let outcome: AttemptOutcome = "partial";
+  let failureClass: string | undefined;
   let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
-  const iterator = provider.streamMessage(providerRequest, providerContext(request, controller.signal))[Symbol.asyncIterator]();
+  const iterator = provider.streamMessage(providerRequest, context)[Symbol.asyncIterator]();
   try {
     while (!controller.signal.aborted) {
       pendingNext ??= iterator.next();
@@ -296,12 +318,19 @@ async function streamResponse(
       }
       pendingNext = undefined;
       if (next.done) {
+        outcome = tracker.hasFinalUsage ? "completed" : "partial";
         break;
+      }
+      if (next.value.type === "usage") {
+        await tracker.observe(next.value.usage);
+        continue;
       }
       outputStarted = true;
       await write(response, serializeEvent(next.value), controller.signal);
     }
   } catch (error) {
+    failureClass = errorClass(error);
+    outcome = controller.signal.aborted ? "cancelled" : outputStarted ? "partial" : "failed";
     if (!controller.signal.aborted) {
       const normalized = normalizeProviderError(error);
       if (!outputStarted) {
@@ -320,16 +349,57 @@ async function streamResponse(
     if (!response.writableEnded) {
       response.end();
     }
+    await tracker.finish(controller.signal.aborted ? "cancelled" : outcome, outputStarted, failureClass);
   }
 
 }
 
-function providerContext(request: FastifyRequest, signal: AbortSignal) {
+function providerContext(request: FastifyRequest, signal: AbortSignal): import("./provider-contract.js").ProviderRequestContext {
+  const parentAgent = headerValue(request.headers["x-claude-code-parent-agent-id"]);
   return {
     signal,
     session: headerValue(request.headers["x-claude-code-session-id"]) ?? "default",
     agent: headerValue(request.headers["x-claude-code-agent-id"]) ?? "main",
+    ...(parentAgent === undefined ? {} : { parentAgent }),
   };
+}
+
+interface AttemptTracker {
+  readonly hasFinalUsage: boolean;
+  observe(usage: import("./provider-contract.js").UsageSnapshot): Promise<void>;
+  finish(outcome: AttemptOutcome, responseStarted: boolean, errorClass?: string): Promise<void>;
+}
+
+async function startAttempt(
+  ledger: UsageLedger | undefined,
+  provider: Provider,
+  model: ProviderModel,
+  routeModelId: string,
+  request: ProviderMessageRequest,
+  context: ReturnType<typeof providerContext>,
+): Promise<AttemptTracker> {
+  if (ledger === undefined) {
+    return { hasFinalUsage: false, observe: async () => undefined, finish: async () => undefined };
+  }
+  const attempt = await ledger.start({
+    session: context.session, agent: context.agent, ...(context.parentAgent === undefined ? {} : { parentAgent: context.parentAgent }),
+    providerId: provider.id, routeModelId, upstreamModel: model.id, model,
+    ...(request.max_tokens === undefined ? {} : { requestedOutputTokens: request.max_tokens }),
+  });
+  let hasFinalUsage = false;
+  return {
+    get hasFinalUsage() { return hasFinalUsage; },
+    observe: async (usage) => {
+      if (usage.stage === "final") hasFinalUsage = true;
+      await ledger.observe(attempt, usage);
+    },
+    finish: async (outcome, responseStarted, error) => ledger.finish(attempt, outcome, responseStarted, error),
+  };
+}
+
+function errorClass(error: unknown): string {
+  const known = providerError(error);
+  return known?.kind ?? "api";
 }
 
 async function nextOrPing<T>(

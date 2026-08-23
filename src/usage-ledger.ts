@@ -82,6 +82,7 @@ export class UsageLedger {
       await recoverDatabase(databasePath);
       database = openDatabase(databasePath);
     }
+    await chmod(databasePath, 0o600);
     return new UsageLedger(database, secret);
   }
 
@@ -146,7 +147,7 @@ export class UsageLedger {
   }
 
   async query(query: UsageQuery = {}): Promise<UsageSummary> {
-    const values: unknown[] = [];
+    const values: Array<string | number> = [];
     const where: string[] = [];
     if (query.session !== undefined) {
       where.push("session_key = ?");
@@ -203,8 +204,8 @@ function openDatabase(path: string): DatabaseSync {
       usage_completeness TEXT NOT NULL, outcome TEXT NOT NULL, response_started INTEGER NOT NULL, error_class TEXT
     );
     CREATE TABLE IF NOT EXISTS usage_observations (
-      attempt_id TEXT NOT NULL, observed_at INTEGER NOT NULL, stage TEXT NOT NULL, snapshot_json TEXT NOT NULL,
-      PRIMARY KEY (attempt_id, observed_at), FOREIGN KEY (attempt_id) REFERENCES attempts(id)
+      id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NULL, observed_at INTEGER NOT NULL, stage TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+      FOREIGN KEY (attempt_id) REFERENCES attempts(id)
     );
     CREATE INDEX IF NOT EXISTS attempts_session_started ON attempts(session_key, started_at DESC);
   `);
@@ -212,39 +213,57 @@ function openDatabase(path: string): DatabaseSync {
 }
 
 function mergeUsage(previous: UsageSnapshot | undefined, next: UsageSnapshot): UsageSnapshot {
+  const inputTokens = next.inputTokens ?? previous?.inputTokens;
+  const outputTokens = next.outputTokens ?? previous?.outputTokens;
+  const cachedInputTokens = next.cachedInputTokens ?? previous?.cachedInputTokens;
+  const cacheWriteTokens = next.cacheWriteTokens ?? previous?.cacheWriteTokens;
+  const reasoningTokens = next.reasoningTokens ?? previous?.reasoningTokens;
+  const toolTokens = next.toolTokens ?? previous?.toolTokens;
+  const totalTokens = next.totalTokens ?? previous?.totalTokens;
   return {
     semantics: "cumulative",
     stage: previous?.stage === "final" || next.stage === "final" ? "final" : "interim",
     source: next.source,
-    ...(previous?.inputTokens === undefined && next.inputTokens === undefined ? {} : { inputTokens: next.inputTokens ?? previous?.inputTokens }),
-    ...(previous?.outputTokens === undefined && next.outputTokens === undefined ? {} : { outputTokens: next.outputTokens ?? previous?.outputTokens }),
-    ...(previous?.cachedInputTokens === undefined && next.cachedInputTokens === undefined ? {} : { cachedInputTokens: next.cachedInputTokens ?? previous?.cachedInputTokens }),
-    ...(previous?.cacheWriteTokens === undefined && next.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: next.cacheWriteTokens ?? previous?.cacheWriteTokens }),
-    ...(previous?.reasoningTokens === undefined && next.reasoningTokens === undefined ? {} : { reasoningTokens: next.reasoningTokens ?? previous?.reasoningTokens }),
-    ...(previous?.toolTokens === undefined && next.toolTokens === undefined ? {} : { toolTokens: next.toolTokens ?? previous?.toolTokens }),
-    ...(previous?.totalTokens === undefined && next.totalTokens === undefined ? {} : { totalTokens: next.totalTokens ?? previous?.totalTokens }),
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+    ...(toolTokens === undefined ? {} : { toolTokens }),
+    ...(totalTokens === undefined ? {} : { totalTokens }),
   };
 }
 
 function toAttemptRecord(row: Record<string, unknown>): UsageAttemptRecord {
   const numberOrUndefined = (value: unknown) => typeof value === "number" ? value : undefined;
   const stringOrUndefined = (value: unknown) => typeof value === "string" ? value : undefined;
+  const parentAgentKey = stringOrUndefined(row.parent_agent_key);
+  const contextWindowTokens = numberOrUndefined(row.context_window_tokens);
+  const requestedOutputTokens = numberOrUndefined(row.requested_output_tokens);
+  const inputTokens = numberOrUndefined(row.input_tokens);
+  const outputTokens = numberOrUndefined(row.output_tokens);
+  const cachedInputTokens = numberOrUndefined(row.cached_input_tokens);
+  const cacheWriteTokens = numberOrUndefined(row.cache_write_tokens);
+  const reasoningTokens = numberOrUndefined(row.reasoning_tokens);
+  const toolTokens = numberOrUndefined(row.tool_tokens);
+  const totalTokens = numberOrUndefined(row.total_tokens);
+  const errorClass = stringOrUndefined(row.error_class);
   return {
     id: String(row.id), sessionKey: String(row.session_key), agentKey: String(row.agent_key),
-    ...(stringOrUndefined(row.parent_agent_key) === undefined ? {} : { parentAgentKey: stringOrUndefined(row.parent_agent_key) }),
+    ...(parentAgentKey === undefined ? {} : { parentAgentKey }),
     providerId: String(row.provider_id), routeModelId: String(row.route_model_id), upstreamModel: String(row.upstream_model),
-    ...(numberOrUndefined(row.context_window_tokens) === undefined ? {} : { contextWindowTokens: numberOrUndefined(row.context_window_tokens) }),
-    ...(numberOrUndefined(row.requested_output_tokens) === undefined ? {} : { requestedOutputTokens: numberOrUndefined(row.requested_output_tokens) }),
-    ...(numberOrUndefined(row.input_tokens) === undefined ? {} : { inputTokens: numberOrUndefined(row.input_tokens) }),
-    ...(numberOrUndefined(row.output_tokens) === undefined ? {} : { outputTokens: numberOrUndefined(row.output_tokens) }),
-    ...(numberOrUndefined(row.cached_input_tokens) === undefined ? {} : { cachedInputTokens: numberOrUndefined(row.cached_input_tokens) }),
-    ...(numberOrUndefined(row.cache_write_tokens) === undefined ? {} : { cacheWriteTokens: numberOrUndefined(row.cache_write_tokens) }),
-    ...(numberOrUndefined(row.reasoning_tokens) === undefined ? {} : { reasoningTokens: numberOrUndefined(row.reasoning_tokens) }),
-    ...(numberOrUndefined(row.tool_tokens) === undefined ? {} : { toolTokens: numberOrUndefined(row.tool_tokens) }),
-    ...(numberOrUndefined(row.total_tokens) === undefined ? {} : { totalTokens: numberOrUndefined(row.total_tokens) }),
+    ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
+    ...(requestedOutputTokens === undefined ? {} : { requestedOutputTokens }),
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+    ...(toolTokens === undefined ? {} : { toolTokens }),
+    ...(totalTokens === undefined ? {} : { totalTokens }),
     usageCompleteness: String(row.usage_completeness) as UsageAttemptRecord["usageCompleteness"],
     outcome: String(row.outcome) as AttemptOutcome, responseStarted: row.response_started === 1,
-    ...(stringOrUndefined(row.error_class) === undefined ? {} : { errorClass: stringOrUndefined(row.error_class) }),
+    ...(errorClass === undefined ? {} : { errorClass }),
   };
 }
 
@@ -276,10 +295,13 @@ async function loadOrCreateSecret(path: string): Promise<Buffer> {
 }
 
 async function recoverDatabase(path: string): Promise<void> {
-  try {
-    await rename(path, `${path}.corrupt-${Date.now()}`);
-  } catch (error: unknown) {
-    if (!(typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
-  }
+  const suffix = `.corrupt-${Date.now()}`;
+  await Promise.all([path, `${path}-wal`, `${path}-shm`].map(async (candidate) => {
+    try {
+      await rename(candidate, `${candidate}${suffix}`);
+    } catch (error: unknown) {
+      if (!(typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
+    }
+  }));
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 }

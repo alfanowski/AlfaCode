@@ -104,6 +104,24 @@ describe('GoogleProvider', () => {
     ]);
   });
 
+  it('maps cache, reasoning, tool, and total usage fields when Gemini reports them', async () => {
+    const mock = client({ streams: [[{
+      usageMetadata: {
+        promptTokenCount: 10,
+        candidatesTokenCount: 4,
+        cachedContentTokenCount: 3,
+        thoughtsTokenCount: 2,
+        toolUsePromptTokenCount: 1,
+        totalTokenCount: 14,
+      },
+    }]] });
+    const provider = new GoogleProvider({ client: mock.client, stateStore: new MemoryGoogleStateStore() });
+    expect(await collect(provider.stream(baseRequest, context))).toContainEqual({
+      type: 'usage', input_tokens: 10, output_tokens: 4, cached_input_tokens: 3,
+      reasoning_tokens: 2, tool_tokens: 1, total_tokens: 14,
+    });
+  });
+
   it('generates deterministic ids for an upstream function call without one', async () => {
     const make = () => client({ streams: [[{ candidates: [{ content: { parts: [{ functionCall: { name: 'weather', args: { city: 'Rome' } } }] } }] }]] });
     const a = make(); const b = make();
