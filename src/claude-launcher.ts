@@ -43,6 +43,12 @@ const inheritedSecretKeys = new Set([
   "GOOGLE_CLOUD_PROJECT",
   "VERTEX_PROJECT",
   "VERTEX_REGION",
+  "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+  "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+  "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
+  "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+  "DISABLE_COMPACT",
+  "DISABLE_AUTO_COMPACT",
 ]);
 
 /** Safe child-process defaults. Explicit launch extraEnv values may opt back in deliberately. */
@@ -53,7 +59,7 @@ const safeClaudeDefaults: Readonly<Record<string, string>> = {
   DISABLE_ERROR_REPORTING: "1",
   DISABLE_FEEDBACK_COMMAND: "1",
   CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
-  CLAUDE_CODE_ENABLE_PROMPT_SUGGESTIONS: "0",
+  CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "0",
 };
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {

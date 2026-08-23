@@ -54,13 +54,68 @@ describe("AlfaCode outer configuration CLI", () => {
     const cli = createCli({
       configStore,
       ui: terminal.terminal,
-      discoverModels: async () => [{ id: "alfacode-anthropic/google/gemini-test", displayName: "Gemini Test" }],
+      discoverModels: async () => [{
+        id: "alfacode-anthropic/google/gemini-test",
+        displayName: "Gemini Test",
+        availability: "available",
+        capabilities: { streaming: true, tools: true },
+        quota: { state: "limited", remainingRequests: 3 },
+        headroom: { contextWindowTokens: 1_000_000, availableInputTokens: 900_000, maxOutputTokens: 64_000 },
+      }],
     });
 
     await cli.parseAsync(["node", "alfacode", "models"], { from: "node" });
     await cli.parseAsync(["node", "alfacode", "default"], { from: "node" });
     expect((await configStore.read()).providers[0]?.options).toEqual({ defaultModel: "gemini-test" });
+    expect(terminal.output.join("\n")).toContain("availability:available");
+    expect(terminal.output.join("\n")).toContain("headroom:context=1000000");
     expect(terminal.output.join("\n")).not.toContain("PRIVATE_KEY");
+  });
+
+  it("clears a manual model pin back to automatic selection", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    await configStore.write({ version: 1, defaultProviderId: "google", providers: [{ id: "google", type: "google", options: { defaultModel: "gemini-pinned" } }] });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+    await cli.parseAsync(["node", "alfacode", "default", "auto"], { from: "node" });
+    expect((await configStore.read()).providers[0]?.options).toBeUndefined();
+  });
+
+  it("configures descriptor-driven providers without a hardcoded model catalog", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal, keychain: { store: async () => { throw new Error("must not prompt"); } } });
+    await cli.parseAsync(["node", "alfacode", "connect", "zen", "--id", "zen", "--api-key-env", "ZEN_KEY"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "connect", "anthropic", "--id", "anthropic", "--api-key-env", "ANTHROPIC_KEY"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "connect", "openai-compatible", "--id", "local", "--base-url", "http://127.0.0.1:4000/v1", "--api-key-env", "LOCAL_KEY"], { from: "node" });
+    expect((await configStore.read()).providers).toMatchObject([
+      { id: "zen", type: "zen" },
+      { id: "anthropic", type: "anthropic" },
+      { id: "local", type: "openai-compatible", options: { baseUrl: "http://127.0.0.1:4000/v1" } },
+    ]);
+  });
+
+  it("uses an injected provider catalog instead of a built-in CLI switch", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({
+      configStore,
+      ui: ui(false).terminal,
+      providerDescriptors: [{ id: "acme", configType: "acme-compatible", displayName: "Acme", description: "Injected at the platform boundary", requiresBaseUrl: true }],
+      keychain: { store: async () => { throw new Error("must not prompt"); } },
+    });
+    await cli.parseAsync(["node", "alfacode", "connect", "acme", "--id", "acme", "--base-url", "https://api.acme.test/v1", "--api-key-env", "ACME_KEY"], { from: "node" });
+    expect((await configStore.read()).providers).toMatchObject([{ id: "acme", type: "acme-compatible", options: { baseUrl: "https://api.acme.test/v1" } }]);
+  });
+
+  it("renders injected local usage data in human and JSON modes", async () => {
+    const terminal = ui(false);
+    const summary = {
+      attempts: [{ id: "attempt", sessionKey: "redacted", agentKey: "redacted", providerId: "google", routeModelId: "route", upstreamModel: "model", usageCompleteness: "final" as const, outcome: "completed" as const, responseStarted: true, extendedContext: false, totalTokens: 12 }],
+      totals: { inputTokens: 8, outputTokens: 4, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, toolTokens: 0, totalTokens: 12 },
+    };
+    const cli = createCli({ configStore: new ConfigStore({ homeDirectory: await home() }), ui: terminal.terminal, queryUsage: async () => summary });
+    await cli.parseAsync(["node", "alfacode", "usage"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "usage", "--json", "--limit", "2"], { from: "node" });
+    expect(terminal.output[0]).toContain("Tokens: total 12");
+    expect(terminal.output[1]).toContain('"totalTokens":12');
   });
 
   it("removes only config by default and deletes a Keychain item only when requested", async () => {

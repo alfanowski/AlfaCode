@@ -43,7 +43,7 @@ For this checkout, install a local `alfacode` launcher in a directory already on
 
 ## Configure and launch
 
-On first interactive launch, AlfaCode runs a small outer-terminal wizard. It selects a provider, invokes macOS Keychain for the API key, offers a model picker, and only then starts the real Claude Code TUI. The API key is never collected through a Claude prompt, transcript, plugin, or project configuration.
+On first interactive launch, AlfaCode runs a small outer-terminal wizard. It selects a provider, invokes macOS Keychain for the API key, and then starts the real Claude Code TUI with automatic model selection. Pin a model later only when you need a stable override. The API key is never collected through a Claude prompt, transcript, plugin, or project configuration.
 
 Configure a Google provider explicitly using the macOS Keychain prompt:
 
@@ -75,9 +75,21 @@ alfacode providers remove google-personal                 # leaves the Keychain 
 alfacode providers remove google-personal --delete-keychain
 alfacode models [provider]
 alfacode default [alfacode-anthropic/provider/model]
-alfacode usage [--json]                                  # placeholder until a local ledger ships
+alfacode default auto
+alfacode usage [--provider id] [--model id] [--json]
 alfacode doctor [--json]
 ```
+
+Provider choices are descriptor-driven rather than model-hardcoded:
+
+```bash
+alfacode connect google --id personal
+alfacode connect zen --id zen --api-key-env OPENCODE_API_KEY
+alfacode connect anthropic --id anthropic --api-key-env ANTHROPIC_API_KEY
+alfacode connect openai-compatible --id local --base-url http://127.0.0.1:4000/v1 --api-key-env LOCAL_API_KEY
+```
+
+`alfacode models` displays discovery metadata including availability, advertised capabilities, quota state, and context/output headroom whenever the platform discovery implementation returns it. Provider runtime support is intentionally separate from configuration: a configured provider is not a claim that a compatible runtime adapter is already installed.
 
 `alfacode` and `alfacode launch` pass subsequent Claude Code arguments through unchanged. `alfacode run` is the non-interactive alias; use `--` before Claude flags that could otherwise be interpreted by AlfaCode.
 
@@ -99,11 +111,11 @@ alfacode -- --model alfacode-anthropic/google-personal/<model-id>
 ```
 
 Inside the session, `/model` shows models discovered from configured providers.
-Press `d` on a model in Claude Code's picker to make it the default for future AlfaCode sessions; the choice is stored only under `~/.alfacode/claude`.
+Use `alfacode default <model-id>` to persist a manual AlfaCode pin, or `alfacode default auto` to return to automatic selection.
 
 ## Data and cost warning
 
-Requests contain repository context and are sent to the selected provider. Verify employer and client policy before using external models on work repositories. AlfaCode does not enable billing, but it cannot guarantee that a provider project is unbilled; provider-side billing and quota configuration remains authoritative.
+Requests contain repository context and are sent to the selected provider. Verify employer and client policy before using external models on work repositories. AlfaCode does not enable billing, but it cannot guarantee that a provider project is unbilled; provider-side billing and quota configuration remains authoritative. `alfacode usage` reads local privacy-preserving token accounting, not a provider billing invoice.
 
 ## License
 
