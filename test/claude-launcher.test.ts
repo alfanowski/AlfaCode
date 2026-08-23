@@ -15,6 +15,7 @@ describe("launchClaude", () => {
       authToken: "ephemeral-token",
       configDir,
       defaultModelId: "gemini-3-pro",
+      contextWindowTokens: 262_144,
       extraEnv: { ALFACODE_GATEWAY_URL: "http://127.0.0.1:4317" },
       scrubEnvironmentKeys: ["CUSTOM_GOOGLE_KEY"],
       environment: { ANTHROPIC_API_KEY: "leak", GEMINI_API_KEY: "leak", CUSTOM_GOOGLE_KEY: "leak", AWS_PROFILE: "wrong", PATH: "/bin" },
@@ -32,12 +33,12 @@ describe("launchClaude", () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_SONNET_MODEL: "gemini-3-pro",
       ANTHROPIC_DEFAULT_HAIKU_MODEL: "gemini-3-pro",
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "262144",
     });
     expect(request?.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(request?.env.GEMINI_API_KEY).toBeUndefined();
     expect(request?.env.CUSTOM_GOOGLE_KEY).toBeUndefined();
     expect(request?.env.AWS_PROFILE).toBeUndefined();
-    expect(request?.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined();
     await rm(configDir, { recursive: true, force: true });
   });
 

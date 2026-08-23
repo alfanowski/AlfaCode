@@ -24,6 +24,7 @@ export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
   readonly defaultModelId?: string;
+  readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   close(): Promise<void>;
 }
@@ -77,10 +78,17 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
 
     const authToken = randomBytes(32).toString("base64url");
     const gateway = await listenLocalGateway({ token: authToken, providers });
+    const contextWindows = providers.flatMap((provider) => provider instanceof GoogleGatewayProvider
+      ? provider.googleModels
+        .map((model) => model.contextWindow)
+        .filter((window): window is number => window !== undefined)
+      : []);
+    const contextWindowTokens = contextWindows.length === 0 ? undefined : Math.min(...contextWindows);
     return {
       baseUrl: gateway.address,
       authToken,
       defaultModelId: encodeModelId(selectedProvider.id, selectedModel.id),
+      ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => gateway.app.close(),
     };
