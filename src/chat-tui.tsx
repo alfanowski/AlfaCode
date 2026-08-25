@@ -28,6 +28,8 @@ export interface ChatTuiOptions {
   readonly models: readonly ModelDescriptor[];
   readonly permissions: PermissionBroker;
   readonly loadUsage: () => Promise<UsageSummary>;
+  /** Render on the terminal's alternate screen buffer with a fixed-bottom composer, instead of the default scrolling layout. */
+  readonly fullscreen?: boolean;
 }
 
 export interface TranscriptItem {
@@ -63,13 +65,13 @@ export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let settled = false;
   const action = new Promise<ChatAction>((resolve) => { resolveAction = resolve; });
   const settle = (value: ChatAction): void => { if (!settled) { settled = true; resolveAction(value); } };
-  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false });
+  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, ...(options.fullscreen ? { alternateScreen: true } : {}) });
   await instance.waitUntilExit();
   settle({ type: "exit" });
   return action;
 }
 
-function ChatTui({ session, identity, config, models, permissions, loadUsage, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
+function ChatTui({ session, identity, config, models, permissions, loadUsage, fullscreen = false, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const theme = useMemo(() => resolveTheme(), []);
@@ -99,6 +101,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [promptSuggestion, setPromptSuggestion] = useState<string>();
   const [engineCommands, setEngineCommands] = useState<readonly Command[]>([]);
+  const [scrollOffset, setScrollOffset] = useState(0);
   const pendingTurns = useRef(0);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
@@ -109,10 +112,19 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const availableCommands = useMemo(() => mergeCommands(commands, engineCommands), [engineCommands]);
   const commandMatches = useMemo(() => commandSuggestions(editor.value, availableCommands), [availableCommands, editor.value]);
   const width = Math.max(48, stdout.columns ?? 100);
+  const height = stdout.rows ?? 30;
+  const transcriptWidth = width - 6;
   const blockingPanelRows = pendingQuestion === undefined ? pendingPermission === undefined ? 0 : 8 : 16;
-  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows);
-  const visibleMessages = useMemo(() => tailItemsByRows(messages, transcriptRows, width - 6), [messages, transcriptRows, width]);
+  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, height - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows);
+  const maxScrollOffset = useMemo(() => maxScrollOffsetRows(messages, transcriptWidth), [messages, transcriptWidth]);
+  const scrollWindow = useMemo(() => windowItemsByRows(messages, transcriptRows, transcriptWidth, scrollOffset), [messages, transcriptRows, transcriptWidth, scrollOffset]);
+  const visibleMessages = scrollWindow.items;
   const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
+  // Reusable scroll-offset API (rows scrolled up from the tail): keyboard binds to it below, and a future
+  // mouse-wheel handler can drive the same three entry points without touching the windowing math.
+  const scrollBy = (deltaRows: number): void => setScrollOffset((current) => Math.max(0, Math.min(maxScrollOffset, current + deltaRows)));
+  const scrollToStart = (): void => setScrollOffset(maxScrollOffset);
+  const scrollToEnd = (): void => setScrollOffset(0);
 
   useEffect(() => session.subscribe((message) => {
     setMessages((current) => reduceSdkMessage(current, message));
@@ -186,6 +198,12 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (screen === "permissions") { handlePermissionModeInput(key); return; }
     if (screen === "help" || screen === "usage") return;
 
+    if (fullscreen && screen === "chat") {
+      if (key.pageUp) { scrollBy(transcriptRows); return; }
+      if (key.pageDown) { scrollBy(-transcriptRows); return; }
+      if (key.ctrl && key.home) { scrollToStart(); return; }
+      if (key.ctrl && key.end) { scrollToEnd(); return; }
+    }
     if (key.tab && key.shift) {
       const index = modes.indexOf(permissionMode);
       const next = modes[(index + 1) % modes.length] ?? "default";
@@ -369,16 +387,18 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
-  return <Box flexDirection="column" paddingX={1} width={width}>
+  const scrollIndicatorVisible = fullscreen && screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && !scrollWindow.atTail;
+  return <Box flexDirection="column" paddingX={1} width={width} {...(fullscreen ? { height } : {})}>
     <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={identity.compatibility.compatible} busy={busy} theme={theme} width={width} />
-    <Box flexDirection="column" minHeight={transcriptRows} paddingX={1}>
-      {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={width - 6} busy={busy} /> : null}
+    <Box flexDirection="column" minHeight={transcriptRows} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
+      {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} /> : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
-      {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} theme={theme} width={width - 6} /> : null}
+      {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} theme={theme} width={transcriptWidth} /> : null}
       {screen === "permissions" ? <PermissionPicker selected={permissionMode} theme={theme} /> : null}
       {screen === "help" ? <Help theme={theme} commands={availableCommands} /> : null}
     </Box>
+    {scrollIndicatorVisible ? <ScrollIndicator count={scrollWindow.newerItemCount} theme={theme} /> : null}
     {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
@@ -453,6 +473,9 @@ function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly
   return <Box paddingLeft={2}><Text color={color}>{icon}</Text><Text color={theme.muted}> {item.detail === undefined ? "tool" : item.detail} · </Text><Text color={theme.text}>{item.text}</Text></Box>;
 }
 function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
+function ScrollIndicator({ count, theme }: { readonly count: number; readonly theme: Theme }): React.JSX.Element {
+  return <Box paddingX={1}><Text color={theme.accent}>↓ {count > 0 ? `${count} new message${count === 1 ? "" : "s"} below` : "scrolled up"} · Ctrl+End to jump to bottom</Text></Box>;
+}
 
 function Composer({ editor, busy, screen, context, lastTurnTokens, messages, suggestion, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const split = splitAtCursor(editor);
@@ -545,10 +568,52 @@ function Help({ theme, commands: available }: { readonly theme: Theme; readonly 
 export function commandSuggestions(value: string, available: readonly Command[] = commands): readonly Command[] { if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return []; const needle = value.toLowerCase(); return available.filter((command) => command.name.startsWith(needle)); }
 function mergeCommands(local: readonly Command[], engine: readonly Command[]): readonly Command[] { const merged = new Map(engine.map((command) => [command.name, command])); for (const command of local) merged.set(command.name, command); return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name)); }
 function toCommands(supported: readonly { readonly name: string; readonly description: string; readonly argumentHint: string; readonly aliases?: readonly string[] }[]): readonly Command[] { return supported.flatMap((command) => { const name = safeCommandName(command.name); if (name === undefined) return []; const primary: Command = { name, description: sanitizeTerminalText(command.description).slice(0, 240), ...(command.argumentHint.length === 0 ? {} : { shortcut: sanitizeTerminalText(command.argumentHint).slice(0, 80) }) }; return [primary, ...(command.aliases ?? []).flatMap((alias) => { const aliasName = safeCommandName(alias); return aliasName === undefined ? [] : [{ name: aliasName, description: `Alias for ${name}` }]; })]; }); }
+function estimateItemRows(item: TranscriptItem, width: number): number {
+  return Math.max(1, item.text.split("\n").reduce((total, line) => total + Math.max(1, Math.ceil(line.length / Math.max(12, width))), 0)) + 1;
+}
 export function tailItemsByRows(items: readonly TranscriptItem[], rows: number, width: number): readonly TranscriptItem[] {
   let used = 0; const output: TranscriptItem[] = [];
-  for (let index = items.length - 1; index >= 0; index -= 1) { const item = items[index]; if (item === undefined) continue; const estimated = Math.max(1, item.text.split("\n").reduce((total, line) => total + Math.max(1, Math.ceil(line.length / Math.max(12, width))), 0)) + 1; if (output.length > 0 && used + estimated > rows) break; output.unshift(item); used += estimated; }
+  for (let index = items.length - 1; index >= 0; index -= 1) { const item = items[index]; if (item === undefined) continue; const estimated = estimateItemRows(item, width); if (output.length > 0 && used + estimated > rows) break; output.unshift(item); used += estimated; }
   return output;
+}
+
+export interface ScrollWindow {
+  /** The message slice that fits `rows` at the requested offset, oldest first — same shape `tailItemsByRows` returns. */
+  readonly items: readonly TranscriptItem[];
+  /** True when the window's bottom item is the newest transcript item (no scroll-back applied). */
+  readonly atTail: boolean;
+  /** True when older history exists above the window (there's still somewhere for PageUp / jump-to-start to go). */
+  readonly hasMoreAbove: boolean;
+  /** Count of newer items scrolled past below the window — 0 at the tail, drives the "N new messages below" indicator. */
+  readonly newerItemCount: number;
+}
+
+/**
+ * Offset-aware sibling of `tailItemsByRows`. `offsetRows` shifts the window up from the tail by roughly
+ * that many rows; `offsetRows <= 0` reproduces `tailItemsByRows` exactly. The offset is expressed in rows
+ * (not items) so `PageUp`/`PageDown` can move by "a screen's worth of rows" regardless of how tall
+ * individual transcript items are. Callers are expected to clamp `offsetRows` with `maxScrollOffsetRows`
+ * before storing it, so repeated `scrollBy` calls compose correctly with `scrollToStart`/`scrollToEnd`.
+ */
+export function windowItemsByRows(items: readonly TranscriptItem[], rows: number, width: number, offsetRows: number): ScrollWindow {
+  let skipped = 0;
+  let end = items.length;
+  if (offsetRows > 0) {
+    while (end > 1 && skipped < offsetRows) {
+      end -= 1;
+      skipped += estimateItemRows(items[end]!, width);
+    }
+  }
+  const windowed = tailItemsByRows(items.slice(0, end), rows, width);
+  return { items: windowed, atTail: skipped === 0, hasMoreAbove: end - windowed.length > 0, newerItemCount: items.length - end };
+}
+
+/** The largest `offsetRows` value that still moves `windowItemsByRows`'s window (further scrolling has nowhere to go). */
+export function maxScrollOffsetRows(items: readonly TranscriptItem[], width: number): number {
+  let skipped = 0;
+  let end = items.length;
+  while (end > 1) { end -= 1; skipped += estimateItemRows(items[end]!, width); }
+  return skipped;
 }
 async function refreshTelemetry(session: AgentSession, loadUsage: () => Promise<UsageSummary>, setContext: React.Dispatch<React.SetStateAction<ContextUsage | undefined>>, setUsage: React.Dispatch<React.SetStateAction<UsageSummary | undefined>>, setLatestTurn?: React.Dispatch<React.SetStateAction<number | undefined>>): Promise<void> { const [contextResult, usageResult] = await Promise.allSettled([session.contextUsage(), loadUsage()]); if (contextResult.status === "fulfilled") setContext(contextResult.value); if (usageResult.status === "fulfilled") { setUsage(usageResult.value); const latest = usageResult.value.attempts[0]; if (setLatestTurn !== undefined) setLatestTurn(latest === undefined || !attemptHasUsage(latest) ? undefined : attemptTokenCount(latest)); } }
 function contextualHint(messages: readonly TranscriptItem[], busy: boolean): string { if (busy) return "Queue your next request…"; const last = messages.at(-1); if (last === undefined) return "Ask AlfaCode anything, or type / for commands"; if (last.role === "system") return "Retry, switch /model, or inspect /usage"; if (last.role === "tool") return "Follow up on the tool result…"; return "Ask a follow-up, request a change, or type /"; }

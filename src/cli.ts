@@ -62,6 +62,7 @@ export interface CreateCliOptions {
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
 interface RemoveFlags { readonly deleteKeychain?: boolean; }
 interface UsageFlags { readonly json?: boolean; readonly provider?: string; readonly model?: string; readonly session?: string; readonly limit?: string; }
+interface NativeLaunchFlags { readonly fullscreen?: boolean; }
 
 export function createCli(options: CreateCliOptions = {}): Command {
   const configStore = options.configStore ?? new ConfigStore();
@@ -256,7 +257,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     });
   };
 
-  const nativeLaunch = async (args: readonly string[]): Promise<void> => {
+  const nativeLaunch = async (args: readonly string[], flags: NativeLaunchFlags = {}): Promise<void> => {
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     let nextAction: ChatAction = { type: "connect" };
     while (nextAction.type !== "exit") {
@@ -299,6 +300,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
           loadUsage: () => options.queryUsage === undefined
             ? queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), { limit: 100 })
             : options.queryUsage({ limit: 100 }),
+          ...(flags.fullscreen === true ? { fullscreen: true } : {}),
         });
       } finally {
         permissions.close();
@@ -323,7 +325,9 @@ export function createCli(options: CreateCliOptions = {}): Command {
   };
 
   const program = new Command();
-  program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true).action(nativeLaunch);
+  program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true)
+    .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer")
+    .action(nativeLaunch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
     .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely").option("--base-url <url>", "Base URL for an OpenAI-compatible provider")
     .action(async (type: string | undefined, flags: ConnectFlags) => {
