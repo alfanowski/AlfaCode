@@ -25,6 +25,7 @@ describe("AgentSession", () => {
       supportedCommands: vi.fn(async () => []),
       supportedAgents: vi.fn(async () => []),
       getContextUsage: vi.fn(async () => ({ totalTokens: 0, maxTokens: 1, rawMaxTokens: 1, percentage: 0, categories: [], gridRows: [], model: "route/model", memoryFiles: [] })),
+      mcpServerStatus: vi.fn(async () => [{ name: "docs", status: "connected", tools: [{ name: "search" }] }]),
     } as unknown as Query;
     const session = await AgentSession.start({
       runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: runtimeClose },
@@ -39,6 +40,7 @@ describe("AgentSession", () => {
 
     session.sendPrompt("hello");
     await expect(session.identity()).resolves.toMatchObject({ sessionId: "session-1", model: "route/model", claudeCodeVersion: "2.1.241" });
+    await expect(session.mcpServerStatus()).resolves.toEqual([{ name: "docs", status: "connected", tools: [{ name: "search" }] }]);
     await session.close();
     expect(closed).toBe(true);
     expect(runtimeClose).toHaveBeenCalledOnce();

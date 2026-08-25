@@ -64,6 +64,12 @@ describe("chat transcript reducer", () => {
     expect(commandSuggestions("/model now")).toEqual([]);
   });
 
+  it("registers the discovery and export commands alongside the built-ins", () => {
+    expect(commandSuggestions("/the").map((command) => command.name)).toEqual(["/theme"]);
+    expect(commandSuggestions("/mcp").map((command) => command.name)).toEqual(["/mcp"]);
+    expect(commandSuggestions("/exp").map((command) => command.name)).toEqual(["/export"]);
+  });
+
   it("keeps the newest transcript items within the visible row budget", () => {
     const items = [
       { id: "one", role: "assistant", text: "first" },

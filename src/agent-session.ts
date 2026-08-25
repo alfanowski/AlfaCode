@@ -183,6 +183,10 @@ export class AgentSession {
     return this.query.getContextUsage();
   }
 
+  public mcpServerStatus(): ReturnType<Query["mcpServerStatus"]> {
+    return this.query.mcpServerStatus();
+  }
+
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
