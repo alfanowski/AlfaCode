@@ -198,6 +198,24 @@ describe('GoogleProvider', () => {
     expect(errors).toEqual([{ type: 'error', error: { type: 'Error', message: 'request failed key=[REDACTED]' } }]);
   });
 
+  it('redacts the exact configured credential from every surfaced SDK error', async () => {
+    const secret = 'zen-opaque-credential';
+    const streamClient = client({ streams: [] });
+    streamClient.client.models.generateContentStream = async () => { throw new Error(`stream rejected ${secret}`); };
+    const streamErrors = await collect(new GoogleProvider({ apiKey: secret, client: streamClient.client, stateStore: new MemoryGoogleStateStore() }).stream(baseRequest, context));
+    expect(streamErrors).toEqual([{ type: 'error', error: { type: 'Error', message: 'stream rejected [REDACTED]' } }]);
+
+    const tokenClient = client();
+    tokenClient.client.models.countTokens = async () => { throw new Error(`token count rejected ${secret}`); };
+    await expect(new GoogleProvider({ apiKey: secret, client: tokenClient.client, stateStore: new MemoryGoogleStateStore() }).countTokens(baseRequest, baseRequest.model, context))
+      .rejects.toThrow('token count rejected [REDACTED]');
+
+    const modelClient = client();
+    modelClient.client.models.list = async () => { throw new Error(`model list rejected ${secret}`); };
+    await expect(new GoogleProvider({ apiKey: secret, client: modelClient.client, stateStore: new MemoryGoogleStateStore() }).listModels())
+      .rejects.toThrow('model list rejected [REDACTED]');
+  });
+
   it('preserves structured upstream status codes for cooldown learning', async () => {
     const mock = client();
     mock.client.models.generateContentStream = async () => { throw Object.assign(new Error('quota exhausted'), { status: 429 }); };

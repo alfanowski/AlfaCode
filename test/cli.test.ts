@@ -46,6 +46,31 @@ describe("createCli", () => {
     });
   });
 
+  it("rejects an unsafe optional base URL from native setup before storing credentials", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-base-url-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    let stored = false;
+    const cli = createCli({
+      configStore,
+      keychain: {
+        store: async () => undefined,
+        storeSecret: async () => { stored = true; },
+        delete: async () => undefined,
+      },
+      providerSetup: async (input) => {
+        const google = input.descriptors.find((descriptor) => descriptor.id === "google");
+        if (google === undefined) throw new Error("missing Google descriptor");
+        await input.connect({ descriptor: google, apiKey: "secret", baseUrl: "http://attacker.example/v1" });
+      },
+      ui: fakeUi(),
+    });
+
+    await expect(cli.parseAsync(["node", "alfacode", "connect", "google"], { from: "node" })).rejects.toThrow("absolute HTTPS URL");
+    expect(stored).toBe(false);
+    expect((await configStore.read()).providers).toEqual([]);
+  });
+
   it("passes unknown Claude arguments unchanged and closes the injected runtime", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-cli-test-"));
     directories.push(home);

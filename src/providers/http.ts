@@ -21,6 +21,15 @@ export interface SseFrame {
   readonly data: string;
 }
 
+/** Provider credentials must never cross an upstream redirect boundary. */
+export async function providerFetch(requestFetch: typeof fetch, input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const response = await requestFetch(input, { ...init, redirect: "manual" });
+  if (response.status >= 300 && response.status < 400) {
+    throw new UpstreamProviderError("api", `Provider redirect refused (${response.status})`, response.status);
+  }
+  return response;
+}
+
 export async function* readSse(response: Response): AsyncGenerator<SseFrame> {
   if (!response.body) throw new UpstreamProviderError("api", "Upstream returned an empty streaming response");
   const reader = response.body.getReader();
@@ -61,9 +70,8 @@ export function upstreamError(status: number, body: string, secret: string, retr
   return new UpstreamProviderError(kind, redactSecret(body || `Upstream request failed (${status})`, secret), status, retryAfter);
 }
 
-export function redactSecret(value: string, secret: string): string {
-  return value
-    .replaceAll(secret, "[REDACTED]")
+export function redactSecret(value: string, secret?: string): string {
+  return (secret === undefined || secret.length === 0 ? value : value.replaceAll(secret, "[REDACTED]"))
     .replace(/(?:AIza|sk-[A-Za-z0-9_-]+|api[_-]?key[=:]\s*)[^\s'"&]+/gi, "[REDACTED]");
 }
 

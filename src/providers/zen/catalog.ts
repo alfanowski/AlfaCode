@@ -1,4 +1,5 @@
 import { CAPABILITIES, type ModelDescriptor, type WireProtocol } from "../foundation/types.js";
+import { providerFetch } from "../http.js";
 
 export interface ZenCatalogOptions {
   readonly apiKey: string;
@@ -25,7 +26,7 @@ export interface ZenCatalogModel {
 /** Discover the catalog at runtime; credentials are sent only as an HTTP header. */
 export async function discoverZenModels(options: ZenCatalogOptions): Promise<ModelDescriptor[]> {
   const baseUrl = (options.baseUrl ?? "https://opencode.ai/zen/v1").replace(/\/$/, "");
-  const response = await (options.fetch ?? fetch)(`${baseUrl}/models`, {
+  const response = await providerFetch(options.fetch ?? fetch, `${baseUrl}/models`, {
     headers: { Authorization: `Bearer ${options.apiKey}`, Accept: "application/json" },
   });
   if (!response.ok) throw zenError(response.status, await response.text(), options.apiKey);
