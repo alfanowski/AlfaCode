@@ -1,18 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
-import type { PermissionMode, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode, SDKAssistantMessage, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
 import type { AgentSession, AgentSessionIdentity } from "./agent-session.js";
 import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
 import type { UsageSummary } from "./usage-ledger.js";
+import { BackgroundTasksPanel, parseBackgroundTasksChanged, type BackgroundTask } from "./ui/background-tasks-panel.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { usePulse, useSpinner } from "./ui/motion.js";
 import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import { resolveTheme, type Theme } from "./ui/theme.js";
+import { parseTodoWriteTodos, TodoPanel, type TodoItem } from "./ui/todo-panel.js";
+import { stringifyToolPayload, truncateForDisplay } from "./ui/tool-output.js";
 
 export type ChatAction =
   | { readonly type: "exit" }
@@ -37,6 +40,12 @@ export interface TranscriptItem {
   readonly status?: "running" | "completed" | "failed";
   readonly detail?: string;
   readonly streamId?: string | null;
+  /** Correlates a tool transcript row across content_block_start / assistant / tool_result events; never rendered directly. */
+  readonly toolUseId?: string;
+  /** Full tool input, once its content block completes. Rendered only in the Ctrl+O detailed view, sanitized at render time. */
+  readonly toolInput?: unknown;
+  /** Sanitized tool_result text, captured once the matching tool_use resolves. */
+  readonly toolOutput?: string;
 }
 
 type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help";
@@ -99,6 +108,13 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [promptSuggestion, setPromptSuggestion] = useState<string>();
   const [engineCommands, setEngineCommands] = useState<readonly Command[]>([]);
+  const [toolDetail, setToolDetail] = useState(false);
+  const [todos, setTodos] = useState<readonly TodoItem[]>([]);
+  const [todoPanelCollapsed, setTodoPanelCollapsed] = useState(false);
+  const [backgroundTasks, setBackgroundTasks] = useState<readonly BackgroundTask[]>([]);
+  const [permissionComment, setPermissionComment] = useState<string>();
+  const [permissionCommentMode, setPermissionCommentMode] = useState(false);
+  const [permissionCommentEditor, setPermissionCommentEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const pendingTurns = useRef(0);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
@@ -110,7 +126,9 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const commandMatches = useMemo(() => commandSuggestions(editor.value, availableCommands), [availableCommands, editor.value]);
   const width = Math.max(48, stdout.columns ?? 100);
   const blockingPanelRows = pendingQuestion === undefined ? pendingPermission === undefined ? 0 : 8 : 16;
-  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows);
+  const todoPanelRows = screen === "chat" && todos.length > 0 ? (todoPanelCollapsed ? 4 : Math.min(10, todos.length + 4)) : 0;
+  const backgroundPanelRows = screen === "chat" && backgroundTasks.length > 0 ? Math.min(8, Math.min(backgroundTasks.length, 4) + 4) : 0;
+  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows - todoPanelRows - backgroundPanelRows);
   const visibleMessages = useMemo(() => tailItemsByRows(messages, transcriptRows, width - 6), [messages, transcriptRows, width]);
   const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
 
@@ -118,6 +136,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     setMessages((current) => reduceSdkMessage(current, message));
     const routedModel = routedModelFromMessage(message);
     if (routedModel !== undefined) setActiveModel(routedModel);
+    const nextTodos = parseTodoWriteTodos(message);
+    if (nextTodos !== undefined) setTodos(nextTodos);
+    const nextBackgroundTasks = parseBackgroundTasksChanged(message);
+    if (nextBackgroundTasks !== undefined) setBackgroundTasks(nextBackgroundTasks);
     if (message.type === "prompt_suggestion") setPromptSuggestion(sanitizeTerminalText(message.suggestion));
     if (message.type === "system" && message.subtype === "commands_changed") setEngineCommands(toCommands(message.commands));
     if (message.type === "result") {
@@ -146,7 +168,12 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
 
   useEffect(() => permissions.subscribe((request) => {
     setPendingPermission(request);
-    if (request !== undefined) setPermissionCursor(1);
+    if (request !== undefined) {
+      setPermissionCursor(1);
+      setPermissionComment(undefined);
+      setPermissionCommentMode(false);
+      setPermissionCommentEditor({ value: "", cursor: 0 });
+    }
   }), [permissions]);
 
   useEffect(() => permissions.subscribeQuestions((request) => {
@@ -162,15 +189,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
 
   useInput((text, key) => {
     if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
-    if (pendingPermission !== undefined) {
-      if (key.leftArrow) setPermissionCursor((current) => Math.max(0, current - 1));
-      else if (key.rightArrow) setPermissionCursor((current) => Math.min(pendingPermission.suggestions.length > 0 ? 2 : 1, current + 1));
-      else if (key.return) {
-        if (permissionCursor === 0) permissions.deny();
-        else permissions.allow(permissionCursor === 2);
-      }
-      return;
-    }
+    if (pendingPermission !== undefined) { handlePermissionInput(text, key, pendingPermission); return; }
     if (confirmDeleteId !== undefined) {
       if (text.toLowerCase() === "y") finish({ type: "delete-provider", providerId: confirmDeleteId });
       else if (text.toLowerCase() === "n" || key.escape) setConfirmDeleteId(undefined);
@@ -193,6 +212,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       reportFailure("Permission mode", session.setPermissionMode(next));
       return;
     }
+    if (key.ctrl && text === "o") { setToolDetail((current) => !current); return; }
+    if (key.ctrl && text === "t") { setTodoPanelCollapsed((current) => !current); return; }
     if (commandMatches.length > 0 && key.upArrow) { setCommandCursor((current) => Math.max(0, current - 1)); return; }
     if (commandMatches.length > 0 && key.downArrow) { setCommandCursor((current) => Math.min(commandMatches.length - 1, current + 1)); return; }
     if (commandMatches.length > 0 && key.tab) {
@@ -279,6 +300,33 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     else if (key.downArrow) setPermissionModeState(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
     else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
   }
+  function handlePermissionInput(text: string, key: Key, request: PermissionRequest): void {
+    if (permissionCommentMode) {
+      if (key.escape) { setPermissionCommentMode(false); return; }
+      if (key.return) {
+        const trimmed = permissionCommentEditor.value.trim();
+        setPermissionComment(trimmed.length > 0 ? trimmed.slice(0, 300) : undefined);
+        setPermissionCommentMode(false);
+        return;
+      }
+      applyPermissionCommentKey(text, key);
+      return;
+    }
+    if (key.tab) {
+      setPermissionCommentMode(true);
+      setPermissionCommentEditor({ value: permissionComment ?? "", cursor: (permissionComment ?? "").length });
+      return;
+    }
+    if (key.leftArrow) { setPermissionCursor((current) => Math.max(0, current - 1)); return; }
+    if (key.rightArrow) { setPermissionCursor((current) => Math.min(request.suggestions.length > 0 ? 2 : 1, current + 1)); return; }
+    if (key.return) {
+      const label = permissionCursor === 0 ? "Deny" : request.suggestions.length > 0 && permissionCursor === 2 ? "Always allow" : "Allow once";
+      appendSystem(setMessages, describePermissionDecision(request.toolName, label, permissionComment));
+      if (permissionCursor === 0) permissions.deny(permissionComment !== undefined && permissionComment.length > 0 ? permissionComment : undefined);
+      else permissions.allow(permissionCursor === 2);
+      setPermissionComment(undefined);
+    }
+  }
   function handleQuestionInput(text: string, key: Key, request: UserQuestionRequest): void {
     const question = request.questions[questionIndex];
     if (question === undefined) return;
@@ -320,18 +368,12 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     } else completeQuestion(request, [focused]);
   }
   function applyQuestionEditorKey(text: string, key: Key): void {
-    let operation: Parameters<typeof editInput>[1] | undefined;
-    if (key.leftArrow) operation = { type: "left" };
-    else if (key.rightArrow) operation = { type: "right" };
-    else if (key.home || (key.ctrl && text === "a")) operation = { type: "home" };
-    else if (key.end || (key.ctrl && text === "e")) operation = { type: "end" };
-    else if (key.ctrl && text === "u") operation = { type: "delete-to-start" };
-    else if (key.ctrl && text === "k") operation = { type: "delete-to-end" };
-    else if (key.ctrl && text === "w") operation = { type: "delete-word" };
-    else if (key.backspace) operation = { type: "backspace" };
-    else if (key.delete) operation = { type: "delete" };
-    else if (!key.ctrl && !key.meta && text.length > 0) operation = { type: "insert", text: sanitizeTerminalText(text).replace(/\r?\n/gu, " ") };
+    const operation = resolveLineEditorOperation(text, key);
     if (operation !== undefined) setQuestionOtherEditor((current) => editInput(current, operation));
+  }
+  function applyPermissionCommentKey(text: string, key: Key): void {
+    const operation = resolveLineEditorOperation(text, key);
+    if (operation !== undefined) setPermissionCommentEditor((current) => editInput(current, operation));
   }
   function completeQuestion(request: UserQuestionRequest, values: readonly string[]): void {
     const nextSelections = { ...questionSelections, [questionIndex]: values };
@@ -371,8 +413,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
 
   return <Box flexDirection="column" paddingX={1} width={width}>
     <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={identity.compatibility.compatible} busy={busy} theme={theme} width={width} />
+    {screen === "chat" ? <BackgroundTasksPanel tasks={backgroundTasks} theme={theme} /> : null}
+    {screen === "chat" ? <TodoPanel todos={todos} collapsed={todoPanelCollapsed} theme={theme} /> : null}
     <Box flexDirection="column" minHeight={transcriptRows} paddingX={1}>
-      {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={width - 6} busy={busy} /> : null}
+      {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={width - 6} busy={busy} detailed={toolDetail} /> : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} theme={theme} width={width - 6} /> : null}
@@ -382,7 +426,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
-      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
+      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} comment={permissionComment} commentMode={permissionCommentMode} commentEditor={permissionCommentEditor} theme={theme} />}
   </Box>;
 }
 
@@ -395,9 +439,12 @@ export function reduceSdkMessage(current: readonly TranscriptItem[], message: SD
     if (event.type === "content_block_delta" && typeof delta?.text === "string") return appendAssistantDelta(items, sanitizeTerminalText(delta.text), message.parent_tool_use_id);
     if (event.type === "content_block_start" && isRecord(event.content_block) && event.content_block.type === "tool_use") {
       const name = typeof event.content_block.name === "string" ? event.content_block.name : "tool";
-      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }) }];
+      const toolUseId = typeof event.content_block.id === "string" ? event.content_block.id : undefined;
+      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
     }
   }
+  if (message.type === "assistant") return applyAssistantToolUse(items, message);
+  if (message.type === "user") return applyToolResults(items, message);
   if (message.type === "system" && message.subtype === "notification") return [...items, { id: message.uuid, role: "system", text: sanitizeTerminalText(message.text) }];
   if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running" }];
   if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent");
@@ -423,6 +470,51 @@ function upsertTool(items: TranscriptItem[], id: string, text: string, status: "
   if (index < 0) return [...items, { id, role: "tool", text, status, detail }];
   return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail } : item);
 }
+/**
+ * The CLI emits one `assistant` message per completed content block, so a tool_use block arrives
+ * here fully populated (unlike the `stream_event content_block_start` that opened the row with an
+ * empty input). Enrich the row content_block_start already created — correlated by tool_use id,
+ * never by transcript row id — or create it if no stream event preceded this (e.g. replayed
+ * history). This is what feeds both the Ctrl+O detailed tool view and the TodoWrite panel.
+ */
+function applyAssistantToolUse(items: TranscriptItem[], message: SDKAssistantMessage): TranscriptItem[] {
+  const content: unknown = message.message.content;
+  if (!Array.isArray(content)) return items;
+  let next = items;
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== "tool_use" || typeof block.id !== "string") continue;
+    const toolUseId = block.id;
+    const name = typeof block.name === "string" ? block.name : "tool";
+    const index = next.findIndex((item) => item.toolUseId === toolUseId);
+    if (index < 0) {
+      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }) }];
+    } else {
+      next = next.map((item, itemIndex) => itemIndex === index ? { ...item, text: name, ...(block.input === undefined ? {} : { toolInput: block.input }) } : item);
+    }
+  }
+  return next;
+}
+/** Correlates `tool_result` content blocks in a `user` message back to the tool row they answer, marking it settled and capturing its sanitized output. */
+function applyToolResults(items: TranscriptItem[], message: SDKUserMessage): TranscriptItem[] {
+  const content: unknown = message.message.content;
+  if (!Array.isArray(content)) return items;
+  let next = items;
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
+    const toolUseId = block.tool_use_id;
+    const index = next.findIndex((item) => item.toolUseId === toolUseId);
+    if (index < 0) continue;
+    const status: "completed" | "failed" = block.is_error === true ? "failed" : "completed";
+    const output = sanitizeTerminalText(extractToolResultText(block.content));
+    next = next.map((item, itemIndex) => itemIndex === index ? { ...item, status, ...(output.length === 0 ? {} : { toolOutput: output }) } : item);
+  }
+  return next;
+}
+function extractToolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((block) => isRecord(block) && typeof block.text === "string" ? block.text : "").filter((text) => text.length > 0).join("\n");
+  return "";
+}
 
 function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const pulse = usePulse(busy);
@@ -432,25 +524,33 @@ function Header({ model, mode, providers, compatible, busy, theme, width }: { re
     <Box columnGap={2} justifyContent="flex-end" flexGrow={1}>
       <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
       <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
-      <Text color={theme.faint} wrap="truncate-end">{providers}P · {mode}{compatible ? "" : " · mismatch"}</Text>
+      <Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text>
     </Box>
   </Box>;
 }
 
-function Transcript({ items, theme, width, busy }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean }): React.JSX.Element {
+function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
   if (items.length === 0) return <EmptyState theme={theme} />;
   return <>{items.map((item) => {
     if (item.role === "assistant") return <Box key={item.id} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
     if (item.role === "user") return <Box key={item.id} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} />;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} />;
     return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
   })}{busy && items.at(-1)?.role !== "tool" ? <ThinkingLine theme={theme} /> : null}</>;
 }
-function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly theme: Theme }): React.JSX.Element {
+function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
   const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
   const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
-  return <Box paddingLeft={2}><Text color={color}>{icon}</Text><Text color={theme.muted}> {item.detail === undefined ? "tool" : item.detail} · </Text><Text color={theme.text}>{item.text}</Text></Box>;
+  const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {item.detail === undefined ? "tool" : item.detail} · </Text><Text color={theme.text}>{item.text}</Text></Box>;
+  if (!detailed) return <Box paddingLeft={2}>{summary}</Box>;
+  const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
+  const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
+  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1}>
+    {summary}
+    {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2}><Text color={theme.faint}>input</Text><Text color={theme.muted}>{input}</Text></Box>}
+    {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2}><Text color={theme.faint}>output</Text><Text color={theme.muted}>{output}</Text></Box>}
+  </Box>;
 }
 function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
 
@@ -536,13 +636,48 @@ function QuestionCard({ request, questionIndex, cursor, selections, otherMode, o
     {otherMode ? <Box flexDirection="column" marginTop={1}><Text bold color={theme.muted}>YOUR ANSWER</Text><Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box><Text color={theme.faint}>enter confirm · esc return to choices</Text></Box> : <Text color={theme.faint}>{question.multiSelect ? "space toggle · enter confirm · " : "enter select · "}↑↓ navigate · tab next · esc dismiss</Text>}
   </Box>;
 }
-function PermissionCard({ request, cursor, theme }: { readonly request: PermissionRequest; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+function PermissionCard({ request, cursor, comment, commentMode, commentEditor, theme }: { readonly request: PermissionRequest; readonly cursor: number; readonly comment: string | undefined; readonly commentMode: boolean; readonly commentEditor: EditorState; readonly theme: Theme }): React.JSX.Element {
   const options = request.suggestions.length > 0 ? ["Deny", "Allow once", "Always allow"] : ["Deny", "Allow once"];
-  return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}><Text bold color={theme.warning}>⚠ {request.title ?? `${request.toolName} requests permission`}</Text>{request.description ? <Text color={theme.text}>{request.description}</Text> : null}<Text color={theme.muted} wrap="truncate-end">{permissionInputSummary(request)}</Text>{request.reason ? <Text color={theme.faint}>{request.reason}</Text> : null}<Box marginTop={1} columnGap={2}>{options.map((option, index) => <Text key={option} bold={index === cursor} inverse={index === cursor} color={index === 0 ? theme.danger : theme.success}> {option} </Text>)}</Box><Text color={theme.faint}>←→ choose · enter confirm</Text></Box>;
+  const split = splitAtCursor(commentEditor);
+  return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}>
+    <Text bold color={theme.warning}>⚠ {request.title ?? `${request.toolName} requests permission`}</Text>
+    {request.description ? <Text color={theme.text}>{request.description}</Text> : null}
+    <Text color={theme.muted} wrap="truncate-end">{permissionInputSummary(request)}</Text>
+    {request.reason ? <Text color={theme.faint}>{request.reason}</Text> : null}
+    {commentMode
+      ? <Box flexDirection="column" marginTop={1}>
+          <Text bold color={theme.muted}>NOTE (attached to your decision)</Text>
+          <Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box>
+          <Text color={theme.faint}>enter save note · esc cancel</Text>
+        </Box>
+      : <>
+          {comment === undefined ? null : <Text color={theme.secondarySoft}>note: “{comment}”</Text>}
+          <Box marginTop={1} columnGap={2}>{options.map((option, index) => <Text key={option} bold={index === cursor} inverse={index === cursor} color={index === 0 ? theme.danger : theme.success}> {option} </Text>)}</Box>
+          <Text color={theme.faint}>←→ choose · tab {comment === undefined ? "add" : "edit"} note · enter confirm</Text>
+        </>}
+  </Box>;
 }
-function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>shift+tab cycles permission mode · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
+function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>shift+tab cycles permission mode · ctrl+o toggles tool detail · ctrl+t toggles tasks panel</Text><Text>tab while a permission is focused attaches an audit note · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
 
 export function commandSuggestions(value: string, available: readonly Command[] = commands): readonly Command[] { if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return []; const needle = value.toLowerCase(); return available.filter((command) => command.name.startsWith(needle)); }
+/** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
+export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
+  if (key.leftArrow) return { type: "left" };
+  if (key.rightArrow) return { type: "right" };
+  if (key.home || (key.ctrl && text === "a")) return { type: "home" };
+  if (key.end || (key.ctrl && text === "e")) return { type: "end" };
+  if (key.ctrl && text === "u") return { type: "delete-to-start" };
+  if (key.ctrl && text === "k") return { type: "delete-to-end" };
+  if (key.ctrl && text === "w") return { type: "delete-word" };
+  if (key.backspace) return { type: "backspace" };
+  if (key.delete) return { type: "delete" };
+  if (!key.ctrl && !key.meta && text.length > 0) return { type: "insert", text: sanitizeTerminalText(text).replace(/\r?\n/gu, " ") };
+  return undefined;
+}
+/** Builds the audit-trail transcript line for a resolved permission prompt; `appendSystem` sanitizes the composed text on the way in. */
+export function describePermissionDecision(toolName: string, label: string, comment: string | undefined): string {
+  return comment === undefined || comment.length === 0 ? `Permission: ${toolName} → ${label}` : `Permission: ${toolName} → ${label} — “${comment}”`;
+}
 function mergeCommands(local: readonly Command[], engine: readonly Command[]): readonly Command[] { const merged = new Map(engine.map((command) => [command.name, command])); for (const command of local) merged.set(command.name, command); return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name)); }
 function toCommands(supported: readonly { readonly name: string; readonly description: string; readonly argumentHint: string; readonly aliases?: readonly string[] }[]): readonly Command[] { return supported.flatMap((command) => { const name = safeCommandName(command.name); if (name === undefined) return []; const primary: Command = { name, description: sanitizeTerminalText(command.description).slice(0, 240), ...(command.argumentHint.length === 0 ? {} : { shortcut: sanitizeTerminalText(command.argumentHint).slice(0, 80) }) }; return [primary, ...(command.aliases ?? []).flatMap((alias) => { const aliasName = safeCommandName(alias); return aliasName === undefined ? [] : [{ name: aliasName, description: `Alias for ${name}` }]; })]; }); }
 export function tailItemsByRows(items: readonly TranscriptItem[], rows: number, width: number): readonly TranscriptItem[] {
