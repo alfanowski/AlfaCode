@@ -30,6 +30,22 @@ describe("PermissionBroker", () => {
     await expect(result).rejects.toThrow("Permission surface closed");
   });
 
+  it("sanitizes terminal controls while preserving the permission text cap", async () => {
+    const broker = new PermissionBroker();
+    const result = broker.canUseTool("Bash", {}, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-sanitize",
+      requestId: "request-sanitize",
+      title: `safe\u001B]52;c;clipboard\u0007${"x".repeat(2_100)}`,
+    });
+
+    expect(broker.current()?.title).toHaveLength(2_000);
+    expect(broker.current()?.title).not.toContain("\u001B");
+    broker.deny();
+    await expect(result).resolves.toEqual({ behavior: "deny", message: "Denied by user" });
+  });
+
   it("surfaces AskUserQuestion separately and returns the exact updated input contract", async () => {
     const broker = new PermissionBroker();
     const controller = new AbortController();

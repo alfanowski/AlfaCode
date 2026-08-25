@@ -1,12 +1,50 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Box, Text } from "ink";
 import { marked, type Token, type Tokens } from "marked";
 import stringWidth from "string-width";
 import type { Theme } from "./theme.js";
 
+const MARKDOWN_LEX_INTERVAL_MS = 80;
+
 export function Markdown({ children, theme, width = 88 }: { readonly children: string; readonly theme: Theme; readonly width?: number }): React.JSX.Element {
-  const tokens = useMemo(() => marked.lexer(sanitizeTerminalText(children), { gfm: true, breaks: true }), [children]);
+  const tokens = useMarkdownTokens(children);
   return <Box flexDirection="column">{tokens.map((token, index) => <BlockToken key={`${token.type}-${index}`} token={token} theme={theme} width={width} />)}</Box>;
+}
+
+function useMarkdownTokens(source: string): Token[] {
+  const latestSource = useRef(source);
+  const parsedSource = useRef(source);
+  const lastLexedAt = useRef(Date.now());
+  const timeout = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [tokens, setTokens] = useState<Token[]>(() => lexMarkdown(source));
+  latestSource.current = source;
+
+  useEffect(() => {
+    if (parsedSource.current === source) return;
+
+    const flush = (): void => {
+      timeout.current = undefined;
+      const nextSource = latestSource.current;
+      if (parsedSource.current === nextSource) return;
+      parsedSource.current = nextSource;
+      lastLexedAt.current = Date.now();
+      setTokens(lexMarkdown(nextSource));
+    };
+    const elapsed = Date.now() - lastLexedAt.current;
+    const delay = Math.max(0, MARKDOWN_LEX_INTERVAL_MS - elapsed);
+    if (delay === 0) flush();
+    else if (timeout.current === undefined) timeout.current = setTimeout(flush, delay);
+  }, [source]);
+
+  useEffect(() => () => {
+    if (timeout.current !== undefined) clearTimeout(timeout.current);
+  }, []);
+
+  return tokens;
+}
+
+function lexMarkdown(source: string): Token[] {
+  return marked.lexer(sanitizeTerminalText(source), { gfm: true, breaks: true });
 }
 
 function BlockToken({ token, theme, width }: { readonly token: Token; readonly theme: Theme; readonly width: number }): React.JSX.Element | null {
