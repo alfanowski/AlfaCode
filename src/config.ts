@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { chmod, lstat, mkdir, open, rename, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
@@ -86,8 +87,7 @@ export class ConfigStore {
   async read(): Promise<AlfaCodeConfig> {
     try {
       await this.assertSafePath(this.directory, true);
-      await this.assertRegularFile(this.path);
-      const raw = await readFile(this.path, "utf8");
+      const raw = await this.readFile();
       return alfacodeConfigSchema.parse(JSON.parse(raw));
     } catch (error: unknown) {
       if (isNotFound(error)) return emptyConfig();
@@ -147,6 +147,27 @@ export class ConfigStore {
   private async assertRegularFile(path: string): Promise<void> {
     const info = await lstat(path);
     if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link at ${path}`);
+    this.assertSafeRegularFile(info, path);
+  }
+
+  private async readFile(): Promise<string> {
+    let file: FileHandle;
+    try {
+      file = await open(this.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error: unknown) {
+      if (isSymbolicLinkLoop(error)) throw new Error(`Refusing symbolic link at ${this.path}`, { cause: error });
+      throw error;
+    }
+
+    try {
+      this.assertSafeRegularFile(await file.stat(), this.path);
+      return await file.readFile("utf8");
+    } finally {
+      await file.close();
+    }
+  }
+
+  private assertSafeRegularFile(info: Stats, path: string): void {
     if (!info.isFile()) throw new Error(`Expected regular file at ${path}`);
     if ((info.mode & 0o077) !== 0) throw new Error(`Refusing insecure permissions at ${path}`);
     if (process.getuid !== undefined && info.uid !== process.getuid()) throw new Error(`Refusing file not owned by the current user: ${path}`);
@@ -169,4 +190,8 @@ export async function migrateLegacyConfig(options: LegacyMigrationOptions): Prom
 
 function isNotFound(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function isSymbolicLinkLoop(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ELOOP";
 }
