@@ -91,6 +91,10 @@ describe("createCli", () => {
       chatTui: async (input) => {
         expect(input.config.providers.map((provider) => provider.id)).toEqual(["google", "zen"]);
         expect(input.models.map((model) => model.providerId)).toEqual(["google", "zen"]);
+        expect(input.identity).toMatchObject({
+          claudeCodeVersion: "pending",
+          compatibility: { status: "pending", compatible: false, actual: "pending" },
+        });
         return { type: "exit" };
       },
       ui: fakeUi(),

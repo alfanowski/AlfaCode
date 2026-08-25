@@ -14,10 +14,10 @@ import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
 import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { runProviderSetup, type ProviderSetupOptions, type ProviderSetupResult } from "./setup-tui.js";
-import { AgentSession } from "./agent-session.js";
+import { AgentSession, type AgentSessionIdentity } from "./agent-session.js";
 import { PermissionBroker } from "./permission-broker.js";
 import { runChatTui, type ChatAction } from "./chat-tui.js";
-import { PINNED_CLAUDE_CODE_VERSION, checkEngineCompatibility } from "./engine-compatibility.js";
+import { pendingEngineCompatibility } from "./engine-compatibility.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -283,12 +283,13 @@ export function createCli(options: CreateCliOptions = {}): Command {
           canUseTool: permissions.canUseTool,
           ...(resume === undefined ? {} : { resume }),
         });
-        const identity = {
+        const compatibility = pendingEngineCompatibility();
+        const identity: AgentSessionIdentity = {
           sessionId: "pending",
           model: runtime.defaultModelId ?? "automatic",
-          claudeCodeVersion: PINNED_CLAUDE_CODE_VERSION,
-          compatibility: checkEngineCompatibility(PINNED_CLAUDE_CODE_VERSION),
-          capabilities: [] as string[],
+          claudeCodeVersion: compatibility.actual,
+          compatibility,
+          capabilities: [],
         };
         nextAction = await (options.chatTui ?? runChatTui)({
           session,
