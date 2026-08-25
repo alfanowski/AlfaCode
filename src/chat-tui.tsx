@@ -1,12 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
-import type { PermissionMode, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode, SDKMessage, SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
 import type { AgentSession, AgentSessionIdentity } from "./agent-session.js";
 import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
+import { formatRelativeTime } from "./session-history.js";
 import type { UsageSummary } from "./usage-ledger.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
@@ -39,9 +40,19 @@ export interface TranscriptItem {
   readonly streamId?: string | null;
 }
 
-type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help";
-type ContextUsage = { readonly totalTokens: number; readonly maxTokens: number; readonly percentage: number; readonly model: string; readonly categories?: readonly { readonly name: string; readonly tokens: number; readonly isDeferred?: boolean }[] };
+type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind";
+type ContextUsage = {
+  readonly totalTokens: number;
+  readonly maxTokens: number;
+  readonly percentage: number;
+  readonly model: string;
+  readonly categories?: readonly { readonly name: string; readonly tokens: number; readonly isDeferred?: boolean }[];
+  /** Usage percentage at which the engine auto-compacts, when it reports one. */
+  readonly autoCompactThreshold?: number;
+  readonly isAutoCompactEnabled?: boolean;
+};
 interface Command { readonly name: string; readonly description: string; readonly shortcut?: string }
+interface Checkpoint { readonly uuid: string; readonly text: string; readonly transcriptItemId: string; readonly at: number }
 
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
 const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
@@ -51,12 +62,16 @@ const commands: readonly Command[] = [
   { name: "/providers", description: "Manage connected providers" },
   { name: "/connect", description: "Connect another provider" },
   { name: "/usage", description: "Inspect context and token usage" },
+  { name: "/context", description: "Inspect context window usage" },
+  { name: "/compact", description: "Summarize the conversation to free up context", shortcut: "[instructions]" },
   { name: "/agents", description: "List available subagents" },
   { name: "/permissions", description: "Change tool permission mode" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
 ];
+/** Usage percentage at which we nudge toward /compact, when the engine doesn't report its own. */
+const defaultContextWarningThreshold = 80;
 
 export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let resolveAction!: (action: ChatAction) => void;
@@ -83,6 +98,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [confirmDeleteId, setConfirmDeleteId] = useState<string>();
   const [usage, setUsage] = useState<UsageSummary>();
   const [lastTurnTokens, setLastTurnTokens] = useState<number>();
+  const [lastTurnCostUsd, setLastTurnCostUsd] = useState<number>();
+  const [sessionCostUsd, setSessionCostUsd] = useState<number>();
   const [contextUsage, setContextUsage] = useState<ContextUsage>();
   const [permissionCursor, setPermissionCursor] = useState(1);
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest>();
@@ -99,7 +116,14 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [promptSuggestion, setPromptSuggestion] = useState<string>();
   const [engineCommands, setEngineCommands] = useState<readonly Command[]>([]);
+  const [checkpoints, setCheckpoints] = useState<readonly Checkpoint[]>([]);
+  const [rewindCursor, setRewindCursor] = useState(0);
+  const [rewindBusy, setRewindBusy] = useState(false);
+  const [historySearch, setHistorySearch] = useState<{ readonly query: string; readonly index: number }>();
   const pendingTurns = useRef(0);
+  const contextWarnedRef = useRef(false);
+  const previousSessionCostRef = useRef(0);
+  const lastEscapeAtRef = useRef(0);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
@@ -108,6 +132,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   }, [callableModels, modelFilter]);
   const availableCommands = useMemo(() => mergeCommands(commands, engineCommands), [engineCommands]);
   const commandMatches = useMemo(() => commandSuggestions(editor.value, availableCommands), [availableCommands, editor.value]);
+  const historyMatches = useMemo(() => historySearch === undefined ? [] : historySearchMatches(history, historySearch.query), [history, historySearch]);
+  const visibleCheckpoints = useMemo(() => checkpoints.slice(-20), [checkpoints]);
   const width = Math.max(48, stdout.columns ?? 100);
   const blockingPanelRows = pendingQuestion === undefined ? pendingPermission === undefined ? 0 : 8 : 16;
   const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows);
@@ -123,7 +149,17 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (message.type === "result") {
       pendingTurns.current = Math.max(0, pendingTurns.current - 1);
       setBusy(pendingTurns.current > 0);
-      void refreshTelemetry(session, loadUsage, setContextUsage, setUsage, setLastTurnTokens);
+      const cost = turnCostFromResult(message, previousSessionCostRef.current);
+      if (cost !== undefined) {
+        previousSessionCostRef.current = cost.cumulativeCostUsd;
+        setLastTurnCostUsd(cost.turnCostUsd);
+        setSessionCostUsd(cost.cumulativeCostUsd);
+      }
+      void refreshTelemetry(session, loadUsage, setContextUsage, setUsage, setLastTurnTokens, (context) => {
+        const warning = contextFullWarning(context, contextWarnedRef.current);
+        if (warning !== undefined) { contextWarnedRef.current = true; appendSystem(setMessages, warning); }
+        else if (context.percentage < contextFullThreshold(context)) contextWarnedRef.current = false;
+      });
     }
   }), [loadUsage, session]);
 
@@ -184,8 +220,22 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (screen === "models") { handleModelInput(text, key); return; }
     if (screen === "providers") { handleProviderInput(text, key); return; }
     if (screen === "permissions") { handlePermissionModeInput(key); return; }
+    if (screen === "rewind") { handleRewindInput(key); return; }
     if (screen === "help" || screen === "usage") return;
 
+    if (historySearch !== undefined) { handleHistorySearchInput(text, key); return; }
+    if (key.ctrl && text === "r") { setHistorySearch({ query: "", index: 0 }); return; }
+    if (key.escape && editor.value.length === 0 && !busy && checkpoints.length > 0) {
+      const now = Date.now();
+      if (now - lastEscapeAtRef.current < 900) {
+        lastEscapeAtRef.current = 0;
+        setRewindCursor(Math.max(0, visibleCheckpoints.length - 1));
+        setScreen("rewind");
+      } else {
+        lastEscapeAtRef.current = now;
+      }
+      return;
+    }
     if (key.tab && key.shift) {
       const index = modes.indexOf(permissionMode);
       const next = modes[(index + 1) % modes.length] ?? "default";
@@ -246,11 +296,18 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   }
   function sendPrompt(prompt: string): void {
     setPromptSuggestion(undefined);
-    setMessages((current) => [...current, { id: createTranscriptItemId("user"), role: "user", text: prompt }]);
+    const itemId = createTranscriptItemId("user");
+    setMessages((current) => [...current, { id: itemId, role: "user", text: prompt }]);
     pendingTurns.current += 1;
     setBusy(true);
-    try { session.sendPrompt(prompt); }
-    catch (error: unknown) { pendingTurns.current = Math.max(0, pendingTurns.current - 1); setBusy(pendingTurns.current > 0); appendSystem(setMessages, error instanceof Error ? error.message : String(error)); }
+    try {
+      const uuid = session.sendPrompt(prompt);
+      setCheckpoints((current) => [...current, { uuid, text: prompt, transcriptItemId: itemId, at: Date.now() }]);
+    } catch (error: unknown) {
+      pendingTurns.current = Math.max(0, pendingTurns.current - 1);
+      setBusy(pendingTurns.current > 0);
+      appendSystem(setMessages, error instanceof Error ? error.message : String(error));
+    }
   }
   function handleModelInput(text: string, key: Key): void {
     if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
@@ -278,6 +335,41 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (key.upArrow) setPermissionModeState(modes[Math.max(0, index - 1)] ?? "default");
     else if (key.downArrow) setPermissionModeState(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
     else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
+  }
+  function handleHistorySearchInput(text: string, key: Key): void {
+    if (key.escape) { setHistorySearch(undefined); return; }
+    if (key.return) {
+      const match = historyMatches[historySearch!.index % Math.max(1, historyMatches.length)];
+      setHistorySearch(undefined);
+      if (match !== undefined) { setEditor({ value: match, cursor: match.length }); setHistoryCursor(-1); }
+      return;
+    }
+    if (key.ctrl && text === "r") { setHistorySearch((current) => current === undefined ? current : { ...current, index: historyMatches.length === 0 ? 0 : (current.index + 1) % historyMatches.length }); return; }
+    if (key.backspace || key.delete) { setHistorySearch((current) => current === undefined ? current : { query: current.query.slice(0, -1), index: 0 }); return; }
+    if (!key.ctrl && !key.meta && text) { setHistorySearch((current) => current === undefined ? current : { query: current.query + sanitizeTerminalText(text).replace(/\r?\n/gu, " "), index: 0 }); }
+  }
+  function handleRewindInput(key: Key): void {
+    if (rewindBusy) return;
+    if (key.upArrow) { setRewindCursor((current) => Math.max(0, current - 1)); return; }
+    if (key.downArrow) { setRewindCursor((current) => Math.min(Math.max(0, visibleCheckpoints.length - 1), current + 1)); return; }
+    if (key.return) void performRewind(visibleCheckpoints[rewindCursor]);
+  }
+  async function performRewind(checkpoint: Checkpoint | undefined): Promise<void> {
+    if (checkpoint === undefined) return;
+    setRewindBusy(true);
+    try {
+      try {
+        await session.rewindFiles(checkpoint.uuid);
+      } catch (error: unknown) {
+        appendSystem(setMessages, `File rewind unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      setMessages((current) => truncateTranscriptAt(current, checkpoint.transcriptItemId));
+      setCheckpoints((current) => truncateCheckpointsAt(current, checkpoint.uuid));
+      setEditor({ value: checkpoint.text, cursor: checkpoint.text.length });
+      setScreen("chat");
+    } finally {
+      setRewindBusy(false);
+    }
   }
   function handleQuestionInput(text: string, key: Key, request: UserQuestionRequest): void {
     const question = request.questions[questionIndex];
@@ -355,7 +447,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (name === "/help") { setScreen("help"); return; }
     if (name === "/clear") { setMessages([]); return; }
     if (name === "/exit" || name === "/quit") return finish({ type: "exit" });
-    if (name === "/usage") { await refreshTelemetry(session, loadUsage, setContextUsage, setUsage); setScreen("usage"); return; }
+    if (name === "/usage" || name === "/context") { await refreshTelemetry(session, loadUsage, setContextUsage, setUsage); setScreen("usage"); return; }
     if (name === "/agents") {
       try {
         const agents = await session.supportedAgents();
@@ -375,14 +467,15 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={width - 6} busy={busy} /> : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
-      {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} theme={theme} width={width - 6} /> : null}
+      {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={width - 6} /> : null}
       {screen === "permissions" ? <PermissionPicker selected={permissionMode} theme={theme} /> : null}
       {screen === "help" ? <Help theme={theme} commands={availableCommands} /> : null}
+      {screen === "rewind" ? <RewindMenu checkpoints={visibleCheckpoints} cursor={rewindCursor} busy={rewindBusy} theme={theme} /> : null}
     </Box>
-    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
+    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
-      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
+      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
   </Box>;
 }
 
@@ -454,13 +547,25 @@ function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly
 }
 function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
 
-function Composer({ editor, busy, screen, context, lastTurnTokens, messages, suggestion, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostUsd, checkpointCount, historySearch, historyMatches, messages, suggestion, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly lastTurnCostUsd: number | undefined; readonly checkpointCount: number; readonly historySearch: { readonly query: string; readonly index: number } | undefined; readonly historyMatches: readonly string[]; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+  if (historySearch !== undefined) {
+    const match = historyMatches[historySearch.index % Math.max(1, historyMatches.length)];
+    return <Box flexDirection="column" marginTop={1}>
+      <Box borderStyle="round" borderColor={theme.accent} paddingX={1} minHeight={3}>
+        <Text bold color={theme.accent}>history ❯ </Text>
+        <Text color={theme.muted}>(reverse-i-search)`</Text><Text color={theme.text}>{historySearch.query}</Text><Text color={theme.muted}>': </Text>
+        <Text color={theme.text} wrap="truncate-end">{match ?? ""}</Text>
+      </Box>
+      <Box paddingX={1} columnGap={2}><Text color={theme.faint}>{historyMatches.length} match{historyMatches.length === 1 ? "" : "es"} · ctrl+r next · enter accept · esc cancel</Text></Box>
+    </Box>;
+  }
   const split = splitAtCursor(editor);
   const promptTokens = estimateTokens(editor.value);
   const contextLeft = context === undefined ? undefined : Math.max(0, context.maxTokens - context.totalTokens);
   const compact = width < 96;
-  const leftHint = screen !== "chat" ? "esc back" : suggestion !== undefined && editor.value.length === 0 ? "tab accept · type dismisses" : busy ? "ctrl+c stop · type to queue" : compact ? "↵ send · ⇧↵ newline · / commands" : "enter send · shift+enter newline · / commands";
-  const rightHint = `${promptTokens > 0 ? `~${formatCompact(promptTokens)} draft · ` : ""}${lastTurnTokens === undefined ? "" : `${formatCompact(lastTurnTokens)} turn · `}${contextLeft === undefined ? "ctx —" : `${formatCompact(contextLeft)} ctx left`}`;
+  const canRewind = screen === "chat" && !busy && editor.value.length === 0 && checkpointCount > 0;
+  const leftHint = screen !== "chat" ? "esc back" : suggestion !== undefined && editor.value.length === 0 ? "tab accept · type dismisses" : busy ? "ctrl+c stop · type to queue" : compact ? `↵ send · ⇧↵ newline · / commands${canRewind ? " · esc esc rewind" : ""}` : `enter send · shift+enter newline · / commands${canRewind ? " · esc esc rewind" : ""}`;
+  const rightHint = `${promptTokens > 0 ? `~${formatCompact(promptTokens)} draft · ` : ""}${lastTurnTokens === undefined ? "" : `${formatCompact(lastTurnTokens)} turn · `}${lastTurnCostUsd === undefined ? "" : `${formatCostUsd(lastTurnCostUsd)} turn · `}${contextLeft === undefined ? "ctx —" : `${formatCompact(contextLeft)} ctx left`}`;
   return <Box flexDirection="column" marginTop={1}>
     <Box borderStyle="round" borderColor={busy ? theme.secondary : screen === "chat" ? theme.accent : theme.border} paddingX={1} minHeight={3}>
       <Text bold color={theme.accent}>❯ </Text>
@@ -486,7 +591,7 @@ function ProviderManager({ providers, models, cursor, defaultId, theme }: { read
 }
 function DeleteConfirmation({ providerId, theme }: { readonly providerId: string; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column" borderStyle="double" borderColor={theme.danger} paddingX={2} paddingY={1}><Text bold color={theme.danger}>Delete “{providerId}”?</Text><Text color={theme.text}>Its AlfaCode configuration and Keychain credential will be removed.</Text><Box marginTop={1} columnGap={2}><KeyHint shortcut="y" label="delete permanently" theme={theme} /><KeyHint shortcut="n" label="cancel" theme={theme} /></Box></Box>; }
 
-function UsagePanel({ usage, context, theme, width }: { readonly usage: UsageSummary | undefined; readonly context: ContextUsage | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+function UsagePanel({ usage, context, sessionCostUsd, theme, width }: { readonly usage: UsageSummary | undefined; readonly context: ContextUsage | undefined; readonly sessionCostUsd: number | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   if (usage === undefined || context === undefined) return <Text color={theme.muted}>Usage is not available yet. Send a prompt first.</Text>;
   const trackedTokens = usage.attempts.reduce((total, attempt) => total + attemptTokenCount(attempt), 0);
   const providers = [...new Set(usage.attempts.map((attempt) => attempt.providerId))].map((providerId) => { const attempts = usage.attempts.filter((attempt) => attempt.providerId === providerId); return { providerId, attempts: attempts.length, completed: attempts.filter((attempt) => attempt.outcome === "completed").length, failed: attempts.filter((attempt) => attempt.outcome === "failed").length, tokens: attempts.reduce((total, attempt) => total + attemptTokenCount(attempt), 0) }; });
@@ -499,13 +604,13 @@ function UsagePanel({ usage, context, theme, width }: { readonly usage: UsageSum
       <Text color={theme.faint}>{formatCompact(Math.max(0, context.maxTokens - context.totalTokens))} tokens left · {shortModel(context.model)}</Text>
       {categories.length === 0 ? null : <Box flexDirection="column" marginTop={1}>{categories.map((category) => <Box key={category.name} justifyContent="space-between"><Text color={theme.muted}>{category.name}{category.isDeferred ? " · deferred" : ""}</Text><Text color={theme.text}>{formatCompact(category.tokens)}</Text></Box>)}</Box>}
     </Box>
-    <Box columnGap={3} marginBottom={1}><Metric label="tracked" value={trackedTokens} theme={theme} /><Metric label="input" value={usage.totals.inputTokens} theme={theme} /><Metric label="output" value={usage.totals.outputTokens} theme={theme} /><Metric label="cache" value={usage.totals.cachedInputTokens} theme={theme} /></Box>
+    <Box columnGap={3} marginBottom={1}><Metric label="tracked" value={trackedTokens} theme={theme} /><Metric label="input" value={usage.totals.inputTokens} theme={theme} /><Metric label="output" value={usage.totals.outputTokens} theme={theme} /><Metric label="cache" value={usage.totals.cachedInputTokens} theme={theme} />{sessionCostUsd === undefined ? null : <Metric label="session est." value={sessionCostUsd} format={formatCostUsd} theme={theme} />}</Box>
     {providers.map((provider) => <Box key={provider.providerId} justifyContent="space-between"><Text bold>[{provider.providerId}]</Text><Text>{formatCompact(provider.tokens)} tokens <Text color={theme.faint}>· {provider.completed}/{provider.attempts} completed{provider.failed > 0 ? ` · ${provider.failed} failed` : ""}</Text></Text></Box>)}
     <Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>RECENT ATTEMPTS</Text>{usage.attempts.slice(0, 6).map((attempt) => <Text key={attempt.id} color={attempt.outcome === "failed" ? theme.danger : theme.text}>{attempt.outcome === "completed" ? "✓" : attempt.outcome === "failed" ? "×" : "·"} [{attempt.providerId}] {shortModel(attempt.upstreamModel)} <Text color={theme.faint}>{attemptHasUsage(attempt) ? `${formatCompact(attemptTokenCount(attempt))} tokens` : "usage unavailable"}{attempt.errorClass === undefined ? "" : ` · ${attempt.errorClass}`}</Text></Text>)}</Box>
-    <HintBar theme={theme}>esc back · no prompt or response content is stored</HintBar>
+    <HintBar theme={theme}>esc back · no prompt or response content is stored{sessionCostUsd === undefined ? "" : " · cost is the engine's own estimate, not a bill"}</HintBar>
   </Box>;
 }
-function Metric({ label, value, theme }: { readonly label: string; readonly value: number; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column"><Text bold color={theme.secondarySoft}>{formatCompact(value)}</Text><Text color={theme.faint}>{label}</Text></Box>; }
+function Metric({ label, value, format, theme }: { readonly label: string; readonly value: number; readonly format?: (value: number) => string; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column"><Text bold color={theme.secondarySoft}>{format === undefined ? formatCompact(value) : format(value)}</Text><Text color={theme.faint}>{label}</Text></Box>; }
 function PermissionPicker({ selected, theme }: { readonly selected: PermissionMode; readonly theme: Theme }): React.JSX.Element {
   const descriptions: Partial<Record<PermissionMode, string>> = { default: "Ask before sensitive actions", acceptEdits: "Accept file edits", plan: "Read-only planning", dontAsk: "Deny unapproved actions", bypassPermissions: "Bypass every prompt", auto: "Engine evaluates risk automatically" };
   return <Box flexDirection="column"><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.text}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>↑↓ select · enter apply · esc back</HintBar></Box>;
@@ -540,7 +645,21 @@ function PermissionCard({ request, cursor, theme }: { readonly request: Permissi
   const options = request.suggestions.length > 0 ? ["Deny", "Allow once", "Always allow"] : ["Deny", "Allow once"];
   return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}><Text bold color={theme.warning}>⚠ {request.title ?? `${request.toolName} requests permission`}</Text>{request.description ? <Text color={theme.text}>{request.description}</Text> : null}<Text color={theme.muted} wrap="truncate-end">{permissionInputSummary(request)}</Text>{request.reason ? <Text color={theme.faint}>{request.reason}</Text> : null}<Box marginTop={1} columnGap={2}>{options.map((option, index) => <Text key={option} bold={index === cursor} inverse={index === cursor} color={index === 0 ? theme.danger : theme.success}> {option} </Text>)}</Box><Text color={theme.faint}>←→ choose · enter confirm</Text></Box>;
 }
-function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>shift+tab cycles permission mode · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
+function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ctrl+r search history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>esc esc on an empty prompt rewinds · shift+tab cycles permission mode · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
+function RewindMenu({ checkpoints: entries, cursor, busy, theme }: { readonly checkpoints: readonly Checkpoint[]; readonly cursor: number; readonly busy: boolean; readonly theme: Theme }): React.JSX.Element {
+  if (entries.length === 0) return <Text color={theme.muted}>Nothing to rewind to yet.</Text>;
+  return <Box flexDirection="column">
+    <SectionTitle title="Rewind" detail="restore the conversation, and tracked file edits, to an earlier prompt" theme={theme} />
+    {entries.map((checkpoint, index) => {
+      const active = index === cursor;
+      return <Box key={checkpoint.uuid} flexDirection="column" paddingLeft={active ? 0 : 2}>
+        <Text color={active ? theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{truncateOneLine(checkpoint.text, 76)}</Text></Text>
+        {active ? <Text color={theme.faint}>  {formatRelativeTime(checkpoint.at)}</Text> : null}
+      </Box>;
+    })}
+    <HintBar theme={theme}>{busy ? "restoring…" : "↑↓ select · enter rewind · esc cancel"}</HintBar>
+  </Box>;
+}
 
 export function commandSuggestions(value: string, available: readonly Command[] = commands): readonly Command[] { if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return []; const needle = value.toLowerCase(); return available.filter((command) => command.name.startsWith(needle)); }
 function mergeCommands(local: readonly Command[], engine: readonly Command[]): readonly Command[] { const merged = new Map(engine.map((command) => [command.name, command])); for (const command of local) merged.set(command.name, command); return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name)); }
@@ -550,7 +669,48 @@ export function tailItemsByRows(items: readonly TranscriptItem[], rows: number, 
   for (let index = items.length - 1; index >= 0; index -= 1) { const item = items[index]; if (item === undefined) continue; const estimated = Math.max(1, item.text.split("\n").reduce((total, line) => total + Math.max(1, Math.ceil(line.length / Math.max(12, width))), 0)) + 1; if (output.length > 0 && used + estimated > rows) break; output.unshift(item); used += estimated; }
   return output;
 }
-async function refreshTelemetry(session: AgentSession, loadUsage: () => Promise<UsageSummary>, setContext: React.Dispatch<React.SetStateAction<ContextUsage | undefined>>, setUsage: React.Dispatch<React.SetStateAction<UsageSummary | undefined>>, setLatestTurn?: React.Dispatch<React.SetStateAction<number | undefined>>): Promise<void> { const [contextResult, usageResult] = await Promise.allSettled([session.contextUsage(), loadUsage()]); if (contextResult.status === "fulfilled") setContext(contextResult.value); if (usageResult.status === "fulfilled") { setUsage(usageResult.value); const latest = usageResult.value.attempts[0]; if (setLatestTurn !== undefined) setLatestTurn(latest === undefined || !attemptHasUsage(latest) ? undefined : attemptTokenCount(latest)); } }
+async function refreshTelemetry(session: AgentSession, loadUsage: () => Promise<UsageSummary>, setContext: React.Dispatch<React.SetStateAction<ContextUsage | undefined>>, setUsage: React.Dispatch<React.SetStateAction<UsageSummary | undefined>>, setLatestTurn?: React.Dispatch<React.SetStateAction<number | undefined>>, onContext?: (context: ContextUsage) => void): Promise<void> { const [contextResult, usageResult] = await Promise.allSettled([session.contextUsage(), loadUsage()]); if (contextResult.status === "fulfilled") { setContext(contextResult.value); onContext?.(contextResult.value); } if (usageResult.status === "fulfilled") { setUsage(usageResult.value); const latest = usageResult.value.attempts[0]; if (setLatestTurn !== undefined) setLatestTurn(latest === undefined || !attemptHasUsage(latest) ? undefined : attemptTokenCount(latest)); } }
+/** Usage percentage at which we nudge toward /compact: the engine's own auto-compact point when it's a sane percentage, else a static fallback. */
+export function contextFullThreshold(context: Pick<ContextUsage, "autoCompactThreshold">): number {
+  const { autoCompactThreshold } = context;
+  return autoCompactThreshold !== undefined && autoCompactThreshold > 0 && autoCompactThreshold <= 100 ? autoCompactThreshold : defaultContextWarningThreshold;
+}
+/** A one-shot "context is getting full" nudge, or undefined when below threshold or already shown for this crossing. */
+export function contextFullWarning(context: ContextUsage, alreadyWarned: boolean): string | undefined {
+  if (alreadyWarned || context.percentage < contextFullThreshold(context)) return undefined;
+  const auto = context.isAutoCompactEnabled === true ? " before the engine compacts it for you" : "";
+  return `Context is ${Math.round(context.percentage)}% full. Run /compact [instructions] to summarize and free up space${auto}.`;
+}
+/** This turn's estimated cost (USD), derived from the engine's cumulative session total. Undefined when the engine didn't report a cost. */
+export function turnCostFromResult(message: SDKResultMessage, previousCumulativeUsd: number): { readonly turnCostUsd: number; readonly cumulativeCostUsd: number } | undefined {
+  const cumulative = message.total_cost_usd;
+  if (typeof cumulative !== "number" || !Number.isFinite(cumulative)) return undefined;
+  return { turnCostUsd: Math.max(0, cumulative - previousCumulativeUsd), cumulativeCostUsd: cumulative };
+}
+export function historySearchMatches(history: readonly string[], query: string): readonly string[] {
+  if (query.length === 0) return history;
+  const needle = query.toLowerCase();
+  return history.filter((item) => item.toLowerCase().includes(needle));
+}
+/** Drops `itemId` and everything after it from the transcript (used to restore the view to an earlier checkpoint). */
+export function truncateTranscriptAt(items: readonly TranscriptItem[], itemId: string): TranscriptItem[] {
+  const index = items.findIndex((item) => item.id === itemId);
+  return index < 0 ? [...items] : items.slice(0, index);
+}
+export function truncateCheckpointsAt(checkpoints: readonly Checkpoint[], uuid: string): Checkpoint[] {
+  const index = checkpoints.findIndex((item) => item.uuid === uuid);
+  return index < 0 ? [...checkpoints] : checkpoints.slice(0, index);
+}
+export function truncateOneLine(value: string, max: number): string {
+  const line = value.replace(/\s+/gu, " ").trim();
+  return line.length > max ? `${line.slice(0, Math.max(0, max - 1))}…` : line;
+}
+/** Formats a USD estimate with enough precision to not always read as "$0.00" for a cheap turn. */
+export function formatCostUsd(value: number): string {
+  if (value <= 0) return "$0.00";
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
 function contextualHint(messages: readonly TranscriptItem[], busy: boolean): string { if (busy) return "Queue your next request…"; const last = messages.at(-1); if (last === undefined) return "Ask AlfaCode anything, or type / for commands"; if (last.role === "system") return "Retry, switch /model, or inspect /usage"; if (last.role === "tool") return "Follow up on the tool result…"; return "Ask a follow-up, request a change, or type /"; }
 function truncatePreview(value: string): string { const lines = value.split("\n"); const visible = lines.slice(0, 8).join("\n").slice(0, 1_200); return visible.length < value.length ? `${visible}\n\n_…preview truncated_` : visible; }
 function safeCommandName(value: string): string | undefined { const sanitized = sanitizeTerminalText(value).trim().replace(/^\/+/, ""); return sanitized.length === 0 || /\s/u.test(sanitized) ? undefined : `/${sanitized.slice(0, 100)}`; }
