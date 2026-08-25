@@ -12,7 +12,20 @@ import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { usePulse, useSpinner } from "./ui/motion.js";
 import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
-import { resolveTheme, type Theme } from "./ui/theme.js";
+import { resolveTheme, supportsMotion, type Theme } from "./ui/theme.js";
+import {
+  checkComposerText,
+  defaultSpellCheckSettings,
+  defaultSpellCheckSettingsPath,
+  detectSpellChecker,
+  FileSpellCheckSettingsStore,
+  segmentText,
+  spellCheckerNames,
+  SpellCheckController,
+  type MisspelledRange,
+  type SpellCheckerName,
+  type SpellCheckSettings,
+} from "./spellcheck.js";
 
 export type ChatAction =
   | { readonly type: "exit" }
@@ -53,6 +66,7 @@ const commands: readonly Command[] = [
   { name: "/usage", description: "Inspect context and token usage" },
   { name: "/agents", description: "List available subagents" },
   { name: "/permissions", description: "Change tool permission mode" },
+  { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -99,7 +113,12 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [promptSuggestion, setPromptSuggestion] = useState<string>();
   const [engineCommands, setEngineCommands] = useState<readonly Command[]>([]);
+  const [spellCheckSettings, setSpellCheckSettings] = useState<SpellCheckSettings>(defaultSpellCheckSettings);
+  const [spellChecker, setSpellChecker] = useState<SpellCheckerName>();
+  const [misspelledRanges, setMisspelledRanges] = useState<readonly MisspelledRange[]>([]);
   const pendingTurns = useRef(0);
+  const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
+  const spellCheckController = useRef<SpellCheckController | undefined>(undefined);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
@@ -159,6 +178,42 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       setQuestionOtherEditor({ value: "", cursor: 0 });
     }
   }), [permissions]);
+
+  useEffect(() => {
+    let active = true;
+    void spellCheckStore.load().then((settings) => { if (active) setSpellCheckSettings(settings); }).catch(() => undefined);
+    return () => { active = false; };
+  }, [spellCheckStore]);
+
+  useEffect(() => {
+    let active = true;
+    void detectSpellChecker({ ...(spellCheckSettings.checker === undefined ? {} : { preferred: spellCheckSettings.checker }) })
+      .then((checker) => { if (active) setSpellChecker(checker); })
+      .catch(() => { if (active) setSpellChecker(undefined); });
+    return () => { active = false; };
+  }, [spellCheckSettings.checker]);
+
+  useEffect(() => {
+    const active = spellCheckSettings.enabled && spellChecker !== undefined && supportsMotion();
+    if (!active) {
+      spellCheckController.current?.dispose();
+      spellCheckController.current = undefined;
+      setMisspelledRanges((current) => (current.length === 0 ? current : []));
+      return;
+    }
+    const checker = spellChecker;
+    const controller = new SpellCheckController({
+      checkText: (text) => checkComposerText(text, { checker, ...(spellCheckSettings.dictionary === undefined ? {} : { dictionary: spellCheckSettings.dictionary }) }),
+      onResult: setMisspelledRanges,
+    });
+    spellCheckController.current = controller;
+    controller.setText(editor.value);
+    return () => controller.dispose();
+    // editor.value is intentionally not a dependency here: the effect right below drives
+    // per-keystroke updates on this same controller instance without recreating it.
+  }, [spellCheckSettings.enabled, spellCheckSettings.dictionary, spellChecker]);
+
+  useEffect(() => { spellCheckController.current?.setText(editor.value); }, [editor.value]);
 
   useInput((text, key) => {
     if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
@@ -363,7 +418,35 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       } catch (error: unknown) { appendSystem(setMessages, `Unable to list subagents: ${error instanceof Error ? error.message : String(error)}`); }
       return;
     }
+    if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
     sendPrompt(command);
+  }
+  async function handleSpellCheckCommand(command: string): Promise<void> {
+    const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
+    const [sub, ...rest] = args;
+    let next: SpellCheckSettings;
+    if (sub === undefined) next = { ...spellCheckSettings, enabled: !spellCheckSettings.enabled };
+    else if (sub === "on") next = { ...spellCheckSettings, enabled: true };
+    else if (sub === "off") next = { ...spellCheckSettings, enabled: false };
+    else if (sub === "checker") {
+      const matched = rest[0] === undefined ? undefined : spellCheckerNames.find((candidate) => candidate === rest[0]);
+      if (matched === undefined) { appendSystem(setMessages, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
+      next = { ...spellCheckSettings, checker: matched };
+    } else if (sub === "dictionary") {
+      const dictionary = rest.join(" ");
+      if (dictionary.length === 0) { appendSystem(setMessages, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
+      next = { ...spellCheckSettings, dictionary };
+    } else if (sub === "color") {
+      const underlineColor = rest[0];
+      if (underlineColor === undefined) { appendSystem(setMessages, "Usage: /spellcheck color <name>, e.g. red"); return; }
+      next = { ...spellCheckSettings, underlineColor };
+    } else {
+      appendSystem(setMessages, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
+      return;
+    }
+    setSpellCheckSettings(next);
+    try { await spellCheckStore.save(next); } catch { /* best-effort local persistence */ }
+    appendSystem(setMessages, describeSpellCheckSettings(next, spellChecker));
   }
   function reportFailure(label: string, promise: Promise<unknown>, onSuccess?: () => void): void {
     void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
@@ -382,7 +465,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
-      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
+      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} misspelledRanges={misspelledRanges} underlineColor={spellCheckSettings.underlineColor ?? theme.danger} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
   </Box>;
 }
 
@@ -454,7 +537,7 @@ function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly
 }
 function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
 
-function Composer({ editor, busy, screen, context, lastTurnTokens, messages, suggestion, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+function Composer({ editor, busy, screen, context, lastTurnTokens, messages, suggestion, theme, width, misspelledRanges, underlineColor }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number; readonly misspelledRanges: readonly MisspelledRange[]; readonly underlineColor: string }): React.JSX.Element {
   const split = splitAtCursor(editor);
   const promptTokens = estimateTokens(editor.value);
   const contextLeft = context === undefined ? undefined : Math.max(0, context.maxTokens - context.totalTokens);
@@ -464,7 +547,7 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, messages, sug
   return <Box flexDirection="column" marginTop={1}>
     <Box borderStyle="round" borderColor={busy ? theme.secondary : screen === "chat" ? theme.accent : theme.border} paddingX={1} minHeight={3}>
       <Text bold color={theme.accent}>❯ </Text>
-      {screen !== "chat" ? <Text color={theme.faint}>Press Esc to return to chat</Text> : editor.value.length === 0 ? <Text><Text inverse color={theme.text}> </Text><Text color={suggestion === undefined ? theme.faint : theme.muted}>{suggestion ?? contextualHint(messages, busy)}</Text></Text> : <Text wrap="wrap"><Text color={theme.text}>{split.before}</Text><Text inverse color={theme.text}>{split.cursor}</Text><Text color={theme.text}>{split.after}</Text></Text>}
+      {screen !== "chat" ? <Text color={theme.faint}>Press Esc to return to chat</Text> : editor.value.length === 0 ? <Text><Text inverse color={theme.text}> </Text><Text color={suggestion === undefined ? theme.faint : theme.muted}>{suggestion ?? contextualHint(messages, busy)}</Text></Text> : <Text wrap="wrap">{spellCheckRuns(split.before, 0, misspelledRanges, "b", theme.text, underlineColor)}<Text inverse color={theme.text}>{split.cursor}</Text>{spellCheckRuns(split.after, editor.value.length - split.after.length, misspelledRanges, "a", theme.text, underlineColor)}</Text>}
     </Box>
     <Box paddingX={1} columnGap={2}><Box flexGrow={1}><Text color={theme.faint} wrap="truncate-end">{leftHint}</Text></Box><Text color={theme.faint}>{rightHint}</Text></Box>
   </Box>;
@@ -551,6 +634,20 @@ export function tailItemsByRows(items: readonly TranscriptItem[], rows: number, 
   return output;
 }
 async function refreshTelemetry(session: AgentSession, loadUsage: () => Promise<UsageSummary>, setContext: React.Dispatch<React.SetStateAction<ContextUsage | undefined>>, setUsage: React.Dispatch<React.SetStateAction<UsageSummary | undefined>>, setLatestTurn?: React.Dispatch<React.SetStateAction<number | undefined>>): Promise<void> { const [contextResult, usageResult] = await Promise.allSettled([session.contextUsage(), loadUsage()]); if (contextResult.status === "fulfilled") setContext(contextResult.value); if (usageResult.status === "fulfilled") { setUsage(usageResult.value); const latest = usageResult.value.attempts[0]; if (setLatestTurn !== undefined) setLatestTurn(latest === undefined || !attemptHasUsage(latest) ? undefined : attemptTokenCount(latest)); } }
+/** Splits one composer text slice into plain/underlined `<Text>` runs using spellcheck.ts's pure segmentation. */
+function spellCheckRuns(text: string, offset: number, ranges: readonly MisspelledRange[], keyPrefix: string, color: string, underlineColor: string): readonly React.JSX.Element[] {
+  if (text.length === 0) return [];
+  if (ranges.length === 0) return [<Text key={keyPrefix} color={color}>{text}</Text>];
+  return segmentText(text, offset, ranges).map((segment, index) => (
+    <Text key={`${keyPrefix}-${index}`} color={segment.misspelled ? underlineColor : color} underline={segment.misspelled}>{segment.text}</Text>
+  ));
+}
+function describeSpellCheckSettings(settings: SpellCheckSettings, checker: SpellCheckerName | undefined): string {
+  if (!settings.enabled) return "Spell-check disabled.";
+  if (checker === undefined) return "Spell-check enabled, but no checker (aspell/hunspell/ispell) was found on PATH.";
+  const dictionary = settings.dictionary === undefined ? "" : ` · dictionary ${settings.dictionary}`;
+  return `Spell-check enabled using ${checker}${dictionary}.`;
+}
 function contextualHint(messages: readonly TranscriptItem[], busy: boolean): string { if (busy) return "Queue your next request…"; const last = messages.at(-1); if (last === undefined) return "Ask AlfaCode anything, or type / for commands"; if (last.role === "system") return "Retry, switch /model, or inspect /usage"; if (last.role === "tool") return "Follow up on the tool result…"; return "Ask a follow-up, request a change, or type /"; }
 function truncatePreview(value: string): string { const lines = value.split("\n"); const visible = lines.slice(0, 8).join("\n").slice(0, 1_200); return visible.length < value.length ? `${visible}\n\n_…preview truncated_` : visible; }
 function safeCommandName(value: string): string | undefined { const sanitized = sanitizeTerminalText(value).trim().replace(/^\/+/, ""); return sanitized.length === 0 || /\s/u.test(sanitized) ? undefined : `/${sanitized.slice(0, 100)}`; }
