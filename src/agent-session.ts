@@ -43,6 +43,17 @@ export interface AgentSessionIdentity {
   readonly capabilities: readonly string[];
 }
 
+/**
+ * An image to attach alongside a prompt's text. The Messages API (and the SDK's `MessageParam`
+ * content, which accepts `string | Array<ContentBlockParam>`) already supports image content blocks
+ * in outgoing user messages — this is composer-side plumbing (image paste / dropped image files)
+ * riding that existing capability, not a new wire format.
+ */
+export interface PromptImageAttachment {
+  readonly mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  readonly base64: string;
+}
+
 class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
   private readonly pending: SDKUserMessage[] = [];
   private readonly readers: Array<(result: IteratorResult<SDKUserMessage>) => void> = [];
@@ -140,12 +151,19 @@ export class AgentSession {
     return () => this.listeners.delete(listener);
   }
 
-  public sendPrompt(text: string): string {
+  public sendPrompt(text: string, attachments: readonly PromptImageAttachment[] = []): string {
     if (text.trim().length === 0) throw new Error("Prompt cannot be empty");
     const uuid = randomUUID();
+    const content = attachments.length === 0 ? text : [
+      ...attachments.map((attachment) => ({
+        type: "image" as const,
+        source: { type: "base64" as const, media_type: attachment.mediaType, data: attachment.base64 },
+      })),
+      { type: "text" as const, text },
+    ];
     this.input.push({
       type: "user",
-      message: { role: "user", content: text },
+      message: { role: "user", content },
       parent_tool_use_id: null,
       uuid,
     });
