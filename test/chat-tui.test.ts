@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { commandSuggestions, createTranscriptItemId, reduceSdkMessage, tailItemsByRows } from "../src/chat-tui.js";
+import { commandSuggestions, createTranscriptItemId, reduceSdkMessage, resolveInitialVimMode, tailItemsByRows } from "../src/chat-tui.js";
 
 describe("chat transcript reducer", () => {
   it("assembles streamed assistant text and exposes tool activity", () => {
@@ -64,6 +64,10 @@ describe("chat transcript reducer", () => {
     expect(commandSuggestions("/model now")).toEqual([]);
   });
 
+  it("registers /vim in the default command list", () => {
+    expect(commandSuggestions("/vim").map((command) => command.name)).toEqual(["/vim"]);
+  });
+
   it("keeps the newest transcript items within the visible row budget", () => {
     const items = [
       { id: "one", role: "assistant", text: "first" },
@@ -79,6 +83,17 @@ describe("chat transcript reducer", () => {
       expect(createTranscriptItemId("user")).not.toBe(createTranscriptItemId("user"));
     } finally {
       now.mockRestore();
+    }
+  });
+});
+
+describe("vim mode initial config", () => {
+  it("is off by default, and on for recognized truthy ALFACODE_VIM_MODE values", () => {
+    expect(resolveInitialVimMode({})).toBe(false);
+    expect(resolveInitialVimMode({ ALFACODE_VIM_MODE: "0" })).toBe(false);
+    expect(resolveInitialVimMode({ ALFACODE_VIM_MODE: "nope" })).toBe(false);
+    for (const truthy of ["1", "true", "TRUE", "yes", "on"]) {
+      expect(resolveInitialVimMode({ ALFACODE_VIM_MODE: truthy })).toBe(true);
     }
   });
 });
