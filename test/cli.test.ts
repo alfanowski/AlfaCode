@@ -7,6 +7,7 @@ import { ConfigStore } from "../src/config.js";
 import type { TerminalUi } from "../src/terminal-ui.js";
 import type { AgentSession } from "../src/agent-session.js";
 import { CAPABILITIES } from "../src/providers/foundation/types.js";
+import type { SessionsBackend } from "../src/session-history.js";
 
 const directories: string[] = [];
 
@@ -22,6 +23,16 @@ function fakeUi(overrides: Partial<TerminalUi> = {}): TerminalUi {
     select: async (_message, choices) => choices[0]!.value,
     ask: async (_message, fallback) => fallback ?? "",
     ...overrides,
+  };
+}
+
+function fakeSessionsBackend(sessions: ReadonlyArray<{ sessionId: string; summary: string; lastModified: number; customTitle?: string }>): SessionsBackend & { renamed: Array<{ sessionId: string; title: string }> } {
+  const renamed: Array<{ sessionId: string; title: string }> = [];
+  return {
+    renamed,
+    async listSessions() { return sessions.map((session) => ({ ...session })); },
+    async getSessionInfo(sessionId) { return sessions.find((session) => session.sessionId === sessionId); },
+    async renameSession(sessionId, title) { renamed.push({ sessionId, title }); },
   };
 }
 
@@ -185,5 +196,196 @@ describe("createCli", () => {
     expect(stored).toBe("new-key");
     expect(launched).toBe(true);
     expect(await configStore.read()).toMatchObject({ defaultProviderId: "zen", providers: [{ id: "zen", type: "opencode-zen" }] });
+  });
+
+  describe("session resume, continue, and naming", () => {
+    async function nativeConfig(): Promise<ConfigStore> {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-native-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      await configStore.write({ version: 1, defaultProviderId: "google", providers: [{ id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } }] });
+      return configStore;
+    }
+
+    it("resumes a session by uuid directly, without listing sessions", async () => {
+      const configStore = await nativeConfig();
+      let listed = false;
+      const backend = fakeSessionsBackend([]);
+      const spiedBackend: SessionsBackend = { ...backend, listSessions: async (options) => { listed = true; return backend.listSessions(options); } };
+      let captured: { resume?: string; continue?: boolean } | undefined;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => { captured = { ...(input.resume === undefined ? {} : { resume: input.resume }), ...(input.continue === undefined ? {} : { continue: input.continue }) }; return { close: async () => input.runtime.close() } as unknown as AgentSession; },
+        chatTui: async () => ({ type: "exit" }),
+        sessionsBackend: spiedBackend,
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "--resume", "3fa85f64-5717-4562-b3fc-2c963f66afa6"], { from: "node" });
+      expect(captured).toEqual({ resume: "3fa85f64-5717-4562-b3fc-2c963f66afa6" });
+      expect(listed).toBe(false);
+    });
+
+    it("continues the most recent session with --continue, and never sends resume", async () => {
+      const configStore = await nativeConfig();
+      let captured: { resume?: string; continue?: boolean } | undefined;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => { captured = { ...(input.resume === undefined ? {} : { resume: input.resume }), ...(input.continue === undefined ? {} : { continue: input.continue }) }; return { close: async () => input.runtime.close() } as unknown as AgentSession; },
+        chatTui: async () => ({ type: "exit" }),
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "--continue"], { from: "node" });
+      expect(captured).toEqual({ continue: true });
+    });
+
+    it("rejects combining --continue and --resume", async () => {
+      const configStore = await nativeConfig();
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        ui: fakeUi(),
+      });
+      await expect(cli.parseAsync(["node", "alfacode", "--continue", "--resume", "x"], { from: "node" })).rejects.toThrow("Use either --continue or --resume, not both");
+    });
+
+    it("resolves an unambiguous --resume name without prompting", async () => {
+      const configStore = await nativeConfig();
+      const backend = fakeSessionsBackend([
+        { sessionId: "session-a", summary: "Fix the login bug", lastModified: Date.now() - 60_000 },
+        { sessionId: "session-b", summary: "Refactor gateway routing", lastModified: Date.now() - 5_000 },
+      ]);
+      let captured: string | undefined;
+      let selectCalled = false;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => { captured = input.resume; return { close: async () => input.runtime.close() } as unknown as AgentSession; },
+        chatTui: async () => ({ type: "exit" }),
+        sessionsBackend: backend,
+        ui: fakeUi({ select: async (_message, choices) => { selectCalled = true; return choices[0]!.value; } }),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "--resume", "login"], { from: "node" });
+      expect(captured).toBe("session-a");
+      expect(selectCalled).toBe(false);
+    });
+
+    it("prompts a picker when --resume is ambiguous and resumes the selected session", async () => {
+      const configStore = await nativeConfig();
+      const backend = fakeSessionsBackend([
+        { sessionId: "session-a", summary: "Fix login redirect", lastModified: Date.now() - 120_000 },
+        { sessionId: "session-b", summary: "Fix login flicker", lastModified: Date.now() - 30_000 },
+      ]);
+      let captured: string | undefined;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => { captured = input.resume; return { close: async () => input.runtime.close() } as unknown as AgentSession; },
+        chatTui: async () => ({ type: "exit" }),
+        sessionsBackend: backend,
+        ui: fakeUi({ select: async (_message, choices) => choices[1]!.value }),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "--resume", "login"], { from: "node" });
+      expect(captured).toBe("session-a");
+    });
+
+    it("rejects a --resume query that matches nothing", async () => {
+      const configStore = await nativeConfig();
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        sessionsBackend: fakeSessionsBackend([]),
+        ui: fakeUi(),
+      });
+      await expect(cli.parseAsync(["node", "alfacode", "--resume", "nonexistent"], { from: "node" })).rejects.toThrow('No session matches "nonexistent"');
+    });
+
+    it("names the session after it starts, via --name", async () => {
+      const configStore = await nativeConfig();
+      const renameCalls: string[] = [];
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => ({
+          close: async () => input.runtime.close(),
+          rename: async (title: string) => { renameCalls.push(title); },
+        } as unknown as AgentSession),
+        chatTui: async () => ({ type: "exit" }),
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "--name", "My session"], { from: "node" });
+      expect(renameCalls).toEqual(["My session"]);
+    });
+
+    it("does not call rename when --name is not given", async () => {
+      const configStore = await nativeConfig();
+      let renameCalled = false;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => ({
+          close: async () => input.runtime.close(),
+          rename: async () => { renameCalled = true; },
+        } as unknown as AgentSession),
+        chatTui: async () => ({ type: "exit" }),
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode"], { from: "node" });
+      expect(renameCalled).toBe(false);
+    });
+  });
+
+  describe("sessions command", () => {
+    it("lists resumable sessions, name/summary and time-since-activity first", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-sessions-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      const backend = fakeSessionsBackend([{ sessionId: "session-a", summary: "Fix the login bug", customTitle: "Login fix", lastModified: Date.now() - 60_000 }]);
+      const written: string[] = [];
+      const cli = createCli({ configStore, sessionsBackend: backend, ui: fakeUi({ write: (message) => { written.push(message); } }) });
+
+      await cli.parseAsync(["node", "alfacode", "sessions"], { from: "node" });
+      expect(written).toHaveLength(1);
+      expect(written[0]).toContain("session-a");
+      expect(written[0]).toContain("Login fix");
+    });
+
+    it("reports when there is nothing to resume", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-sessions-empty-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      const written: string[] = [];
+      const cli = createCli({ configStore, sessionsBackend: fakeSessionsBackend([]), ui: fakeUi({ write: (message) => { written.push(message); } }) });
+
+      await cli.parseAsync(["node", "alfacode", "sessions"], { from: "node" });
+      expect(written).toEqual(["No resumable sessions in this directory yet."]);
+    });
+
+    it("emits JSON with --json", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-sessions-json-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      const backend = fakeSessionsBackend([{ sessionId: "session-a", summary: "Fix the login bug", lastModified: Date.now() }]);
+      const written: string[] = [];
+      const cli = createCli({ configStore, sessionsBackend: backend, ui: fakeUi({ write: (message) => { written.push(message); } }) });
+
+      await cli.parseAsync(["node", "alfacode", "sessions", "--json"], { from: "node" });
+      expect(JSON.parse(written[0]!)).toEqual([{ sessionId: "session-a", title: "Fix the login bug", lastModified: expect.any(Number) }]);
+    });
   });
 });

@@ -18,6 +18,7 @@ import { AgentSession } from "./agent-session.js";
 import { PermissionBroker } from "./permission-broker.js";
 import { runChatTui, type ChatAction } from "./chat-tui.js";
 import { PINNED_CLAUDE_CODE_VERSION, checkEngineCompatibility } from "./engine-compatibility.js";
+import { describeSessionPickerEntry, listRecentSessions, resolveResumeTarget, type SessionPickerEntry, type SessionsBackend } from "./session-history.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -57,6 +58,8 @@ export interface CreateCliOptions {
   readonly providerSetup?: (options: ProviderSetupOptions) => Promise<void>;
   readonly startAgentSession?: typeof AgentSession.start;
   readonly chatTui?: typeof runChatTui;
+  /** Overrides the SDK-backed session source used to resolve `--resume`/list `sessions`; for tests. */
+  readonly sessionsBackend?: SessionsBackend;
 }
 
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
@@ -256,8 +259,26 @@ export function createCli(options: CreateCliOptions = {}): Command {
     });
   };
 
+  const sessionsConfigDir = (): string => join(configStore.homeDirectory, ".alfacode", "claude");
+
+  /** Resolves a `--resume`/`-r` flag (a name, an id, or bare) to a concrete session id, prompting when ambiguous. */
+  const resolveResumeFlag = async (flag: string | true): Promise<string> => {
+    const resolution = await resolveResumeTarget({ cwd: process.cwd(), configDir: sessionsConfigDir(), ...(options.sessionsBackend === undefined ? {} : { backend: options.sessionsBackend }), ...(flag === true ? {} : { query: flag }) });
+    if (resolution.kind === "id") return resolution.sessionId;
+    if (resolution.kind === "not-found") {
+      throw new Error(flag === true ? "No previous sessions found in this directory." : `No session matches "${flag}".`);
+    }
+    requireInteractive(ui.interactive);
+    return ui.select("Resume which session?", resolution.candidates.map(toSessionChoice));
+  };
+
   const nativeLaunch = async (args: readonly string[]): Promise<void> => {
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
+    const resumeFlag = parseResumeFlag(args);
+    const continueFlag = parseContinueFlag(args);
+    const nameFlag = parseNameFlag(args);
+    if (resumeFlag !== undefined && continueFlag) throw new Error("Use either --continue or --resume, not both");
+    const resolvedResume = resumeFlag === undefined ? undefined : await resolveResumeFlag(resumeFlag);
     let nextAction: ChatAction = { type: "connect" };
     while (nextAction.type !== "exit") {
       let config = await loadConfig();
@@ -276,13 +297,16 @@ export function createCli(options: CreateCliOptions = {}): Command {
       const permissions = new PermissionBroker();
       let session: AgentSession | undefined;
       try {
-        const resume = resumeArgument(args);
         session = await (options.startAgentSession ?? AgentSession.start)({
           runtime,
           cwd: process.cwd(),
           canUseTool: permissions.canUseTool,
-          ...(resume === undefined ? {} : { resume }),
+          ...(resolvedResume === undefined ? {} : { resume: resolvedResume }),
+          ...(continueFlag ? { continue: true } : {}),
         });
+        if (nameFlag !== undefined) {
+          void session.rename(nameFlag).catch((error: unknown) => ui.write(`Unable to name session: ${error instanceof Error ? error.message : String(error)}`));
+        }
         const identity = {
           sessionId: "pending",
           model: runtime.defaultModelId ?? "automatic",
@@ -393,6 +417,14 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const summary = options.queryUsage === undefined ? await queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), query) : await options.queryUsage(query);
     ui.write(flags.json ? JSON.stringify(summary) : renderUsage(summary));
   });
+  program.command("sessions").description("List sessions AlfaCode can resume in this directory").option("--json", "Emit JSON").option("--limit <count>", "Maximum sessions to list").action(async (flags: { json?: boolean; limit?: string }) => {
+    const limit = flags.limit === undefined ? undefined : Number(flags.limit);
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) throw new Error("--limit must be a positive integer");
+    const sessions = await listRecentSessions({ cwd: process.cwd(), configDir: sessionsConfigDir(), ...(options.sessionsBackend === undefined ? {} : { backend: options.sessionsBackend }), ...(limit === undefined ? {} : { limit }) });
+    if (flags.json) return ui.write(JSON.stringify(sessions));
+    if (sessions.length === 0) return ui.write("No resumable sessions in this directory yet.");
+    for (const session of sessions) ui.write(`${session.sessionId}\t${describeSessionPickerEntry(session)}`);
+  });
   program.command("doctor").option("--json", "Emit JSON").action(async (flags: { json?: boolean }) => {
     const config = await loadConfig();
     const report = { configPath: configStore.path, providers: config.providers.map((provider) => ({ id: provider.id, type: provider.type, credential: provider.apiKey?.kind ?? "missing" })), defaultProviderId: config.defaultProviderId ?? null, isolatedClaudeConfig: `${configStore.homeDirectory}/.alfacode/claude`, status: config.providers.length > 0 ? "ready" : "setup-required" };
@@ -421,10 +453,32 @@ async function selectedCredentialUnavailable(
   return await keychain.retrieve(provider.apiKey.account, provider.apiKey.service) ? undefined : provider.id;
 }
 
-function resumeArgument(args: readonly string[]): string | undefined {
+/**
+ * A `--resume`/`-r` flag: a name or id to search for, or `true` for the bare flag (open a
+ * picker over every resumable session in this directory).
+ */
+function parseResumeFlag(args: readonly string[]): string | true | undefined {
   const index = args.findIndex((value) => value === "--resume" || value === "-r");
-  const session = index < 0 ? undefined : args[index + 1];
-  return session?.startsWith("-") ? undefined : session;
+  if (index < 0) return undefined;
+  const next = args[index + 1];
+  return next === undefined || next.startsWith("-") ? true : next;
+}
+
+/** `claude --continue`/`-c`: resume the most recent session in this directory. */
+function parseContinueFlag(args: readonly string[]): boolean {
+  return args.includes("--continue") || args.includes("-c");
+}
+
+/** `--name <title>`: names the session once it starts, so a later `--resume` picker shows it. */
+function parseNameFlag(args: readonly string[]): string | undefined {
+  const index = args.findIndex((value) => value === "--name");
+  if (index < 0) return undefined;
+  const next = args[index + 1];
+  return next === undefined || next.startsWith("-") ? undefined : next;
+}
+
+function toSessionChoice(entry: SessionPickerEntry): { value: string; label: string; hint: string } {
+  return { value: entry.sessionId, label: entry.title, hint: describeSessionPickerEntry(entry) };
 }
 
 async function discoverModelsFromGateway(start: StartRuntime, input: { provider: ProviderRecord; config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
