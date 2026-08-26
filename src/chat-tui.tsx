@@ -45,7 +45,7 @@ import {
   type TranscriptLogState,
 } from "./ui/screen-reader-mode.js";
 import { ScreenReaderTranscript } from "./ui/screen-reader-transcript.js";
-import { getTheme, resolveThemeName, supportsMotion, themeCatalog, type Theme, type ThemeName } from "./ui/theme.js";
+import { getTheme, resolveThemeName, themeCatalog, type Theme, type ThemeName } from "./ui/theme.js";
 import { parseTodoWriteTodos, TodoPanel, type TodoItem } from "./ui/todo-panel.js";
 import { stringifyToolPayload, truncateForDisplay } from "./ui/tool-output.js";
 import { createVimState, resetVimStateForNewBuffer, stepVim, type VimState } from "./ui/vim-mode.js";
@@ -373,8 +373,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   }, [spellCheckSettings.checker]);
 
   useEffect(() => {
-    const active = spellCheckSettings.enabled && spellChecker !== undefined && supportsMotion();
-    if (!active) {
+    if (!spellCheckActive(spellCheckSettings, spellChecker)) {
       spellCheckController.current?.dispose();
       spellCheckController.current = undefined;
       setMisspelledRanges((current) => (current.length === 0 ? current : []));
@@ -1243,6 +1242,14 @@ function spellCheckRuns(text: string, offset: number, ranges: readonly Misspelle
   return segmentText(text, offset, ranges).map((segment, index) => (
     <Text key={`${keyPrefix}-${index}`} color={segment.misspelled ? underlineColor : color} underline={segment.misspelled}>{segment.text}</Text>
   ));
+}
+/**
+ * Whether spell-check should be actively running, given only the feature's own settings and
+ * checker availability — deliberately independent of any environment/animation-capability check
+ * (misspelled-range computation and its underline rendering have nothing to do with animation).
+ */
+export function spellCheckActive(settings: Pick<SpellCheckSettings, "enabled">, checker: SpellCheckerName | undefined): checker is SpellCheckerName {
+  return settings.enabled && checker !== undefined;
 }
 function describeSpellCheckSettings(settings: SpellCheckSettings, checker: SpellCheckerName | undefined): string {
   if (!settings.enabled) return "Spell-check disabled.";

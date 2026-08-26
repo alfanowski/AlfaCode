@@ -14,6 +14,7 @@ import {
   resolveInitialVimMode,
   resolveLineEditorOperation,
   resolvePermissionModeAfterIdentity,
+  spellCheckActive,
   tailItemsByRows,
   truncateCheckpointsAt,
   truncateOneLine,
@@ -230,6 +231,31 @@ describe("permission mode resync after identity resolves", () => {
 
   it("leaves an untouched, already-'default' mode as 'default' (idempotent)", () => {
     expect(resolvePermissionModeAfterIdentity("default", true, false)).toBe("default");
+  });
+});
+
+describe("spell-check activation", () => {
+  it("is active when enabled and a checker was found", () => {
+    expect(spellCheckActive({ enabled: true }, "aspell")).toBe(true);
+  });
+
+  it("is inactive when disabled, regardless of checker availability", () => {
+    expect(spellCheckActive({ enabled: false }, "aspell")).toBe(false);
+  });
+
+  it("is inactive when enabled but no checker was found on PATH", () => {
+    expect(spellCheckActive({ enabled: true }, undefined)).toBe(false);
+  });
+
+  it("stays active under ALFACODE_REDUCED_MOTION=1, CI, and TERM=dumb (unrelated to animation capability)", () => {
+    vi.stubEnv("ALFACODE_REDUCED_MOTION", "1");
+    vi.stubEnv("CI", "1");
+    vi.stubEnv("TERM", "dumb");
+    try {
+      expect(spellCheckActive({ enabled: true }, "hunspell")).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
