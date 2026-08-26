@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import React from "react";
 import { Text } from "ink";
 import { render } from "ink-testing-library";
@@ -59,8 +59,16 @@ describe("spinner and pulse glyph sequences", () => {
 
   it("renders the first spinner and pulse frame on initial mount", () => {
     withAnimationEnabled(() => {
-      expect(render(<Spinner />).lastFrame()).toBe(spinnerFrames[0]);
-      expect(render(<Pulse />).lastFrame()).toBe(pulseFrames[0]);
+      // Unmounted after reading, not left running: the shared clock below asserts exact
+      // setInterval/clearInterval counts, which a leaked, never-unmounted subscription from an
+      // earlier test would silently pollute (harmless under the old one-timer-per-hook design,
+      // consequential now that every hook shares one module-level timer).
+      const spinner = render(<Spinner />);
+      expect(spinner.lastFrame()).toBe(spinnerFrames[0]);
+      spinner.unmount();
+      const pulse = render(<Pulse />);
+      expect(pulse.lastFrame()).toBe(pulseFrames[0]);
+      pulse.unmount();
     });
   });
 });
@@ -74,7 +82,9 @@ describe("useTwinkle", () => {
     withAnimationEnabled(() => {
       // At tick 0 (initial mount), point i's level is (0 + i*1) % 3 — i.e. 0,1,2,0,1,... — so
       // adjacent points start at different brightness levels instead of blinking together.
-      expect(render(<Twinkle count={5} />).lastFrame()).toBe("0,1,2,0,1");
+      const view = render(<Twinkle count={5} />);
+      expect(view.lastFrame()).toBe("0,1,2,0,1");
+      view.unmount(); // see the shared-clock describe block below for why this matters now
     });
   });
 
@@ -126,6 +136,43 @@ async function settle(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }
+
+describe("shared animation clock", () => {
+  // The regression this whole module was rewritten for: independent per-hook setInterval calls
+  // used to compound (a spinner, a pulse, and several parallel tool-call spinners each ticking on
+  // their own uncoordinated schedule), forcing Ink to repaint its whole live region far more often
+  // than any single animation's own interval would suggest. Every hook below now subscribes to one
+  // shared timer instead — mounting several concurrently must start exactly one setInterval, not
+  // one per hook, and it must not stop until every last subscriber has unmounted.
+  it("starts exactly one setInterval no matter how many animated hooks mount concurrently", async () => {
+    await withAnimationEnabledAsync(async () => {
+      const setIntervalSpy = vi.spyOn(global, "setInterval");
+      const before = setIntervalSpy.mock.calls.length;
+      const view = render(<><Spinner /><Pulse /><Twinkle count={3} /></>);
+      await settle();
+      expect(setIntervalSpy.mock.calls.length - before).toBe(1);
+      view.unmount();
+      setIntervalSpy.mockRestore();
+    });
+  });
+
+  it("only stops the shared timer once every subscriber has unmounted", async () => {
+    await withAnimationEnabledAsync(async () => {
+      const clearIntervalSpy = vi.spyOn(global, "clearInterval");
+      const before = clearIntervalSpy.mock.calls.length;
+      const a = render(<Spinner />);
+      const b = render(<Pulse />);
+      await settle();
+      a.unmount();
+      await settle();
+      expect(clearIntervalSpy.mock.calls.length).toBe(before);
+      b.unmount();
+      await settle();
+      expect(clearIntervalSpy.mock.calls.length - before).toBe(1);
+      clearIntervalSpy.mockRestore();
+    });
+  });
+});
 
 describe("useFlash", () => {
   it("never flashes on first mount, only on a genuine later change", async () => {

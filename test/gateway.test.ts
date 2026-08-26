@@ -230,7 +230,8 @@ describe("Anthropic gateway", () => {
     expect(response.statusCode).toBe(200);
     expect(received).toMatchObject({ model: "claude-test", experimental: { x: 1 } });
     expect(systemText(received)).toContain("Original system");
-    expect(systemText(received)).toContain("You are AlfaCode");
+    expect(systemText(received)).toContain("AlfaCode is the terminal tool");
+    expect(systemText(received)).toContain("Never claim 'AlfaCode' is your own identity");
     expect(systemText(received)).toContain('Active provider ID: "mock"');
     expect(systemText(received)).toContain('Active model ID: "claude-test"');
     expect(response.body.match(/^event: .+$/gm)).toEqual([

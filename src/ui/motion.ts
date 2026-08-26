@@ -16,15 +16,52 @@ export function shouldAnimate(environment: NodeJS.ProcessEnv = process.env): boo
   return supportsMotion(environment) && !isScreenReaderMode(environment);
 }
 
+/**
+ * One shared clock every animated element in the app subscribes to, instead of each hook running
+ * its own `setInterval`. Independent per-component timers used to compound: a busy turn with a
+ * spinner, a pulse, and several parallel tool-call spinners each ticking on its own uncoordinated
+ * schedule added up to a near-continuous stream of re-renders — Ink repaints its whole live region
+ * (there is no `<Static>` boundary around the normal, non-screen-reader transcript) on every one
+ * of them, which fights native terminal text selection and scrollback the entire time a response
+ * is streaming in. All subscribers firing on the same shared tick get batched into one React
+ * render pass instead of several staggered ones, so the real repaint ceiling is this one interval,
+ * no matter how many animated elements are on screen at once.
+ */
+const SHARED_TICK_MS = 100;
+const tickSubscribers = new Set<() => void>();
+let sharedTimer: ReturnType<typeof setInterval> | undefined;
+
+function subscribeTick(listener: () => void): () => void {
+  tickSubscribers.add(listener);
+  if (sharedTimer === undefined) {
+    sharedTimer = setInterval(() => { for (const subscriber of tickSubscribers) subscriber(); }, SHARED_TICK_MS);
+  }
+  return () => {
+    tickSubscribers.delete(listener);
+    if (tickSubscribers.size === 0 && sharedTimer !== undefined) {
+      clearInterval(sharedTimer);
+      sharedTimer = undefined;
+    }
+  };
+}
+
+/**
+ * A frame index in [0, frameCount) that advances roughly every `interval` ms, derived from wall-
+ * clock time against the shared tick rather than owning a dedicated timer at that exact interval —
+ * callers keep expressing their desired cadence in milliseconds exactly as before; only the
+ * underlying timer is now shared app-wide. `interval` values finer than the shared tick round up
+ * to the shared tick's own granularity, which is the intended tradeoff (see module doc).
+ */
 export function useAnimationFrame(frameCount: number, interval = 90): number {
-  const [frame, setFrame] = useState(0);
+  const [, forceRerender] = useState(0);
+  const startRef = useRef(Date.now());
   const enabled = shouldAnimate() && frameCount > 1;
   useEffect(() => {
     if (!enabled) return;
-    const timer = setInterval(() => setFrame((current) => (current + 1) % frameCount), interval);
-    return () => clearInterval(timer);
-  }, [enabled, frameCount, interval]);
-  return enabled ? frame : 0;
+    return subscribeTick(() => forceRerender((value) => value + 1));
+  }, [enabled]);
+  if (!enabled) return 0;
+  return Math.floor((Date.now() - startRef.current) / Math.max(SHARED_TICK_MS, interval)) % frameCount;
 }
 
 export function useSpinner(active = true): string {
@@ -40,7 +77,8 @@ export function usePulse(active = true): string {
 export interface TwinkleOptions {
   /** Brightness levels in each point's cycle (0 = dimmest, levels-1 = brightest). Default 3. */
   readonly levels?: number;
-  /** Milliseconds per shared tick. Default 220. */
+  /** Milliseconds per shared tick. Default 220. Finer than the shared clock's own granularity
+   * rounds up to it — see the module doc on why the timer itself is shared app-wide now. */
   readonly interval?: number;
   /** Per-index phase-offset multiplier that staggers points against each other. Default 1. */
   readonly offset?: number;
@@ -58,15 +96,16 @@ export interface TwinkleOptions {
  */
 export function useTwinkle(count: number, options: TwinkleOptions = {}): readonly number[] {
   const levels = Math.max(2, options.levels ?? 3);
-  const interval = options.interval ?? 220;
+  const interval = Math.max(SHARED_TICK_MS, options.interval ?? 220);
   const offset = options.offset ?? 1;
   const enabled = shouldAnimate() && count > 0 && levels > 1;
-  const [tick, setTick] = useState(0);
+  const [, forceRerender] = useState(0);
+  const startRef = useRef(Date.now());
   useEffect(() => {
     if (!enabled) return;
-    const timer = setInterval(() => setTick((current) => (current + 1) % levels), interval);
-    return () => clearInterval(timer);
-  }, [enabled, levels, interval]);
+    return subscribeTick(() => forceRerender((value) => value + 1));
+  }, [enabled]);
+  const tick = enabled ? Math.floor((Date.now() - startRef.current) / interval) : 0;
   return Array.from({ length: count }, (_, index) => (enabled ? (tick + index * offset) % levels : levels - 1));
 }
 
@@ -74,7 +113,9 @@ export function useTwinkle(count: number, options: TwinkleOptions = {}): readonl
  * True for a brief window (`durationMs`) whenever `trigger` changes identity/value, then settles
  * back to false — a transient highlight pulse for "something just arrived" (a new message, a new
  * background task) rather than a persistent state. Never flashes on first mount: only a genuine
- * change after the initial render counts. Always false when animation is disabled.
+ * change after the initial render counts. Always false when animation is disabled. This is a
+ * one-shot timeout, not a continuous loop, so it deliberately does not join the shared tick above
+ * — it does not contribute to sustained repaint pressure the way a repeating animation does.
  */
 export function useFlash(trigger: unknown, durationMs = 500): boolean {
   const [active, setActive] = useState(false);
