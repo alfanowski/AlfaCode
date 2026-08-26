@@ -241,6 +241,29 @@ describe("vim-mode", () => {
       expect(down.handled).toBe(true);
       expect(down.editor.cursor).toBe(5);
     });
+
+    it("swallows a multi-character paste in NORMAL mode instead of falling through to raw insertion", () => {
+      const frame = start("abc", 0);
+      const pasted = stepVim(frame.editor, frame.vim, "pasted text", key());
+      expect(pasted.handled).toBe(true);
+      expect(pasted.editor.value).toBe("abc");
+      expect(pasted.vim.mode).toBe("normal");
+    });
+
+    it("swallows a multi-character paste in VISUAL mode too", () => {
+      const frame = press(start("abc", 0), "v");
+      expect(frame.vim.mode).toBe("visual");
+      const pasted = stepVim(frame.editor, frame.vim, "pasted text", key());
+      expect(pasted.handled).toBe(true);
+      expect(pasted.editor.value).toBe("abc");
+    });
+
+    it("still inserts a multi-character paste normally in INSERT mode", () => {
+      const frame = press(start("abc", 3), "i");
+      const pasted = stepVim(frame.editor, frame.vim, "pasted text", key());
+      expect(pasted.handled).toBe(true);
+      expect(pasted.editor.value).toBe("abcpasted text");
+    });
   });
 
   describe("resetVimStateForNewBuffer", () => {

@@ -118,7 +118,15 @@ function handleEscape(editor: EditorState, vim: VimState): VimStep {
 
 function handleCommand(editor: EditorState, vim: VimState, text: string, key: VimKeyLike): VimStep {
   const letter = resolveLetter(text, key);
-  if (letter === undefined) return notHandled(editor, vim);
+  if (letter === undefined) {
+    // A multi-character paste — not a recognized single-letter command or special key — is
+    // consumed and discarded in NORMAL/VISUAL mode: real vim never inserts raw text outside
+    // INSERT mode. Any other unmatched key (Enter, Tab, ctrl/meta combos, empty text) still falls
+    // through to the caller's own handling, unchanged. (A pasted file/image path was already
+    // intercepted upstream in chat-tui.tsx before reaching here, so this never swallows those.)
+    if (!key.ctrl && !key.meta && text.length > 1) return handled(editor, vim);
+    return notHandled(editor, vim);
+  }
   return vim.mode === "visual" ? handleVisual(editor, vim, letter) : handleNormal(editor, vim, letter);
 }
 
