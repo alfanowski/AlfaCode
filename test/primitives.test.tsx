@@ -48,7 +48,32 @@ describe("EmptyState", () => {
     expect(left.length).toBe(right.length);
   });
 
-  it("skips the starburst below its width threshold without breaking the rest of the layout", () => {
+  it("renders the AlfaCode wordmark as genuine dot-matrix block art at a comfortable width", () => {
+    // Not just colored text: real letterforms built from "█" cells, wide enough to spell all
+    // eight letters of ALFACODE side by side.
+    const view = render(<EmptyState theme={theme} width={60} />);
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("█");
+    const letterRows = frame.split("\n").filter((line) => line.includes("█"));
+    expect(letterRows.length).toBe(5); // the dot-matrix font is 5 rows tall
+    // Every row starts within one column of every other row: the block itself is centered as one
+    // unit, so a ragged glyph desyncing the columns of every letter after it would show up as a
+    // multi-column spread here. A one-column spread is expected and correct, not a bug — "A"'s
+    // narrower peak row (".##." vs "#..#") legitimately starts one column further right than the
+    // rows below it.
+    const leadingSpaces = letterRows.map((line) => line.length - line.trimStart().length);
+    expect(Math.max(...leadingSpaces) - Math.min(...leadingSpaces)).toBeLessThanOrEqual(1);
+  });
+
+  it("falls back to a plain two-tone label below the wordmark's minimum width, without breaking layout", () => {
+    const view = render(<EmptyState theme={theme} width={39} />);
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("ALFA");
+    expect(frame).toContain("CODE");
+    expect(frame).not.toContain("█");
+  });
+
+  it("skips the starburst below its width threshold, still keeping the brand mark visible as plain text", () => {
     const view = render(<EmptyState theme={theme} width={20} />);
     const frame = view.lastFrame() ?? "";
     expect(frame).toContain("ALFA");
@@ -57,9 +82,11 @@ describe("EmptyState", () => {
     expect(frame).not.toContain("✦");
   });
 
-  it("still renders correctly with no width provided at all", () => {
+  it("still renders correctly with no width provided at all, defaulting to the full wordmark treatment", () => {
     const view = render(<EmptyState theme={theme} />);
-    expect(view.lastFrame()).toContain("ALFA");
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("█");
+    expect(frame).toContain("One agent. Every model. Your terminal.");
   });
 });
 

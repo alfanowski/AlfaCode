@@ -977,22 +977,36 @@ function extractToolResultText(content: unknown): string {
 }
 
 /**
- * The app's single always-on-screen signature element: a taller, tinted panel (two information
- * rows instead of one) topped by the brand mark and capped with an `ActivityRule` — a full-width
- * strip that stays a quiet, still line when idle and switches to a flat accent color when busy.
+ * The app's single always-on-screen signature element — deliberately chrome-light: no enclosing
+ * border box and no background fill (an earlier tinted-panel treatment read as heavy and, per
+ * direct feedback, too close to a generic dashboard widget), just two information rows under the
+ * compact brand mark and an `ActivityRule` beneath them doing the one job a frame needs to do —
+ * separate the header from the transcript and signal busy/ready with a color, not a shape.
+ *
+ * The ready/busy indicator itself is a flat color+label swap, not an animated glyph: it used to
+ * cycle through `usePulse`'s frames continuously for the entire busy duration, which is exactly
+ * the kind of sustained repaint this component's history warns against (see `ActivityRule` below).
+ * A flat swap loses nothing — the label text already carries the state unambiguously — while
+ * guaranteeing this always-mounted element never animates while a response is streaming.
  */
 export function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
-  const pulse = usePulse(busy);
   const modelWidth = Math.max(16, Math.min(34, width - 36));
   const ruleWidth = Math.max(4, width - 8);
-  return <Box flexDirection="column" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1} backgroundColor={theme.surfaceRaised}>
+  // Pre-existing math, unchanged — but it was only ever exercised with the meta text at its
+  // shortest ("3P · default"); its own `wrap="truncate-end"` couldn't do anything without a
+  // bounded box, so adding " · mismatch" at a narrow width let it run straight into the model box
+  // with no separation at all. Bounding it the same way modelWidth already bounds its neighbor
+  // makes the mismatch warning degrade the same way the model name already does, instead of
+  // overlapping it.
+  const metaWidth = Math.max(14, width - modelWidth - 6);
+  return <Box flexDirection="column" paddingX={1} marginBottom={1}>
     <Box justifyContent="space-between">
       <Brand theme={theme} compact />
-      <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
+      <Text color={busy ? theme.accent : theme.success}>● <Text bold>{busy ? "working" : "ready"}</Text></Text>
     </Box>
-    <Box justifyContent="space-between">
+    <Box justifyContent="space-between" columnGap={1}>
       <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
-      <Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text>
+      <Box width={metaWidth} justifyContent="flex-end"><Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text></Box>
     </Box>
     <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
   </Box>;
@@ -1004,8 +1018,8 @@ export function Header({ model, mode, providers, compatible, busy, theme, width 
  * tick throughout the whole busy period, which is exactly when a user is most likely to want to
  * select or scroll the streaming response; Ink has no way to repaint just this row in isolation
  * (there's no `<Static>` boundary around the live transcript), so the whole visible frame repainted
- * with it. A flat color change already communicates "busy" (paired with the panel's own border
- * color and the working/ready label) without needing continuous animation to do it.
+ * with it. A flat color change already communicates "busy" (paired with the working/ready label)
+ * without needing continuous animation to do it.
  */
 function ActivityRule({ busy, width, theme }: { readonly busy: boolean; readonly width: number; readonly theme: Theme }): React.JSX.Element {
   return <Text color={busy ? theme.accent : theme.border}>{"━".repeat(width)}</Text>;
