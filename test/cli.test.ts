@@ -82,6 +82,46 @@ describe("createCli", () => {
     expect((await configStore.read()).providers).toEqual([]);
   });
 
+  it("treats an unexpected Keychain retrieval failure as an unavailable credential instead of crashing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-keychain-fail-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, defaultProviderId: "google", providers: [
+      { id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } },
+    ] });
+    let notice: string | undefined;
+    let retrieveCalls = 0;
+    const cli = createCli({
+      configStore,
+      keychain: {
+        store: async () => undefined,
+        storeSecret: async () => undefined,
+        delete: async () => undefined,
+        // Fails only the initial availability check that selectedCredentialUnavailable performs;
+        // succeeds afterward so this test isolates that one fix from the separate
+        // backup-before-replace fix (covered by its own test below).
+        retrieve: async () => { retrieveCalls += 1; if (retrieveCalls === 1) throw new Error("Keychain is locked"); return undefined; },
+      },
+      providerSetup: async (input) => {
+        notice = input.notice;
+        await input.connect({ descriptor: input.descriptors[0]!, apiKey: "fresh-secret" });
+      },
+      startRuntime: async (input) => ({
+        baseUrl: "http://gateway",
+        authToken: "token",
+        modelCandidates: input.purpose === "discovery"
+          ? [{ providerId: "google", id: "gemini", displayName: "Gemini", wireProtocol: "gemini-generate-content", capabilities: CAPABILITIES["gemini-generate-content"], availability: "available", support: "best-effort" }]
+          : [],
+        close: async () => undefined,
+      }),
+      launch: async () => 0,
+      ui: fakeUi(),
+    });
+
+    await cli.parseAsync(["node", "alfacode", "launch"], { from: "node" });
+    expect(notice).toContain("has no credential");
+  });
+
   it("passes unknown Claude arguments unchanged and closes the injected runtime", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-cli-test-"));
     directories.push(home);
@@ -196,6 +236,39 @@ describe("createCli", () => {
 
     await expect(cli.parseAsync(["node", "alfacode"], { from: "node" })).rejects.toThrow("invalid replacement key");
     expect(secret).toBe("working-key");
+    expect(await configStore.read()).toMatchObject({ providers: [{ id: "google", type: "google" }] });
+  });
+
+  it("refuses to replace a credential when backing up the previous one fails unexpectedly", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-backup-fail-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, defaultProviderId: "google", providers: [
+      { id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } },
+    ] });
+    let stored = false;
+    let chatCalls = 0;
+    const cli = createCli({
+      configStore,
+      keychain: {
+        store: async () => undefined,
+        storeSecret: async () => { stored = true; },
+        retrieve: async () => { throw new Error("Keychain is locked"); },
+        delete: async () => undefined,
+      },
+      startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+      startAgentSession: async (input) => ({ close: async () => input.runtime.close() }) as unknown as AgentSession,
+      chatTui: async () => (++chatCalls === 1 ? { type: "reconnect-provider", providerId: "google" } : { type: "exit" }),
+      providerSetup: async (input) => {
+        const google = input.descriptors.find((descriptor) => descriptor.id === "google");
+        if (google === undefined) throw new Error("missing Google descriptor");
+        await input.connect({ descriptor: google, apiKey: "new-key" });
+      },
+      ui: fakeUi(),
+    });
+
+    await expect(cli.parseAsync(["node", "alfacode"], { from: "node" })).rejects.toThrow("Credential backup is unavailable");
+    expect(stored).toBe(false);
     expect(await configStore.read()).toMatchObject({ providers: [{ id: "google", type: "google" }] });
   });
 

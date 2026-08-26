@@ -150,9 +150,16 @@ export function createCli(options: CreateCliOptions = {}): Command {
     if (result.apiKey !== undefined && previousKeychain !== undefined && keychain.retrieve === undefined) {
       throw new Error("Credential backup is unavailable; refusing to overwrite the existing Keychain item");
     }
-    const previousSecret = previousKeychain === undefined || keychain.retrieve === undefined
-      ? undefined
-      : await keychain.retrieve(previousKeychain.account, previousKeychain.service);
+    let previousSecret: string | undefined;
+    if (previousKeychain !== undefined && keychain.retrieve !== undefined) {
+      try {
+        previousSecret = await keychain.retrieve(previousKeychain.account, previousKeychain.service);
+      } catch {
+        // Can't safely back up the existing credential before overwriting it — refuse rather
+        // than risk losing it if the new one turns out not to work.
+        throw new Error("Credential backup is unavailable; refusing to overwrite the existing Keychain item");
+      }
+    }
     if (result.apiKey !== undefined) await keychain.storeSecret(id, result.apiKey, keychainService);
     try {
       const providers = replaceable === undefined ? [...config.providers, provider] : config.providers.map((item) => item.id === replaceable.id ? provider : item);
@@ -461,7 +468,13 @@ async function selectedCredentialUnavailable(
   if (provider.apiKey === undefined) return provider.id;
   if (provider.apiKey.kind === "env") return process.env[provider.apiKey.name] ? undefined : provider.id;
   if (keychain.retrieve === undefined) return undefined;
-  return await keychain.retrieve(provider.apiKey.account, provider.apiKey.service) ? undefined : provider.id;
+  try {
+    return await keychain.retrieve(provider.apiKey.account, provider.apiKey.service) ? undefined : provider.id;
+  } catch {
+    // A genuinely unexpected Keychain failure (locked vault, ambiguous entry) degrades to the
+    // same "reconnect this provider" flow as a missing credential, instead of crashing the CLI.
+    return provider.id;
+  }
 }
 
 /**
