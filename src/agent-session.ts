@@ -10,7 +10,7 @@ import {
   type SDKSystemMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { buildClaudeEnvironment } from "./claude-launcher.js";
+import { buildClaudeEnvironment, ensurePrivateDirectory } from "./claude-launcher.js";
 import { ALFACODE_CLIENT_ID, checkEngineCompatibility, type EngineCompatibility } from "./engine-compatibility.js";
 
 export interface AgentRuntimeHandle {
@@ -111,7 +111,9 @@ export class AgentSession {
         cwd: options.cwd ?? process.cwd(),
         env,
         canUseTool: options.canUseTool,
-        permissionMode: options.permissionMode ?? "default",
+        // Stay restrictive until the init message proves the embedded engine
+        // matches the version AlfaCode was tested against.
+        permissionMode: options.permissionMode ?? "dontAsk",
         includePartialMessages: true,
         forwardSubagentText: true,
         agentProgressSummaries: true,
@@ -128,6 +130,8 @@ export class AgentSession {
   }
 
   public static async start(options: AgentSessionOptions): Promise<AgentSession> {
+    const configDir = options.configDir ?? join(homedir(), ".alfacode", "claude");
+    await ensurePrivateDirectory(configDir);
     return new AgentSession(options);
   }
 
@@ -203,22 +207,30 @@ export class AgentSession {
             clearTimeout(this.initializationTimer);
             this.initializationTimer = undefined;
           }
+          const compatibility = checkEngineCompatibility(message.claude_code_version);
+          if (this.options.permissionMode === undefined && compatibility.compatible) {
+            try {
+              await this.query.setPermissionMode("default");
+            } catch (error: unknown) {
+              await this.reportWarning(`Unable to enable default permissions after engine verification: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          } else if (!compatibility.compatible) {
+            const restriction = this.options.permissionMode === undefined ? " The session remains in dontAsk permission mode." : "";
+            await this.reportWarning(`Warning: ${compatibility.reason ?? "Unsupported Claude Code engine version"}.${restriction}`);
+          }
           this.resolveInitialized({
             sessionId: message.session_id,
             model: message.model,
             claudeCodeVersion: message.claude_code_version,
-            compatibility: checkEngineCompatibility(message.claude_code_version),
+            compatibility,
             capabilities: message.capabilities ?? [],
           });
         }
-        await this.options.onMessage?.(message);
-        for (const listener of this.listeners) await listener(message);
+        await this.deliverMessage(message);
       }
       if (!sawInit) this.rejectInitialized(new Error("Claude Code engine exited before initialization"));
       else if (!this.closed) {
-        const message = syntheticEngineError(new Error("Claude Code engine exited unexpectedly"));
-        await this.options.onMessage?.(message);
-        for (const listener of this.listeners) await listener(message);
+        await this.deliverMessage(syntheticEngineError(new Error("Claude Code engine exited unexpectedly")));
       }
     } catch (error) {
       if (this.initializationTimer !== undefined) {
@@ -227,10 +239,32 @@ export class AgentSession {
       }
       const normalized = error instanceof Error ? error : new Error(String(error));
       if (!sawInit) this.rejectInitialized(normalized);
-      const message = syntheticEngineError(normalized);
-      await this.options.onMessage?.(message);
-      for (const listener of this.listeners) await listener(message);
+      await this.deliverMessage(syntheticEngineError(normalized));
     }
+  }
+
+  private async deliverMessage(message: SDKMessage): Promise<void> {
+    await this.options.onMessage?.(message);
+    for (const listener of this.listeners) await listener(message);
+  }
+
+  /**
+   * Surfaces a wrapper-level warning (as opposed to a message from the engine itself).
+   * When the caller wired up a raw stderr sink, use it directly. Otherwise — notably the
+   * native TUI launch path, where Ink owns the terminal and an unmanaged
+   * process.stderr.write would corrupt the screen — route the warning through the same
+   * message channel the transcript already renders system notifications from.
+   */
+  private async reportWarning(message: string): Promise<void> {
+    if (this.options.onStderr !== undefined) {
+      try {
+        this.options.onStderr(message);
+      } catch {
+        // A warning sink must not abort or weaken an otherwise valid session.
+      }
+      return;
+    }
+    await this.deliverMessage(syntheticNotification("alfacode-warning", message));
   }
 }
 
@@ -238,14 +272,18 @@ function isInitMessage(message: SDKMessage): message is SDKSystemMessage {
   return message.type === "system" && message.subtype === "init";
 }
 
-function syntheticEngineError(error: Error): SDKMessage {
+function syntheticNotification(key: string, text: string): SDKMessage {
   return {
     type: "system",
     subtype: "notification",
-    key: "alfacode-engine-error",
-    text: error.message,
+    key,
+    text,
     priority: "immediate",
     uuid: randomUUID(),
     session_id: "unknown",
   };
+}
+
+function syntheticEngineError(error: Error): SDKMessage {
+  return syntheticNotification("alfacode-engine-error", error.message);
 }

@@ -1,12 +1,26 @@
-import { describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { chmod, lstat, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeEnvironment, launchClaude } from "../src/claude-launcher.js";
 
+const directories: string[] = [];
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+async function privateTestRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "alfacode-claude-test-"));
+  directories.push(root);
+  return root;
+}
+
 describe("launchClaude", () => {
   it("uses isolated config and replaces inherited cloud routing credentials", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "alfacode-claude-test-"));
+    const configDir = join(await privateTestRoot(), "claude");
     let request: Parameters<NonNullable<Parameters<typeof launchClaude>[0]["spawner"]>>[0] | undefined;
     const exitCode = await launchClaude({
       claudePath: "/test/claude",
@@ -50,7 +64,7 @@ describe("launchClaude", () => {
     expect(request?.env.AWS_PROFILE).toBeUndefined();
     expect(request?.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
     expect(request?.env.DISABLE_AUTO_COMPACT).toBeUndefined();
-    await rm(configDir, { recursive: true, force: true });
+    expect((await lstat(configDir)).mode & 0o777).toBe(0o700);
   });
 
   it("does not mutate the supplied process environment", () => {
@@ -58,6 +72,31 @@ describe("launchClaude", () => {
     const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", environment });
     expect(environment).toEqual({ ANTHROPIC_API_KEY: "outside", PATH: "/bin" });
     expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("scrubs every embedded-engine proxy and cloud routing override from process.env", () => {
+    const keys = [
+      "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "all_proxy", "no_proxy", "grpc_proxy", "no_grpc_proxy",
+      "AGENT_PROXY_URL", "CLAUDE_CODE_API_BASE_URL", "CLOUD_ML_REGION", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+      "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+      "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+      "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY",
+      "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+      "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH", "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+      "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+      "CLAUDE_LOCAL_OAUTH_APPS_BASE", "CLAUDE_LOCAL_OAUTH_CONSOLE_BASE", "CLAUDE_CODE_OAUTH_CLIENT_ID",
+      "CLAUDE_CODE_ARTIFACTS_API_BASE_URL", "CLAUDE_CODE_ARTIFACTS_API_TOKEN",
+      "CLAUDE_CODE_ARTIFACT_ASSET_BASE_URL", "CLAUDE_CODE_ARTIFACT_LIVE_BASE_URL",
+      "CLAUDE_CODE_ARTIFACT_SYNC_BASE_URL", "CLAUDE_CODE_ARTIFACT_VIEWER_BASE_URL",
+      "CLAUDE_CODE_MEMORY_API_TOKEN",
+    ] as const;
+    for (const key of keys) vi.stubEnv(key, "leak");
+
+    const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "http://127.0.0.1:4317", authToken: "token" });
+
+    for (const key of keys) expect(result[key], key).toBeUndefined();
+    expect(result).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:4317", ANTHROPIC_AUTH_TOKEN: "token" });
   });
 
   it("allows explicit launch options to opt into a safe default", () => {
@@ -69,5 +108,51 @@ describe("launchClaude", () => {
     });
     expect(result.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION).toBe("1");
     expect(result.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined();
+  });
+
+  it("refuses loose permissions on an existing config directory", async () => {
+    const configDir = join(await privateTestRoot(), "claude");
+    await mkdir(configDir, { mode: 0o700 });
+    await chmod(configDir, 0o750);
+    const spawner = vi.fn(async () => 0);
+
+    await expect(launchClaude({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", configDir, spawner }))
+      .rejects.toThrow(/chmod 700/);
+    expect(spawner).not.toHaveBeenCalled();
+  });
+
+  it("refuses an insecure parent before creating the config directory", async () => {
+    const parent = await privateTestRoot();
+    await chmod(parent, 0o755);
+    const configDir = join(parent, "claude");
+
+    await expect(launchClaude({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", configDir, spawner: async () => 0 }))
+      .rejects.toThrow(/chmod 700/);
+    await expect(lstat(configDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses symlinked config directories and parents", async () => {
+    const root = await privateTestRoot();
+    const target = join(root, "target");
+    await mkdir(target, { mode: 0o700 });
+    const configLink = join(root, "config-link");
+    await symlink(target, configLink);
+    await expect(launchClaude({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", configDir: configLink, spawner: async () => 0 }))
+      .rejects.toThrow(/symbolic link/);
+
+    const parentLink = join(root, "parent-link");
+    await symlink(target, parentLink);
+    await expect(launchClaude({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", configDir: join(parentLink, "claude"), spawner: async () => 0 }))
+      .rejects.toThrow(/symbolic link/);
+  });
+
+  it.runIf(process.getuid !== undefined)("refuses paths not owned by the current user", async () => {
+    const configDir = join(await privateTestRoot(), "claude");
+    await mkdir(configDir, { mode: 0o700 });
+    const realUid = process.getuid!();
+    vi.spyOn(process, "getuid").mockReturnValue(realUid + 1);
+
+    await expect(launchClaude({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", configDir, spawner: async () => 0 }))
+      .rejects.toThrow(/not owned by the current user/);
   });
 });
