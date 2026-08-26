@@ -7,9 +7,10 @@ const models: readonly ModelDescriptor[] = [{ providerId: "compat", id: "model-a
 describe("OpenAI Chat adapter", () => {
   it("assembles fragmented parallel tool calls and maps usage", async () => {
     let body = "";
+    let redirect: RequestRedirect | undefined;
     const adapter = new OpenAIChatAdapter({
       id: "compat", apiKey: "chat-secret", models, baseUrl: "https://chat.example/v1",
-      fetch: async (_input, init) => { body = String(init?.body); return sse([
+      fetch: async (_input, init) => { body = String(init?.body); redirect = init?.redirect; return sse([
         "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"Checking \"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"type\":\"function\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\"}},{\"index\":1,\"id\":\"call-b\",\"type\":\"function\",\"function\":{\"name\":\"time\",\"arguments\":\"{\\\"zone\\\":\"}}]}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Rome\\\"}\"}},{\"index\":1,\"function\":{\"arguments\":\"\\\"UTC\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
@@ -22,6 +23,7 @@ describe("OpenAI Chat adapter", () => {
       tools: [{ name: "weather", input_schema: { type: "object" } }], tool_choice: { type: "any" },
     }, context()));
     expect(JSON.parse(body)).toMatchObject({ stream: true, stream_options: { include_usage: true }, tool_choice: "required", messages: [{ role: "system", content: "You are a coding agent." }, { role: "assistant", tool_calls: [{ id: "previous" }] }, { role: "tool", tool_call_id: "previous", content: "ok" }] });
+    expect(redirect).toBe("manual");
     expect(events).toContainEqual({ type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"city":"Rome"}' } });
     expect(events).toContainEqual({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"zone":"UTC"}' } });
     expect(events).toContainEqual({ type: "usage", usage: { semantics: "cumulative", stage: "final", source: "provider", inputTokens: 9, outputTokens: 4 } });

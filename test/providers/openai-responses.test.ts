@@ -7,11 +7,13 @@ const models: readonly ModelDescriptor[] = [{ providerId: "responses", id: "mode
 describe("OpenAI Responses adapter", () => {
   it("maps tool inputs, completes function calls, and replays opaque output only for results", async () => {
     const bodies: unknown[] = [];
+    const redirects: Array<RequestRedirect | undefined> = [];
     const stateStore = new MemoryProtocolStateStore();
     const adapter = new OpenAIResponsesAdapter({
       id: "responses", apiKey: "responses-secret", models, baseUrl: "https://responses.example/v1", stateStore,
       fetch: async (_input, init) => {
         bodies.push(JSON.parse(String(init?.body)));
+        redirects.push(init?.redirect);
         return sse(bodies.length === 1 ? [
           "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
           "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n",
@@ -28,6 +30,7 @@ describe("OpenAI Responses adapter", () => {
 
     await collect(adapter.streamMessage({ model: "model-r", messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "sunny" }] }] }, context()));
     expect(bodies[1]).toMatchObject({ input: [{ type: "function_call", call_id: "call-1" }, { type: "function_call_output", call_id: "call-1", output: "sunny" }] });
+    expect(redirects).toEqual(["manual", "manual"]);
   });
 });
 

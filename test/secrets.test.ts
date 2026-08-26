@@ -22,6 +22,25 @@ describe("MacOSKeychain", () => {
     await expect(resolver.resolve({ kind: "env", name: "ALFACODE_KEY" })).resolves.toBe("test-value");
   });
 
+  it("refuses to resolve Keychain references outside the AlfaCode service", async () => {
+    const keychain = { retrieve: async () => { throw new Error("must not run"); } };
+    const resolver = new SecretResolver({ keychain });
+    await expect(resolver.resolve({ kind: "keychain", service: "another-app", account: "google-main" }))
+      .rejects.toThrow("Refusing to read a legacy Keychain record");
+  });
+
+  it("resolves Keychain references in the AlfaCode service", async () => {
+    const calls: Array<{ account: string; service: string }> = [];
+    const keychain = { retrieve: async (account: string, service: string) => {
+      calls.push({ account, service });
+      return "test-value";
+    } };
+    const resolver = new SecretResolver({ keychain });
+    await expect(resolver.resolve({ kind: "keychain", service: "alfacode", account: "google-main" }))
+      .resolves.toBe("test-value");
+    expect(calls).toEqual([{ account: "google-main", service: "alfacode" }]);
+  });
+
   it("stores a TUI secret through the native credential vault without spawning", async () => {
     const calls: Array<{ service: string; account: string; secret: string }> = [];
     const runner: CommandRunner = { run: async () => { throw new Error("must not spawn"); } };
@@ -32,6 +51,30 @@ describe("MacOSKeychain", () => {
     });
     await new MacOSKeychain(runner, entryFactory).storeSecret("google-main", "secret-value");
     expect(calls).toEqual([{ service: "alfacode", account: "google-main", secret: "secret-value" }]);
+  });
+
+  it("returns undefined when a Keychain entry is not found", async () => {
+    const runner: CommandRunner = { run: async () => { throw new Error("must not spawn"); } };
+    const entryFactory = () => ({
+      setPassword: () => undefined,
+      getPassword: () => null,
+      deletePassword: () => true,
+    });
+    await expect(new MacOSKeychain(runner, entryFactory).retrieve("missing-account"))
+      .resolves.toBeUndefined();
+  });
+
+  it("surfaces Keychain retrieval failures", async () => {
+    const runner: CommandRunner = { run: async () => { throw new Error("must not spawn"); } };
+    const keychainError = new Error("Keychain is locked");
+    const entryFactory = () => ({
+      setPassword: () => undefined,
+      getPassword: () => { throw keychainError; },
+      deletePassword: () => true,
+    });
+    const retrieval = new MacOSKeychain(runner, entryFactory).retrieve("google-main");
+    await expect(retrieval).rejects.toThrow("Unable to retrieve secret from the system credential vault");
+    await expect(retrieval).rejects.toMatchObject({ cause: keychainError });
   });
 
   it("deletes only the named Keychain record", async () => {

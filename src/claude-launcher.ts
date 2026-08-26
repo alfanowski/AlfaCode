@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { lstat, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface SpawnRequest {
   readonly command: string;
@@ -51,6 +51,70 @@ const inheritedSecretKeys = new Set([
   "DISABLE_AUTO_COMPACT",
 ]);
 
+/** Routing controls read by the embedded Claude Code engine in the pinned SDK. */
+const inheritedRoutingKeys = new Set([
+  "AGENT_PROXY_URL",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "GRPC_PROXY",
+  "NO_GRPC_PROXY",
+  "CLAUDE_CODE_PROXY_RESOLVES_HOSTS",
+  "CLAUDE_CODE_ENABLE_PROXY_AUTH_HELPER",
+  "CLAUDE_CODE_PROXY_AUTH_HELPER_TTL_MS",
+  "CLAUDE_CODE_API_BASE_URL",
+  "CLAUDE_CODE_GB_BASE_URL",
+  "CLAUDE_CODE_MEMORY_API_BASE_URL",
+  "CLAUDE_BRIDGE_BASE_URL",
+  "CLAUDE_BRIDGE_SESSION_INGRESS_URL",
+  "CLAUDE_REMOTE_TOOLS_BRIDGE_URL",
+  "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+  "CLAUDE_LOCAL_OAUTH_API_BASE",
+  "CLAUDE_LOCAL_OAUTH_APPS_BASE",
+  "CLAUDE_LOCAL_OAUTH_CONSOLE_BASE",
+  "CLAUDE_CODE_OAUTH_CLIENT_ID",
+  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+  "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+  "CLAUDE_CODE_ARTIFACTS_API_BASE_URL",
+  "CLAUDE_CODE_ARTIFACTS_API_TOKEN",
+  "CLAUDE_CODE_ARTIFACT_ASSET_BASE_URL",
+  "CLAUDE_CODE_ARTIFACT_LIVE_BASE_URL",
+  "CLAUDE_CODE_ARTIFACT_SYNC_BASE_URL",
+  "CLAUDE_CODE_ARTIFACT_VIEWER_BASE_URL",
+  "CLAUDE_CODE_MEMORY_API_TOKEN",
+  "CLOUD_ML_REGION",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+  "CLAUDE_CODE_USE_MANTLE",
+  "CLAUDE_CODE_USE_GATEWAY",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+  "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+  "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+  "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+  "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+]);
+
+const inheritedCloudPrefixes = [
+  "AWS_",
+  "GOOGLE_",
+  "GEMINI_",
+  "VERTEX_",
+  "AZURE_",
+  "OPENAI_",
+  "XAI_",
+  "GROQ_",
+  "MISTRAL_",
+  "COHERE_",
+  "OPENROUTER_",
+] as const;
+
 /** Safe child-process defaults. Explicit launch extraEnv values may opt back in deliberately. */
 const safeClaudeDefaults: Readonly<Record<string, string>> = {
   CLAUDE_CODE_DISABLE_ARTIFACT: "1",
@@ -65,15 +129,20 @@ const safeClaudeDefaults: Readonly<Record<string, string>> = {
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {
   const base = options.environment ?? process.env;
-  const secretKeys = new Set([...inheritedSecretKeys, ...(options.scrubEnvironmentKeys ?? [])]);
+  const secretKeys = new Set([...inheritedSecretKeys, ...(options.scrubEnvironmentKeys ?? [])].map((key) => key.toUpperCase()));
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
-    if (!secretKeys.has(key) && !key.startsWith("ANTHROPIC_")) environment[key] = value;
+    if (!shouldScrubEnvironmentKey(key, secretKeys)) environment[key] = value;
   }
   Object.assign(environment, safeClaudeDefaults, options.extraEnv);
-  for (const key of secretKeys) delete environment[key];
   for (const key of Object.keys(environment)) {
-    if (key.startsWith("ANTHROPIC_") && key !== "ANTHROPIC_CUSTOM_HEADERS") delete environment[key];
+    const normalized = key.toUpperCase();
+    if (!shouldScrubEnvironmentKey(key, secretKeys)) continue;
+    // ANTHROPIC_CUSTOM_HEADERS is exempt from the blanket ANTHROPIC_ prefix scrub by default
+    // (it's a request-header customization, not a credential) — but an explicit caller request
+    // to scrub this exact name (via scrubEnvironmentKeys) always takes precedence.
+    if (normalized === "ANTHROPIC_CUSTOM_HEADERS" && !secretKeys.has(normalized)) continue;
+    delete environment[key];
   }
   Object.assign(environment, {
     ANTHROPIC_BASE_URL: options.baseUrl,
@@ -102,12 +171,36 @@ export async function launchClaude(options: ClaudeLaunchOptions): Promise<number
   return (options.spawner ?? systemClaudeSpawner)({ command: options.claudePath ?? "claude", args: options.claudeArgs, env: buildClaudeEnvironment(options) });
 }
 
-async function ensurePrivateDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const directory = await lstat(path);
-  if (directory.isSymbolicLink() || !directory.isDirectory()) throw new Error(`Refusing unsafe Claude config directory: ${path}`);
-  const parent = await lstat(join(path, ".."));
-  if (parent.isSymbolicLink()) throw new Error(`Refusing symlinked Claude config parent: ${join(path, "..")}`);
+export async function ensurePrivateDirectory(path: string): Promise<void> {
+  const parent = dirname(path);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  await assertPrivateDirectory(parent);
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error: unknown) {
+    if (!isAlreadyExists(error)) throw error;
+  }
+  await assertPrivateDirectory(path);
+}
+
+function shouldScrubEnvironmentKey(key: string, secretKeys: ReadonlySet<string>): boolean {
+  const normalized = key.toUpperCase();
+  return secretKeys.has(normalized)
+    || inheritedRoutingKeys.has(normalized)
+    || normalized.startsWith("ANTHROPIC_")
+    || inheritedCloudPrefixes.some((prefix) => normalized.startsWith(prefix));
+}
+
+async function assertPrivateDirectory(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link at Claude config path: ${path}`);
+  if (!info.isDirectory()) throw new Error(`Expected a directory at Claude config path: ${path}`);
+  if ((info.mode & 0o077) !== 0) throw new Error(`Refusing insecure permissions at Claude config path: ${path}. Fix with: chmod 700 ${path}`);
+  if (process.getuid !== undefined && info.uid !== process.getuid()) throw new Error(`Refusing Claude config path not owned by the current user: ${path}`);
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 export const systemClaudeSpawner: ClaudeSpawner = ({ command, args, env }) => new Promise((resolve, reject) => {

@@ -1,4 +1,5 @@
 import type { CanUseTool, PermissionResult, PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
+import { sanitizeTerminalText } from "./ui/markdown.js";
 
 export interface PermissionRequest {
   readonly id: number;
@@ -181,10 +182,5 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function sanitize(value: string): string {
-  return value
-    .replace(/\u001B(?:\]|P|X|\^|_)[\s\S]*?(?:\u0007|\u001B\\)/gu, "")
-    .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/gu, "")
-    .replace(/\u001B[@-_]/gu, "")
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, "")
-    .slice(0, 2_000);
+  return sanitizeTerminalText(value).slice(0, 2_000);
 }

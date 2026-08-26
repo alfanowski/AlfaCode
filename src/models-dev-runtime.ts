@@ -2,6 +2,7 @@ import type { AlfaCodeConfig } from "./config.js";
 import type { ModelsDevCatalog, ModelsDevModel, ModelsDevProvider } from "./models-dev-catalog.js";
 import { CAPABILITIES, type CapabilitySet, type WireProtocol } from "./providers/foundation/types.js";
 import type { DynamicModelMetadataResolver } from "./runtime.js";
+import { sanitizeTerminalText } from "./ui/markdown.js";
 
 /** Enriches account-scoped discovery without treating catalog order or model names as policy. */
 export function createModelsDevMetadataResolver(catalog: ModelsDevCatalog, config: AlfaCodeConfig): DynamicModelMetadataResolver {
@@ -15,7 +16,7 @@ export function createModelsDevMetadataResolver(catalog: ModelsDevCatalog, confi
       const wireProtocol = input.wireProtocol ?? model.wireFamily;
       if (wireProtocol === undefined) return undefined;
       return {
-        displayName: model.name,
+        displayName: sanitizeTerminalText(model.name),
         capabilities: modelCapabilities(model, wireProtocol),
         contextWindow: model.limits.input ?? model.limits.context,
         maxOutputTokens: model.limits.output,
@@ -44,10 +45,10 @@ export function dynamicProviderDescriptors(catalog: ModelsDevCatalog): readonly 
     for (const wireProtocol of providerWireProtocols(provider)) {
       descriptors.push({
         catalogProviderId: provider.id,
-        displayName: provider.name,
+        displayName: sanitizeTerminalText(provider.name),
         baseUrl: provider.api,
         wireProtocol,
-        environmentVariables: provider.env,
+        environmentVariables: provider.env.map(sanitizeTerminalText),
       });
     }
   }

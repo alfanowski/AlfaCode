@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { render } from "ink-testing-library";
 import { Markdown, plainText, sanitizeTerminalText } from "../src/ui/markdown.js";
 import { resolveTheme } from "../src/ui/theme.js";
@@ -42,5 +42,34 @@ describe("terminal markdown", () => {
     const view = render(<Markdown theme={theme} width={18}>{"| A | B |\n|---|---|\n| one | two |"}</Markdown>);
     expect(view.lastFrame()).toContain("A: one");
     expect(view.lastFrame()).toContain("B: two");
+  });
+
+  it("coalesces rapid streamed updates and fully renders the settled content", async () => {
+    vi.useFakeTimers();
+    const lexer = vi.spyOn(marked, "lexer");
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      const chunks = ["# Result", "\n\nFirst", " paragraph", "\n\n- one", "\n- two", "\n\n**Done**"];
+      let streamed = "";
+      view = render(<Markdown theme={theme}>{streamed}</Markdown>);
+      for (const chunk of chunks) {
+        streamed += chunk;
+        view.rerender(<Markdown theme={theme}>{streamed}</Markdown>);
+      }
+
+      expect(lexer).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(80);
+      await vi.advanceTimersByTimeAsync(40);
+
+      expect(lexer).toHaveBeenCalledTimes(2);
+      expect(view.lastFrame()).toContain("◆ Result");
+      expect(view.lastFrame()).toContain("First paragraph");
+      expect(view.lastFrame()).toContain("two");
+      expect(view.lastFrame()).toContain("Done");
+    } finally {
+      view?.unmount();
+      lexer.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

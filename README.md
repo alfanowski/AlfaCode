@@ -43,7 +43,9 @@ Your normal `claude` installation is left untouched. AlfaCode has its own comman
 - Render terminal-safe Markdown: headings, emphasis, quotes, task lists, links, code fences, line numbers, and responsive tables.
 - Answer tool-driven questions through single choice, multiple choice, previews, custom answers, and consecutive question flows.
 - Watch tool calls and subagents live, with the same structured engine contracts used by Claude Code.
-- Switch between adaptive dark/light themes; animation automatically respects reduced-motion and non-interactive environments.
+- Switch between four built-in themes with `/theme` — dark, light, and colorblind-friendly ("daltonized") dark/light variants built on the Okabe–Ito palette; animation automatically respects reduced-motion and non-interactive environments.
+- Get a terminal bell (and, opt-in, a macOS notification) when a response finishes or a permission prompt is waiting.
+- Export the current conversation to a Markdown file with `/export`.
 
 ## Quick start
 
@@ -154,18 +156,70 @@ alfacode run --non-interactive -- -p "Run the test suite and explain any failure
 | `/providers` | Inspect, select, reconnect, and delete provider connections. |
 | `/connect` | Add another provider without exposing its credential to chat. |
 | `/usage` | Inspect context and locally recorded token usage. |
+| `/context` | Alias for `/usage`'s context-window breakdown. |
+| `/compact [instructions]` | Ask the engine to summarize the conversation and free up context. |
 | `/agents` | List the subagents exposed by the pinned engine. |
+| `/mcp` | Show configured MCP servers, their connection status, and tool counts. |
 | `/permissions` | Change the tool permission mode. |
+| `/vim` | Toggle vim-style modal editing in the composer. |
+| `/theme` | Switch between dark, light, and colorblind-friendly ("daltonized") themes. |
+| `/spellcheck [on\|off\|checker <name>\|dictionary <code>\|color <name>]` | Toggle or configure composer spell-checking. |
+| `/export` | Export the current transcript to a Markdown file under `~/.alfacode/exports/`. |
 | `/clear` | Clear the visible transcript. |
 | `/help` | Show commands and keyboard shortcuts. |
 | `/exit` | Close AlfaCode cleanly. |
 
-The composer supports cursor editing, multiline input, paste, prompt history, common Unix editing shortcuts, filtered slash commands, and engine-generated follow-up suggestions accepted with `Tab`.
+The composer supports cursor editing, multiline input, paste, prompt history, common Unix editing shortcuts, filtered slash commands, and engine-generated follow-up suggestions accepted with `Tab`. It also supports:
+
+- **Vim mode** — `/vim`, or set `ALFACODE_VIM_MODE=1`, for modal NORMAL/INSERT/VISUAL editing: `hjkl`, `w`/`b`/`e`, `0`/`$`, `gg`/`G` motions; `x`, `dd`, `dw`, `cc`, `cw`, `yy`/`p`, `u` edits (and the operator table composes further, e.g. `d$`, `yG`, `cj`).
+- **`@` file mentions** — type `@` for a filtered, navigable popup of files/directories under the working directory (same navigate/tab pattern as the `/` command palette).
+- **Image paste** — `Ctrl+V` (or `Cmd+V` on terminals that support the kitty keyboard protocol) attaches whatever image is on the system clipboard, shown in the composer as `[Image #N]`.
+- **Drag-and-drop** — dropping a file onto the terminal (delivered by most terminals as a pasted path) is detected and turned into an `@`-mention, or attached directly if it's an image.
+- **`Ctrl+R`** — reverse-search the prompt history without leaving the composer.
+- **Spell-check underlines** — misspelled words underline live in the composer when `/spellcheck` is enabled (see [Spell-check](#spell-check) below).
+
+During a turn, `Ctrl+O` toggles a detailed view of the focused tool call's input/output, and `Ctrl+T` collapses or expands the live task list when the engine reports one (`TodoWrite`). A separate panel shows any backgrounded work. On a permission prompt, `Tab` attaches a short free-text note to your decision, recorded in the visible transcript for an audit trail.
+
+### Sessions & checkpoints
+
+- `alfacode --continue` (or `-c`) resumes the most recent session for the current directory; `alfacode --resume [name|id]` resumes a specific one, opening a picker when the query is ambiguous — see `alfacode sessions` below. `--name <title>` names a session as it starts.
+- Double-`Esc` on an empty prompt opens a rewind menu: pick an earlier prompt to restore tracked file edits (via the engine's own file-checkpointing) and truncate the visible transcript back to that point, with the original prompt text restored to the composer for editing and resending.
+- Context-remaining is shown live in the composer and in full via `/usage`; AlfaCode nudges you toward `/compact` once the engine's own auto-compact threshold (or an 80% fallback) is crossed.
+
+### Themes
+
+`/theme` opens a live picker across four built-in themes: `dark`, `light`, `dark-daltonized`, and `light-daltonized`. The daltonized variants use hues from the Okabe–Ito color-universal-design palette and avoid pairing red against green for success/warning/danger, so they stay distinguishable under the common forms of color-blindness. Set `ALFACODE_THEME` (any of the four names) to choose one non-interactively at launch; otherwise AlfaCode infers dark or light from `COLORFGBG`. Theme selection made through `/theme` is session-scoped — it does not persist across restarts.
+
+### Notifications
+
+AlfaCode rings the terminal bell (`\x07`) when a response finishes or a permission prompt starts waiting — on by default, disable with `ALFACODE_NOTIFY_BELL=0`. Most macOS terminals (Terminal.app, iTerm2, Ghostty, …) already turn an unfocused bell into a dock badge or banner when that terminal preference is enabled, so this is the practical way to get "notify me when I'm not looking" without AlfaCode guessing at window focus. Set `ALFACODE_NOTIFY_DESKTOP=1` to additionally fire a best-effort macOS notification (`osascript -e 'display notification …'`); it is off by default, non-blocking, and a failure to notify never affects the session.
+
+### MCP servers
+
+`/mcp` shows the MCP servers configured for the current session — name, connection status (`connected`, `pending`, `needs-auth`, `failed`, `disabled`), and tool count — sourced live from the pinned engine. AlfaCode does not manage MCP servers itself; configure them the same way you would for Claude Code (project `.mcp.json`, user settings, etc.).
+
+### Spell-check
+
+`/spellcheck` toggles opt-in composer spell-checking (off by default). It requires `aspell`, `hunspell`, or `ispell` on `PATH` — detected automatically, or pick one with `/spellcheck checker <name>`. Misspelled words underline live in the composer after a short pause in typing; code-looking tokens, URLs, CLI flags, camelCase/PascalCase identifiers, and backtick-quoted text are skipped. `/spellcheck dictionary <code>` sets the dictionary (e.g. `en_US`) and `/spellcheck color <name>` sets the underline color. The preference is stored locally, independent of `~/.alfacode/config.json`.
+
+### Fullscreen mode
+
+`--fullscreen` renders the chat UI on the terminal's alternate screen buffer (like vim or htop) with a fixed-bottom composer, using Ink's native support so the terminal is restored correctly even on a crash or `Ctrl+C`. `PageUp`/`PageDown` scroll by roughly a screen's worth of rows; `Ctrl+Home`/`Ctrl+End` jump to the oldest or newest message. A "N new messages below" indicator appears when scrolled away from the tail; nothing auto-jumps back to the bottom while you're reading history. Mouse support and in-transcript search are not implemented yet.
+
+### Screen-reader mode
+
+`--screen-reader` (or `ALFACODE_SCREEN_READER=1`; Ink's own `INK_SCREEN_READER=true` is also honored) switches to a plain, linear, screen-reader-friendly UI: an append-only transcript with textual role labels instead of box-drawing and in-place redraws, numbered alternatives on every picker (type the number shown, in addition to arrow keys), typed `y`/`n`/`a` alternatives on permission prompts, and a terminal bell on response completion, permission prompts, and tool calls that run past a few seconds.
 
 ## CLI reference
 
 ```text
 alfacode                              Start the native AlfaCode TUI
+alfacode --continue, -c               Resume the most recent session in this directory
+alfacode --resume, -r [name|id]       Resume a specific session, prompting if ambiguous
+alfacode --name <title>               Name the session as it starts
+alfacode --fullscreen                 Render on the alternate screen buffer
+alfacode --screen-reader              Render a plain, linear, screen-reader-friendly UI
+alfacode sessions [--json] [--limit]  List sessions AlfaCode can resume in this directory
 alfacode connect [provider]           Open provider setup
 alfacode providers list               List configured providers
 alfacode providers default <id>       Prefer a provider
@@ -208,7 +262,7 @@ Usage records contain counters and routing metadata, not prompt or response bodi
 - Every process receives a high-entropy ephemeral gateway credential.
 - API keys are stored in macOS Keychain or read from explicitly named environment variables.
 - Config files contain secret references, never secret bytes.
-- Prompt and response bodies are not written to AlfaCode logs or usage records.
+- Prompt and response bodies are not written to AlfaCode logs or usage records. The one exception is explicit: `/export` writes the visible transcript to a file only when you run it.
 - Configuration files are owner-only, atomically written, and rejected when insecurely permissioned or symlinked.
 - AlfaCode never edits your normal Claude Code configuration directory.
 
@@ -223,6 +277,7 @@ Requests still contain repository context and are sent to the selected provider.
 | `~/.alfacode/usage/` | Content-free local usage ledger. |
 | `~/.alfacode/catalog/` | Validated dynamic catalog cache. |
 | `~/.alfacode/state/` | Model selection and provider continuation state. |
+| `~/.alfacode/exports/` | Markdown transcripts written by `/export`, owner-only. |
 | macOS Keychain service `alfacode` | Provider secret bytes entered through the TUI. |
 
 Read [SECURITY.md](SECURITY.md) before reporting a vulnerability. Never put real keys, private source, prompts, or customer data in a public issue.

@@ -4,7 +4,7 @@ import { CAPABILITIES, selectDefaultModel, type ModelDescriptor } from "../../sr
 
 describe("OpenCode Zen catalog", () => {
   it("classifies dynamic catalog models by explicit protocol hints before model names", async () => {
-    const seen: { url?: string; authorization?: string } = {};
+    const seen: { url?: string; authorization?: string; redirect?: RequestRedirect } = {};
     const models = await discoverZenModels({
       apiKey: "zen-secret",
       baseUrl: "https://zen.example/v1/",
@@ -12,6 +12,7 @@ describe("OpenCode Zen catalog", () => {
         seen.url = String(input);
         const authorization = new Headers(init?.headers).get("authorization");
         if (authorization !== null) seen.authorization = authorization;
+        if (init?.redirect !== undefined) seen.redirect = init.redirect;
         return Response.json({ data: [
           { id: "gpt-5", endpoint: "/responses" },
           { id: "claude-tool", npm: "@ai-sdk/anthropic" },
@@ -20,7 +21,7 @@ describe("OpenCode Zen catalog", () => {
         ] });
       },
     });
-    expect(seen).toEqual({ url: "https://zen.example/v1/models", authorization: "Bearer zen-secret" });
+    expect(seen).toEqual({ url: "https://zen.example/v1/models", authorization: "Bearer zen-secret", redirect: "manual" });
     expect(models.map((model) => [model.id, model.wireProtocol, model.support])).toEqual([
       ["gpt-5", "openai-responses", "best-effort"],
       ["claude-tool", "anthropic-messages", "best-effort"],

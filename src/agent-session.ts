@@ -6,12 +6,14 @@ import {
   type CanUseTool,
   type PermissionMode,
   type Query,
+  type RewindFilesResult,
   type SDKMessage,
   type SDKSystemMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { buildClaudeEnvironment } from "./claude-launcher.js";
+import { buildClaudeEnvironment, ensurePrivateDirectory } from "./claude-launcher.js";
 import { ALFACODE_CLIENT_ID, checkEngineCompatibility, type EngineCompatibility } from "./engine-compatibility.js";
+import { renameAlfaCodeSession } from "./session-history.js";
 
 export interface AgentRuntimeHandle {
   readonly baseUrl: string;
@@ -29,6 +31,8 @@ export interface AgentSessionOptions {
   readonly permissionMode?: PermissionMode;
   readonly canUseTool: CanUseTool;
   readonly resume?: string;
+  /** Continue the most recent conversation in `cwd` instead of starting a new one (`claude --continue`). Mutually exclusive with `resume`. */
+  readonly continue?: boolean;
   readonly onMessage?: (message: SDKMessage) => void | Promise<void>;
   readonly onStderr?: (message: string) => void;
   readonly queryFactory?: typeof createQuery;
@@ -41,6 +45,17 @@ export interface AgentSessionIdentity {
   readonly claudeCodeVersion: string;
   readonly compatibility: EngineCompatibility;
   readonly capabilities: readonly string[];
+}
+
+/**
+ * An image to attach alongside a prompt's text. The Messages API (and the SDK's `MessageParam`
+ * content, which accepts `string | Array<ContentBlockParam>`) already supports image content blocks
+ * in outgoing user messages — this is composer-side plumbing (image paste / dropped image files)
+ * riding that existing capability, not a new wire format.
+ */
+export interface PromptImageAttachment {
+  readonly mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  readonly base64: string;
 }
 
 class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
@@ -84,6 +99,8 @@ export class AgentSession {
   private didInitialize = false;
   private initializationTimer: NodeJS.Timeout | undefined;
   private readonly listeners = new Set<(message: SDKMessage) => void | Promise<void>>();
+  private readonly configDir: string;
+  private readonly cwd: string;
 
   private constructor(private readonly options: AgentSessionOptions) {
     this.initialized = new Promise((resolve, reject) => {
@@ -95,6 +112,8 @@ export class AgentSession {
     // if initialization fails before the UI asks for it.
     void this.initialized.catch(() => undefined);
     const configDir = options.configDir ?? join(homedir(), ".alfacode", "claude");
+    this.configDir = configDir;
+    this.cwd = options.cwd ?? process.cwd();
     const env = buildClaudeEnvironment({
       claudeArgs: [],
       baseUrl: options.runtime.baseUrl,
@@ -108,10 +127,12 @@ export class AgentSession {
     this.query = (options.queryFactory ?? createQuery)({
       prompt: this.input,
       options: {
-        cwd: options.cwd ?? process.cwd(),
+        cwd: this.cwd,
         env,
         canUseTool: options.canUseTool,
-        permissionMode: options.permissionMode ?? "default",
+        // Stay restrictive until the init message proves the embedded engine
+        // matches the version AlfaCode was tested against.
+        permissionMode: options.permissionMode ?? "dontAsk",
         includePartialMessages: true,
         forwardSubagentText: true,
         agentProgressSummaries: true,
@@ -120,7 +141,10 @@ export class AgentSession {
         tools: { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project", "local"],
         persistSession: true,
+        // Lets Query.rewindFiles() restore file edits from AlfaCode's rewind menu.
+        enableFileCheckpointing: true,
         ...(options.resume === undefined ? {} : { resume: options.resume }),
+        ...(options.continue === undefined ? {} : { continue: options.continue }),
         ...(options.onStderr === undefined ? {} : { stderr: options.onStderr }),
       },
     });
@@ -128,6 +152,8 @@ export class AgentSession {
   }
 
   public static async start(options: AgentSessionOptions): Promise<AgentSession> {
+    const configDir = options.configDir ?? join(homedir(), ".alfacode", "claude");
+    await ensurePrivateDirectory(configDir);
     return new AgentSession(options);
   }
 
@@ -140,12 +166,19 @@ export class AgentSession {
     return () => this.listeners.delete(listener);
   }
 
-  public sendPrompt(text: string): string {
+  public sendPrompt(text: string, attachments: readonly PromptImageAttachment[] = []): string {
     if (text.trim().length === 0) throw new Error("Prompt cannot be empty");
     const uuid = randomUUID();
+    const content = attachments.length === 0 ? text : [
+      ...attachments.map((attachment) => ({
+        type: "image" as const,
+        source: { type: "base64" as const, media_type: attachment.mediaType, data: attachment.base64 },
+      })),
+      { type: "text" as const, text },
+    ];
     this.input.push({
       type: "user",
-      message: { role: "user", content: text },
+      message: { role: "user", content },
       parent_tool_use_id: null,
       uuid,
     });
@@ -183,6 +216,25 @@ export class AgentSession {
     return this.query.getContextUsage();
   }
 
+  /**
+   * Restores tracked files to their state at `userMessageId` (a prompt uuid previously returned
+   * by {@link sendPrompt}). Requires the engine to support file checkpointing (see
+   * `enableFileCheckpointing` above); older engines reject with a clear error instead of a crash.
+   */
+  public rewindFiles(userMessageId: string, options?: { readonly dryRun?: boolean }): Promise<RewindFilesResult> {
+    return this.query.rewindFiles(userMessageId, options);
+  }
+
+  /** Sets this session's display title (Claude Code's own `/rename`), for the resume picker. */
+  public async rename(title: string): Promise<void> {
+    const identity = await this.identity();
+    await renameAlfaCodeSession(identity.sessionId, title, { cwd: this.cwd, configDir: this.configDir });
+  }
+
+  public mcpServerStatus(): ReturnType<Query["mcpServerStatus"]> {
+    return this.query.mcpServerStatus();
+  }
+
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -203,22 +255,30 @@ export class AgentSession {
             clearTimeout(this.initializationTimer);
             this.initializationTimer = undefined;
           }
+          const compatibility = checkEngineCompatibility(message.claude_code_version);
+          if (this.options.permissionMode === undefined && compatibility.compatible) {
+            try {
+              await this.query.setPermissionMode("default");
+            } catch (error: unknown) {
+              await this.reportWarning(`Unable to enable default permissions after engine verification: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          } else if (!compatibility.compatible) {
+            const restriction = this.options.permissionMode === undefined ? " The session remains in dontAsk permission mode." : "";
+            await this.reportWarning(`Warning: ${compatibility.reason ?? "Unsupported Claude Code engine version"}.${restriction}`);
+          }
           this.resolveInitialized({
             sessionId: message.session_id,
             model: message.model,
             claudeCodeVersion: message.claude_code_version,
-            compatibility: checkEngineCompatibility(message.claude_code_version),
+            compatibility,
             capabilities: message.capabilities ?? [],
           });
         }
-        await this.options.onMessage?.(message);
-        for (const listener of this.listeners) await listener(message);
+        await this.deliverMessage(message);
       }
       if (!sawInit) this.rejectInitialized(new Error("Claude Code engine exited before initialization"));
       else if (!this.closed) {
-        const message = syntheticEngineError(new Error("Claude Code engine exited unexpectedly"));
-        await this.options.onMessage?.(message);
-        for (const listener of this.listeners) await listener(message);
+        await this.deliverMessage(syntheticEngineError(new Error("Claude Code engine exited unexpectedly")));
       }
     } catch (error) {
       if (this.initializationTimer !== undefined) {
@@ -227,10 +287,32 @@ export class AgentSession {
       }
       const normalized = error instanceof Error ? error : new Error(String(error));
       if (!sawInit) this.rejectInitialized(normalized);
-      const message = syntheticEngineError(normalized);
-      await this.options.onMessage?.(message);
-      for (const listener of this.listeners) await listener(message);
+      await this.deliverMessage(syntheticEngineError(normalized));
     }
+  }
+
+  private async deliverMessage(message: SDKMessage): Promise<void> {
+    await this.options.onMessage?.(message);
+    for (const listener of this.listeners) await listener(message);
+  }
+
+  /**
+   * Surfaces a wrapper-level warning (as opposed to a message from the engine itself).
+   * When the caller wired up a raw stderr sink, use it directly. Otherwise — notably the
+   * native TUI launch path, where Ink owns the terminal and an unmanaged
+   * process.stderr.write would corrupt the screen — route the warning through the same
+   * message channel the transcript already renders system notifications from.
+   */
+  private async reportWarning(message: string): Promise<void> {
+    if (this.options.onStderr !== undefined) {
+      try {
+        this.options.onStderr(message);
+      } catch {
+        // A warning sink must not abort or weaken an otherwise valid session.
+      }
+      return;
+    }
+    await this.deliverMessage(syntheticNotification("alfacode-warning", message));
   }
 }
 
@@ -238,14 +320,18 @@ function isInitMessage(message: SDKMessage): message is SDKSystemMessage {
   return message.type === "system" && message.subtype === "init";
 }
 
-function syntheticEngineError(error: Error): SDKMessage {
+function syntheticNotification(key: string, text: string): SDKMessage {
   return {
     type: "system",
     subtype: "notification",
-    key: "alfacode-engine-error",
-    text: error.message,
+    key,
+    text,
     priority: "immediate",
     uuid: randomUUID(),
     session_id: "unknown",
   };
+}
+
+function syntheticEngineError(error: Error): SDKMessage {
+  return syntheticNotification("alfacode-engine-error", error.message);
 }
