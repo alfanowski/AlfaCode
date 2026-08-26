@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, rm, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -56,8 +56,19 @@ describe("ConfigStore", () => {
     const directory = join(home, "safe");
     await mkdir(directory);
     await chmod(directory, 0o700);
-    await symlink(join(outside, "config.json"), join(directory, "config.json"));
+    const outsideConfig = join(outside, "config.json");
+    await writeFile(outsideConfig, JSON.stringify({ version: 1, providers: [] }), { mode: 0o600 });
+    await symlink(outsideConfig, join(directory, "config.json"));
     await expect(new ConfigStore({ configPath: join(directory, "config.json") }).read()).rejects.toThrow("symbolic link");
+  });
+
+  it("refuses non-regular config files", async () => {
+    const home = await createTemporaryDirectory();
+    const directory = join(home, ".alfacode");
+    await mkdir(join(directory, "config.json"), { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+
+    await expect(new ConfigStore({ homeDirectory: home }).read()).rejects.toThrow("Expected regular file");
   });
 
   it("refuses group-readable config files", async () => {

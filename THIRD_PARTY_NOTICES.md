@@ -42,6 +42,19 @@ is eligible for a free or paid tier.
 
 ## Other dependencies
 
-Other dependencies retain their own licenses and notices. Installing AlfaCode
-through a package manager resolves those dependencies from their respective
-publishers; this repository does not relicense them.
+AlfaCode's other direct runtime dependencies are licensed as follows:
+
+- `@google/genai` — Apache License 2.0. Its copyright, attribution, and notice
+  requirements apply independently of AlfaCode's MIT License.
+- `@napi-rs/keyring` — MIT License.
+- `commander` — MIT License.
+- `fastify` — MIT License.
+- `ink` — MIT License.
+- `marked` — MIT License.
+- `react` — MIT License.
+- `string-width` — MIT License.
+- `zod` — MIT License.
+
+These dependencies retain their own licenses and notices. Installing AlfaCode
+through a package manager resolves them from their respective publishers; this
+repository does not relicense them.

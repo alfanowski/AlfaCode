@@ -63,8 +63,8 @@ export class MacOSKeychain {
     try {
       const secret = this.entryFactory(service, account).getPassword();
       return secret === null || secret.length === 0 ? undefined : secret;
-    } catch {
-      return undefined;
+    } catch (error) {
+      throw new Error("Unable to retrieve secret from the system credential vault", { cause: error });
     }
   }
 
@@ -93,6 +93,9 @@ export class SecretResolver {
 
   async resolve(reference: SecretReference): Promise<string | undefined> {
     if (reference.kind === "env") return this.environment[reference.name];
+    if (reference.service !== keychainService) {
+      throw new Error("Refusing to read a legacy Keychain record. Reconnect this provider to migrate its credential first.");
+    }
     return this.keychain.retrieve(reference.account, reference.service);
   }
 }
