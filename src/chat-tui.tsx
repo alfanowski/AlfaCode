@@ -1,3 +1,4 @@
+import type { EventEmitter } from "node:events";
 import { stat as statFile, readFile as readFileBytes } from "node:fs/promises";
 import { relative as relativePath } from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -107,6 +108,8 @@ const EFFORT_PIPS: readonly ("default" | EffortLevel)[] = ["default", ...EFFORT_
 const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 /** How long a running tool call may run before screen-reader mode rings the bell about it. */
 const TOOL_BELL_THRESHOLD_MS = 3_000;
+/** Debounce window for `useTerminalResize`'s re-render — see its doc comment for why. */
+const RESIZE_DEBOUNCE_MS = 50;
 let transcriptItemSequence = 0;
 const commands: readonly Command[] = [
   { name: "/model", description: "Switch across every live model", shortcut: "⌘M" },
@@ -134,6 +137,43 @@ const defaultContextWarningThreshold = 80;
 export function resolveInitialVimMode(environment: NodeJS.ProcessEnv = process.env): boolean {
   const requested = environment.ALFACODE_VIM_MODE?.trim().toLowerCase();
   return requested === "1" || requested === "true" || requested === "yes" || requested === "on";
+}
+
+/**
+ * Ink's own internal resize handling relayouts+repaints the *already* rendered tree on every raw
+ * `stdout` `resize` event with no debouncing of its own — fine, since that reuses the existing
+ * DOM/Yoga node tree and is cheap — but it does not re-invoke this component. `useStdout()`'s
+ * context value doesn't change identity when the terminal is resized (see Ink's `App` component:
+ * the `StdoutContext` value is memoized on `[stdout, writeToStdout]`, neither of which changes),
+ * so nothing else re-renders `ChatTui` on resize either. That leaves `width`/`height` (and every
+ * row budget, `modelWidth`, and scroll-window size derived from them below) frozen at whatever they
+ * were on the last render triggered by something unrelated (a keypress, a streamed token) until
+ * this hook forces one. The returned generation counter only exists to make this independently
+ * testable; callers that just want the rerender side effect can ignore it.
+ *
+ * Debounced rather than firing once per raw event: some terminals emit a burst of `resize` events
+ * per drag-resize gesture, and reacting to every one would pile a full React re-render on top of
+ * Ink's own already-unthrottled per-event repaint — exactly the kind of independent, uncoordinated
+ * repaint source motion.ts's shared clock was built to eliminate for animation. The debounce window
+ * mirrors Ink's own `pendingInputFlushDelayMilliseconds` pattern for chunked escape sequences: a
+ * plain trailing debounce, not a full leading+trailing throttle — simplest fix that still converges
+ * promptly (well under human perception) once a resize gesture settles.
+ */
+export function useTerminalResize(stdout: EventEmitter, debounceMs: number = RESIZE_DEBOUNCE_MS): number {
+  const [generation, setGeneration] = useState(0);
+  useEffect(() => {
+    let timer: NodeJS.Timeout | undefined;
+    const onResize = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => { timer = undefined; setGeneration((value) => value + 1); }, debounceMs);
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [stdout, debounceMs]);
+  return generation;
 }
 
 export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
@@ -225,6 +265,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const toolBellTimers = useRef(new Map<string, NodeJS.Timeout>());
   const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
   const spellCheckController = useRef<SpellCheckController | undefined>(undefined);
+  // Keeps width/height (and everything derived from them below) live across a terminal resize —
+  // see useTerminalResize's doc comment. The generation counter itself is unused here; calling the
+  // hook is what matters.
+  useTerminalResize(stdout);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
