@@ -90,15 +90,21 @@ exec zsh
 
 ### First launch
 
-The first launch opens AlfaCode's provider setup inside the TUI:
+AlfaCode is usable the moment it starts: a fresh install has no config file yet, so the first launch bootstraps it with **OpenCode Zen → Free public models** already set as the default provider — no key, account, or setup wizard required. Just run:
 
-1. Choose a provider.
-2. Choose its access mode.
-3. Paste the API key when required. The field is masked and clearly labelled.
-4. AlfaCode verifies the connection and discovers the live model catalog.
-5. Add more providers at any time with `/connect` or manage them with `/providers`.
+```bash
+alfacode
+```
 
-For a zero-key first run, choose **OpenCode Zen → Free public models**. To use Google, create a key in [Google AI Studio](https://aistudio.google.com/apikey), then choose **Google AI Studio** and paste that key into the secure field.
+The provider setup wizard is no longer a mandatory first-run step; it's there whenever you want to add another provider or change the default:
+
+1. Open it any time with `/connect` (to add a provider) or `/providers` (to inspect, select, reconnect, or delete providers).
+2. Choose a provider.
+3. Choose its access mode.
+4. Paste the API key when required. The field is masked and clearly labelled.
+5. AlfaCode verifies the connection and discovers the live model catalog.
+
+To use Google, create a key in [Google AI Studio](https://aistudio.google.com/apikey), then choose **Google AI Studio** and paste that key into the secure field. The setup wizard still opens automatically if AlfaCode ever finds a saved provider with no usable credential (for example, a Keychain item that was deleted outside AlfaCode) or if you deliberately remove every provider with `/providers`.
 
 ## Providers
 
