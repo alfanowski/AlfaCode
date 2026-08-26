@@ -19,8 +19,8 @@ import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } fr
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { usePulse, useSpinner } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { useFlash, usePulse, useSpinner } from "./ui/motion.js";
+import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -960,7 +960,7 @@ function extractToolResultText(content: unknown): string {
 function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const pulse = usePulse(busy);
   const modelWidth = Math.max(16, Math.min(34, width - 48));
-  return <Box justifyContent="space-between" borderStyle="round" borderColor={busy ? theme.secondary : theme.border} paddingX={1} marginBottom={1}>
+  return <Box justifyContent="space-between" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1}>
     <Box width={12}><Brand theme={theme} compact /></Box>
     <Box columnGap={2} justifyContent="flex-end" flexGrow={1}>
       <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
@@ -981,16 +981,21 @@ function Transcript({ items, theme, width, busy, detailed }: { readonly items: r
 }
 function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
+  // A brief highlight pulse whenever this row's status changes (most visibly running → completed/failed
+  // — the moment a tool call actually lands something worth noticing) — never on the row's own first
+  // mount, per useFlash's contract, so a burst of freshly-started tool calls doesn't flash all at once.
+  const flash = useFlash(item.status);
   const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
   const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
   const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {item.detail === undefined ? "tool" : item.detail} · </Text><Text color={theme.text}>{item.text}</Text></Box>;
-  if (!detailed) return <Box paddingLeft={2}>{summary}</Box>;
+  const highlight = flash ? { backgroundColor: theme.surfaceRaised } : {};
+  if (!detailed) return <Box paddingLeft={2} {...highlight}>{summary}</Box>;
   const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
   const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
-  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1}>
+  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1} {...highlight}>
     {summary}
-    {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2}><Text color={theme.faint}>input</Text><Text color={theme.muted}>{input}</Text></Box>}
-    {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2}><Text color={theme.faint}>output</Text><Text color={theme.muted}>{output}</Text></Box>}
+    {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>INPUT</Text><Text color={theme.muted}>{input}</Text></Box>}
+    {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
   </Box>;
 }
 function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
@@ -1002,7 +1007,7 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
   if (historySearch !== undefined) {
     const match = historyMatches[historySearch.index % Math.max(1, historyMatches.length)];
     return <Box flexDirection="column" marginTop={1}>
-      <Box borderStyle="round" borderColor={theme.accent} paddingX={1} minHeight={3}>
+      <Box {...panelBorder(theme, "active")} paddingX={1} minHeight={3}>
         <Text bold color={theme.accent}>history ❯ </Text>
         <Text color={theme.muted}>(reverse-i-search)`</Text><Text color={theme.text}>{historySearch.query}</Text><Text color={theme.muted}>': </Text>
         <Text color={theme.text} wrap="truncate-end">{match ?? ""}</Text>
@@ -1019,7 +1024,7 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
   const leftHint = screen !== "chat" ? "esc back" : vimHint !== undefined ? vimHint : suggestion !== undefined && editor.value.length === 0 ? "tab accept · type dismisses" : busy ? "ctrl+c stop · type to queue" : compact ? `↵ send · ⇧↵ newline · / commands${canRewind ? " · esc esc rewind" : ""}` : `enter send · shift+enter newline · / commands${canRewind ? " · esc esc rewind" : ""}`;
   const rightHint = `${attachmentCount > 0 ? `${attachmentCount} image${attachmentCount === 1 ? "" : "s"} · ` : ""}${promptTokens > 0 ? `~${formatCompact(promptTokens)} draft · ` : ""}${lastTurnTokens === undefined ? "" : `${formatCompact(lastTurnTokens)} turn · `}${lastTurnCostUsd === undefined ? "" : `${formatCostUsd(lastTurnCostUsd)} turn · `}${contextLeft === undefined ? "ctx —" : `${formatCompact(contextLeft)} ctx left`}`;
   return <Box flexDirection="column" marginTop={1}>
-    <Box borderStyle="round" borderColor={busy ? theme.secondary : screen === "chat" ? theme.accent : theme.border} paddingX={1} minHeight={3}>
+    <Box {...panelBorder(theme, screen === "chat" ? "active" : "quiet")} paddingX={1} minHeight={3}>
       {vim === undefined ? null : <Text bold color={vim.mode === "insert" ? theme.success : vim.mode === "visual" ? theme.secondary : theme.warning}>{vim.mode.toUpperCase()} </Text>}
       <Text bold color={theme.accent}>❯ </Text>
       {screen !== "chat" ? <Text color={theme.faint}>Press Esc to return to chat</Text> : editor.value.length === 0 ? <Text><Text inverse color={theme.text}> </Text><Text color={suggestion === undefined ? theme.faint : theme.muted}>{suggestion ?? contextualHint(messages, busy)}</Text></Text> : <Text wrap="wrap">{spellCheckRuns(split.before, 0, misspelledRanges, "b", theme.text, underlineColor)}<Text inverse color={theme.text}>{split.cursor}</Text>{spellCheckRuns(split.after, editor.value.length - split.after.length, misspelledRanges, "a", theme.text, underlineColor)}</Text>}
@@ -1031,25 +1036,27 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
 function CommandPalette({ commands: matches, cursor, theme }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, matches.length - 6)));
-  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{numbered ? numberedLabel(start + index, command.name) : command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}<Text bold={active}>{numbered ? numberedLabel(start + index, command.name) : command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
 }
 
 /** Mirrors CommandPalette's navigate/tab/accept interaction on purpose — see mentions.ts. */
 function MentionPalette({ entries, cursor, theme }: { readonly entries: readonly MentionEntry[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, entries.length - 6)));
-  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath}><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath}><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
 }
 
 function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
   const numbered = isScreenReaderMode();
-  const visibleRows = Math.max(5, height - 4);
+  // -6 (not -4) accounts for the picker's own outer panelBorder (2 rows) on top of the section
+  // title and search box already reserved for.
+  const visibleRows = Math.max(5, height - 6);
   const start = Math.max(0, Math.min(cursor - Math.floor(visibleRows / 2), Math.max(0, models.length - visibleRows)));
-  return <Box flexDirection="column"><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model, index) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{numbered ? numberedLabel(start + index, model.displayName) : model.displayName}</Text><Text color={theme.muted}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · enter switch · esc back</HintBar></Box>;
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box {...panelBorder(theme, "active")} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model, index) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : ""}<Text bold={active}>{numbered ? numberedLabel(start + index, model.displayName) : model.displayName}</Text><Text color={theme.faint}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · enter switch · esc back</HintBar></Box>;
 }
 
 function ProviderManager({ providers, models, cursor, defaultId, theme }: { readonly providers: readonly ProviderRecord[]; readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly defaultId?: string; readonly theme: Theme }): React.JSX.Element {
   const numbered = isScreenReaderMode();
-  return <Box flexDirection="column"><SectionTitle title="Providers" detail="all active simultaneously · routing is automatic" theme={theme} />{providers.map((provider, index) => { const available = models.filter((model) => model.providerId === provider.id && model.availability === "available" && model.capabilities.tools).length; const active = cursor === index; return <Box key={provider.id} flexDirection="column" borderStyle="round" borderColor={active ? theme.accent : theme.border} paddingX={1} marginBottom={1}><Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{numbered ? numberedLabel(index, provider.id) : provider.id}</Text><StatusBadge label={available > 0 ? "ready" : "unavailable"} tone={available > 0 ? "success" : "danger"} theme={theme} /></Box><Text color={theme.muted}>{provider.type} · {provider.apiKey === undefined ? "public access" : provider.apiKey.kind === "keychain" ? "Keychain" : `env ${provider.apiKey.name}`} · {available} callable model{available === 1 ? "" : "s"}{provider.id === defaultId ? " · preferred tie-breaker" : ""}</Text></Box>; })}{providers.length === 0 ? <Text color={theme.muted}>No provider connected. Press a to add one.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to focus · " : ""}a add · d delete · r reconnect · enter prefer · esc back</HintBar></Box>;
+  return <Box flexDirection="column"><SectionTitle title="Providers" detail="all active simultaneously · routing is automatic" theme={theme} />{providers.map((provider, index) => { const available = models.filter((model) => model.providerId === provider.id && model.availability === "available" && model.capabilities.tools).length; const active = cursor === index; return <Box key={provider.id} flexDirection="column" {...panelBorder(theme, active ? "active" : "quiet")} paddingX={1} marginBottom={1}><Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}{numbered ? numberedLabel(index, provider.id) : provider.id}</Text><StatusBadge label={available > 0 ? "ready" : "unavailable"} tone={available > 0 ? "success" : "danger"} theme={theme} /></Box><Text color={theme.muted}>{provider.type} · {provider.apiKey === undefined ? "public access" : provider.apiKey.kind === "keychain" ? "Keychain" : `env ${provider.apiKey.name}`} · {available} callable model{available === 1 ? "" : "s"}{provider.id === defaultId ? " · preferred tie-breaker" : ""}</Text></Box>; })}{providers.length === 0 ? <Text color={theme.muted}>No provider connected. Press a to add one.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to focus · " : ""}a add · d delete · r reconnect · enter prefer · esc back</HintBar></Box>;
 }
 function DeleteConfirmation({ providerId, theme }: { readonly providerId: string; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column" borderStyle="double" borderColor={theme.danger} paddingX={2} paddingY={1}><Text bold color={theme.danger}>Delete “{providerId}”?</Text><Text color={theme.text}>Its AlfaCode configuration and Keychain credential will be removed.</Text><Box marginTop={1} columnGap={2}><KeyHint shortcut="y" label="delete permanently" theme={theme} /><KeyHint shortcut="n" label="cancel" theme={theme} /></Box></Box>; }
 
@@ -1060,7 +1067,7 @@ function UsagePanel({ usage, context, sessionCostUsd, theme, width }: { readonly
   const categories = (context.categories ?? []).filter((category) => category.tokens > 0).slice(0, 6);
   return <Box flexDirection="column">
     <SectionTitle title="Usage" detail="local, content-free accounting" theme={theme} />
-    <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}>
+    <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginBottom={1}>
       <Box justifyContent="space-between"><Text bold>Context window</Text><Text color={theme.secondarySoft}>{formatCompact(context.totalTokens)} / {formatCompact(context.maxTokens)} · {context.percentage.toFixed(1)}%</Text></Box>
       <ProgressBar value={context.percentage / 100} width={Math.max(10, Math.min(64, width - 4))} theme={theme} />
       <Text color={theme.faint}>{formatCompact(Math.max(0, context.maxTokens - context.totalTokens))} tokens left · {shortModel(context.model)}</Text>
@@ -1076,13 +1083,13 @@ function Metric({ label, value, format, theme }: { readonly label: string; reado
 function PermissionPicker({ selected, theme }: { readonly selected: PermissionMode; readonly theme: Theme }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const descriptions: Partial<Record<PermissionMode, string>> = { default: "Ask before sensitive actions", acceptEdits: "Accept file edits", plan: "Read-only planning", dontAsk: "Deny unapproved actions", bypassPermissions: "Bypass every prompt", auto: "Engine evaluates risk automatically" };
-  return <Box flexDirection="column"><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode, index) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.text}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{numbered ? numberedLabel(index, mode) : mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>{numbered ? "type a number · " : ""}↑↓ select · enter apply · esc back</HintBar></Box>;
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode, index) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.muted}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{numbered ? numberedLabel(index, mode) : mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>{numbered ? "type a number · " : ""}↑↓ select · enter apply · esc back</HintBar></Box>;
 }
 function ThemePicker({ selected, theme }: { readonly selected: ThemeName; readonly theme: Theme }): React.JSX.Element {
-  return <Box flexDirection="column"><SectionTitle title="Theme" detail="dark, light, and colorblind-friendly variants" theme={theme} />{themeCatalog.map((entry) => {
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}><SectionTitle title="Theme" detail="dark, light, and colorblind-friendly variants" theme={theme} />{themeCatalog.map((entry) => {
     const active = selected === entry.name;
     return <Box key={entry.name} flexDirection="column" paddingLeft={active ? 0 : 2}>
-      <Text color={active ? entry.theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{entry.label}</Text>{entry.theme.colorblindSafe ? <Text color={theme.faint}> · daltonized</Text> : null}</Text>
+      <Text color={active ? entry.theme.accent : theme.muted}>{active ? "❯ " : ""}<Text bold={active}>{entry.label}</Text>{entry.theme.colorblindSafe ? <Text color={theme.faint}> · daltonized</Text> : null}</Text>
       {active ? <Text color={theme.faint}>  {entry.description}</Text> : null}
     </Box>;
   })}<HintBar theme={theme}>↑↓ preview live · enter confirm · esc back</HintBar></Box>;
@@ -1093,7 +1100,7 @@ function McpPanel({ servers, theme }: { readonly servers: readonly McpServerStat
   return <Box flexDirection="column"><SectionTitle title="MCP servers" detail={`${servers.length} configured`} theme={theme} />{servers.map((server) => {
     const toolCount = server.tools?.length ?? 0;
     const tone = server.status === "connected" ? "success" : server.status === "pending" || server.status === "needs-auth" ? "warning" : server.status === "disabled" ? "muted" : "danger";
-    return <Box key={server.name} flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}>
+    return <Box key={server.name} flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginBottom={1}>
       <Box justifyContent="space-between"><Text bold color={theme.text}>{server.name}</Text><StatusBadge label={server.status} tone={tone} theme={theme} /></Box>
       <Text color={theme.muted}>{toolCount} tool{toolCount === 1 ? "" : "s"}{server.scope === undefined ? "" : ` · ${server.scope}`}</Text>
       {server.error === undefined ? null : <Text color={theme.danger} wrap="truncate-end">{sanitizeTerminalText(server.error)}</Text>}
@@ -1109,7 +1116,7 @@ function QuestionCard({ request, questionIndex, cursor, selections, otherMode, o
   const focused = question.options[cursor];
   const preview = focused?.preview === undefined ? undefined : truncatePreview(focused.preview);
   const split = splitAtCursor(otherEditor);
-  return <Box flexDirection="column" borderStyle="double" borderColor={theme.secondary} paddingX={2} paddingY={1} marginTop={1}>
+  return <Box flexDirection="column" {...panelBorder(theme, "active")} paddingX={2} paddingY={1} marginTop={1}>
     <Box justifyContent="space-between"><Text bold color={theme.secondarySoft}>◆ {question.header.toUpperCase()}</Text><Text color={theme.faint}>{questionIndex + 1} / {request.questions.length} · {question.multiSelect ? "multiple choice" : "single choice"}</Text></Box>
     <Box marginTop={1}><Text bold color={theme.text}>{question.question}</Text></Box>
     <Box flexDirection="column" marginTop={1}>{question.options.map((option, index) => {
@@ -1124,15 +1131,15 @@ function QuestionCard({ request, questionIndex, cursor, selections, otherMode, o
         <Text color={cursor === question.options.length || otherMode ? theme.accent : theme.text}>{cursor === question.options.length && !otherMode ? "❯ " : ""}○ <Text bold={otherMode}>{numbered ? "0) Other" : "Other"}</Text><Text color={theme.faint}>  type a custom answer</Text></Text>
       </Box>
     </Box>
-    {preview === undefined || otherMode ? null : <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginTop={1}><Text bold color={theme.faint}>PREVIEW</Text><Markdown theme={theme} width={Math.max(20, width - 8)}>{preview}</Markdown></Box>}
-    {otherMode ? <Box flexDirection="column" marginTop={1}><Text bold color={theme.muted}>YOUR ANSWER</Text><Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box><Text color={theme.faint}>enter confirm · esc return to choices</Text></Box> : <Text color={theme.faint}>{numbered ? "type a number (0 for other) · " : ""}{question.multiSelect ? "space toggle · enter confirm · " : "enter select · "}↑↓ navigate · tab next · esc dismiss</Text>}
+    {preview === undefined || otherMode ? null : <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginTop={1}><Text bold color={theme.faint}>PREVIEW</Text><Markdown theme={theme} width={Math.max(20, width - 8)}>{preview}</Markdown></Box>}
+    {otherMode ? <Box flexDirection="column" marginTop={1}><Text bold color={theme.muted}>YOUR ANSWER</Text><Box {...panelBorder(theme, "active")} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box><Text color={theme.faint}>enter confirm · esc return to choices</Text></Box> : <Text color={theme.faint}>{numbered ? "type a number (0 for other) · " : ""}{question.multiSelect ? "space toggle · enter confirm · " : "enter select · "}↑↓ navigate · tab next · esc dismiss</Text>}
   </Box>;
 }
 function PermissionCard({ request, cursor, comment, commentMode, commentEditor, theme }: { readonly request: PermissionRequest; readonly cursor: number; readonly comment: string | undefined; readonly commentMode: boolean; readonly commentEditor: EditorState; readonly theme: Theme }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const options = request.suggestions.length > 0 ? ["Deny", "Allow once", "Always allow"] : ["Deny", "Allow once"];
   const split = splitAtCursor(commentEditor);
-  return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}>
+  return <Box flexDirection="column" {...panelBorder(theme, "active")} paddingX={2} paddingY={1} marginTop={1}>
     <Text bold color={theme.warning}>⚠ {request.title ?? `${request.toolName} requests permission`}</Text>
     {request.description ? <Text color={theme.text}>{request.description}</Text> : null}
     <Text color={theme.muted} wrap="truncate-end">{permissionInputSummary(request)}</Text>
@@ -1140,7 +1147,7 @@ function PermissionCard({ request, cursor, comment, commentMode, commentEditor, 
     {commentMode
       ? <Box flexDirection="column" marginTop={1}>
           <Text bold color={theme.muted}>NOTE (attached to your decision)</Text>
-          <Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box>
+          <Box {...panelBorder(theme, "active")} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box>
           <Text color={theme.faint}>enter save note · esc cancel</Text>
         </Box>
       : <>

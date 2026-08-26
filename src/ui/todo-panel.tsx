@@ -2,6 +2,8 @@ import React from "react";
 import { Box, Text } from "ink";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { sanitizeTerminalText } from "./markdown.js";
+import { useFlash } from "./motion.js";
+import { panelBorder } from "./primitives.js";
 import type { Theme } from "./theme.js";
 
 export type TodoStatus = "pending" | "in_progress" | "completed";
@@ -54,16 +56,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function TodoPanel({ todos, collapsed, theme }: { readonly todos: readonly TodoItem[]; readonly collapsed: boolean; readonly theme: Theme }): React.JSX.Element | null {
+  // A stable signature over every task's status and content: changes whenever a task is added,
+  // removed, or moves between pending/in_progress/completed — exactly the "something happened
+  // here" moments that should briefly draw the eye, without re-triggering on every unrelated
+  // re-render (e.g. the parent's spinner tick) that leaves the list itself untouched.
+  const signature = todos.map((todo) => `${todo.status}:${todo.content}`).join("|");
+  const flash = useFlash(signature);
   if (todos.length === 0) return null;
   const completed = todos.filter((todo) => todo.status === "completed").length;
   const active = todos.find((todo) => todo.status === "in_progress");
+  const border = panelBorder(theme, flash ? "active" : "quiet");
   if (collapsed) {
-    return <Box borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1} justifyContent="space-between">
+    return <Box {...border} paddingX={1} marginBottom={1} justifyContent="space-between">
       <Text bold color={theme.muted}>TASKS</Text>
       <Text color={theme.faint}>{completed}/{todos.length} done{active === undefined ? "" : ` · ${active.activeForm}`} · ctrl+t expand</Text>
     </Box>;
   }
-  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}>
+  return <Box flexDirection="column" {...border} paddingX={1} marginBottom={1}>
     <Box justifyContent="space-between"><Text bold color={theme.muted}>TASKS</Text><Text color={theme.faint}>{completed}/{todos.length} done · ctrl+t collapse</Text></Box>
     {todos.map((todo, index) => {
       const icon = todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "▶" : "○";
