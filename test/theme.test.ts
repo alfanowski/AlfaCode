@@ -21,19 +21,51 @@ describe("terminal theme", () => {
     expect(resolveThemeName({ ALFACODE_THEME: "light" })).toBe("light");
     expect(resolveThemeName({ ALFACODE_THEME: "dark-daltonized" })).toBe("dark-daltonized");
     expect(resolveThemeName({ ALFACODE_THEME: "light-daltonized" })).toBe("light-daltonized");
+    expect(resolveThemeName({ ALFACODE_THEME: "nova" })).toBe("nova");
   });
 
   it("accepts an uppercase or mixed-case override", () => {
     expect(resolveThemeName({ ALFACODE_THEME: "Dark-Daltonized" })).toBe("dark-daltonized");
   });
 
-  it("exposes exactly four built-in themes, half of them colorblind-safe", () => {
-    expect(themeNames).toEqual(["dark", "light", "dark-daltonized", "light-daltonized"]);
-    expect(themeCatalog).toHaveLength(4);
+  it("defaults dark terminals to nova, without disturbing an explicit dark override or light-terminal inference", () => {
+    expect(resolveThemeName({ COLORFGBG: "15;0" })).toBe("nova");
+    expect(resolveThemeName({})).toBe("nova");
+    expect(resolveThemeName({ ALFACODE_THEME: "dark", COLORFGBG: "15;0" })).toBe("dark");
+    expect(resolveThemeName({ COLORFGBG: "0;15" })).toBe("light");
+  });
+
+  it("exposes exactly five built-in themes, two of them colorblind-safe", () => {
+    expect(themeNames).toEqual(["dark", "light", "dark-daltonized", "light-daltonized", "nova"]);
+    expect(themeCatalog).toHaveLength(5);
     expect(themeCatalog.filter((entry) => entry.theme.colorblindSafe).map((entry) => entry.name)).toEqual([
       "dark-daltonized",
       "light-daltonized",
     ]);
+  });
+
+  it("gives nova the locked-in astronomical red/gold palette", () => {
+    const nova = getTheme("nova");
+    expect(nova).toMatchObject({
+      mode: "dark",
+      colorblindSafe: false,
+      accent: "#FF4757",
+      accentSoft: "#FF7A85",
+      secondary: "#FFC93C",
+      secondarySoft: "#FFDD7A",
+      text: "#F5F1EA",
+      muted: "#9B93A8",
+      faint: "#655D74",
+      surface: "#14101E",
+      surfaceRaised: "#231C33",
+      border: "#3D3450",
+      success: "#4FE3B0",
+      warning: "#FF9F1C",
+      danger: "#F0466E",
+      code: "#B9A3E3",
+    });
+    // accent and danger must never share a hue family: an error should never read as the brand color.
+    expect(nova.accent).not.toBe(nova.danger);
   });
 
   it("gives every theme a distinct, non-empty color for every token", () => {

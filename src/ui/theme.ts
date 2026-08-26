@@ -1,5 +1,5 @@
 export type ThemeMode = "dark" | "light";
-export type ThemeName = "dark" | "light" | "dark-daltonized" | "light-daltonized";
+export type ThemeName = "dark" | "light" | "dark-daltonized" | "light-daltonized" | "nova";
 
 export interface Theme {
   readonly name: ThemeName;
@@ -113,15 +113,39 @@ const themes: Record<ThemeName, Theme> = {
     danger: "#B34700",
     code: "#005F8C",
   },
+  // Astronomical red/gold palette — AlfaCode's default look on dark terminals. accent (flame-red)
+  // and danger (hot rose-red) are deliberately different red hues so an error is never visually
+  // confusable with the brand color; secondary (solar yellow) is meant to be used more sparingly
+  // than accent so the overall balance reads "red field, yellow glow" rather than a hazard stripe.
+  nova: {
+    name: "nova",
+    mode: "dark",
+    colorblindSafe: false,
+    accent: "#FF4757",
+    accentSoft: "#FF7A85",
+    secondary: "#FFC93C",
+    secondarySoft: "#FFDD7A",
+    text: "#F5F1EA",
+    muted: "#9B93A8",
+    faint: "#655D74",
+    surface: "#14101E",
+    surfaceRaised: "#231C33",
+    border: "#3D3450",
+    success: "#4FE3B0",
+    warning: "#FF9F1C",
+    danger: "#F0466E",
+    code: "#B9A3E3",
+  },
 };
 
-export const themeNames: readonly ThemeName[] = ["dark", "light", "dark-daltonized", "light-daltonized"];
+export const themeNames: readonly ThemeName[] = ["dark", "light", "dark-daltonized", "light-daltonized", "nova"];
 
 const themeLabels: Record<ThemeName, string> = {
   dark: "Dark",
   light: "Light",
   "dark-daltonized": "Dark · Daltonized",
   "light-daltonized": "Light · Daltonized",
+  nova: "Nova",
 };
 
 const themeDescriptions: Record<ThemeName, string> = {
@@ -129,6 +153,7 @@ const themeDescriptions: Record<ThemeName, string> = {
   light: "Default light palette",
   "dark-daltonized": "Colorblind-friendly dark palette (Okabe–Ito hues)",
   "light-daltonized": "Colorblind-friendly light palette (Okabe–Ito hues)",
+  nova: "Astronomical red/gold palette — AlfaCode's default look",
 };
 
 export const themeCatalog: readonly ThemeCatalogEntry[] = themeNames.map((name) => ({
@@ -149,7 +174,9 @@ export function isThemeName(value: string): value is ThemeName {
 export function resolveThemeName(environment: NodeJS.ProcessEnv = process.env): ThemeName {
   const requested = environment.ALFACODE_THEME?.toLowerCase();
   if (requested !== undefined && isThemeName(requested)) return requested;
-  return inferThemeMode(environment.COLORFGBG);
+  // Dark terminals default to the nova palette; plain "dark" remains fully selectable via
+  // /theme or ALFACODE_THEME=dark. Light terminals are unaffected — nova has no light variant.
+  return inferThemeMode(environment.COLORFGBG) === "dark" ? "nova" : "light";
 }
 
 export function resolveTheme(environment: NodeJS.ProcessEnv = process.env): Theme {
