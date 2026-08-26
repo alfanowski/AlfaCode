@@ -231,6 +231,10 @@ export class AgentSession {
     await renameAlfaCodeSession(identity.sessionId, title, { cwd: this.cwd, configDir: this.configDir });
   }
 
+  public mcpServerStatus(): ReturnType<Query["mcpServerStatus"]> {
+    return this.query.mcpServerStatus();
+  }
+
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;

@@ -3,13 +3,15 @@ import { relative as relativePath } from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
-import type { PermissionMode, SDKMessage, SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerStatus, PermissionMode, SDKMessage, SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
 import type { AgentSession, AgentSessionIdentity, PromptImageAttachment } from "./agent-session.js";
+import { notifyTurnComplete, resolveNotificationSettings } from "./notifications.js";
 import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
 import { formatRelativeTime } from "./session-history.js";
+import { exportTranscript } from "./transcript-export.js";
 import type { UsageSummary } from "./usage-ledger.js";
 import { mediaTypeForExtension, readClipboardImage } from "./ui/clipboard-image.js";
 import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } from "./ui/dropped-paths.js";
@@ -18,7 +20,7 @@ import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
 import { usePulse, useSpinner } from "./ui/motion.js";
 import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
-import { resolveTheme, type Theme } from "./ui/theme.js";
+import { getTheme, resolveThemeName, themeCatalog, type Theme, type ThemeName } from "./ui/theme.js";
 import { createVimState, resetVimStateForNewBuffer, stepVim, type VimState } from "./ui/vim-mode.js";
 
 export type ChatAction =
@@ -46,7 +48,7 @@ export interface TranscriptItem {
   readonly streamId?: string | null;
 }
 
-type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind";
+type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp";
 type ContextUsage = {
   readonly totalTokens: number;
   readonly maxTokens: number;
@@ -73,8 +75,11 @@ const commands: readonly Command[] = [
   { name: "/context", description: "Inspect context window usage" },
   { name: "/compact", description: "Summarize the conversation to free up context", shortcut: "[instructions]" },
   { name: "/agents", description: "List available subagents" },
+  { name: "/mcp", description: "Inspect configured MCP servers" },
   { name: "/permissions", description: "Change tool permission mode" },
   { name: "/vim", description: "Toggle vim-style modal editing in the composer" },
+  { name: "/theme", description: "Switch the color theme" },
+  { name: "/export", description: "Export this transcript to a file" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -102,7 +107,9 @@ export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
 function ChatTui({ session, identity, config, models, permissions, loadUsage, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
-  const theme = useMemo(() => resolveTheme(), []);
+  const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
+  const theme = useMemo(() => getTheme(themeName), [themeName]);
+  const notificationSettings = useMemo(() => resolveNotificationSettings(), []);
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
@@ -116,6 +123,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [lastTurnCostUsd, setLastTurnCostUsd] = useState<number>();
   const [sessionCostUsd, setSessionCostUsd] = useState<number>();
   const [contextUsage, setContextUsage] = useState<ContextUsage>();
+  const [mcpServers, setMcpServers] = useState<readonly McpServerStatus[]>([]);
   const [permissionCursor, setPermissionCursor] = useState(1);
   const [pendingPermission, setPendingPermission] = useState<PermissionRequest>();
   const [pendingQuestion, setPendingQuestion] = useState<UserQuestionRequest>();
@@ -225,6 +233,21 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     return () => { active = false; };
   }, []);
 
+  // Turn-completion / permission-wait notifications. Independent of the
+  // subscriptions above: it only observes state they already set, so it
+  // never changes when a response finishes or a permission prompt starts.
+  const wasBusy = useRef(busy);
+  useEffect(() => {
+    if (wasBusy.current && !busy) notifyTurnComplete({ settings: notificationSettings, title: "AlfaCode", body: "Turn finished — back to you." });
+    wasBusy.current = busy;
+  }, [busy, notificationSettings]);
+  const hadPendingPermission = useRef(pendingPermission !== undefined);
+  useEffect(() => {
+    const pending = pendingPermission !== undefined;
+    if (!hadPendingPermission.current && pending) notifyTurnComplete({ settings: notificationSettings, title: "AlfaCode", body: "Waiting on a permission decision." });
+    hadPendingPermission.current = pending;
+  }, [pendingPermission, notificationSettings]);
+
   useInput((text, key) => {
     if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
     if (pendingPermission !== undefined) {
@@ -250,7 +273,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (screen === "providers") { handleProviderInput(text, key); return; }
     if (screen === "permissions") { handlePermissionModeInput(key); return; }
     if (screen === "rewind") { handleRewindInput(key); return; }
-    if (screen === "help" || screen === "usage") return;
+    if (screen === "theme") { handleThemeInput(key); return; }
+    if (screen === "help" || screen === "usage" || screen === "mcp") return;
 
     // Image paste (Ctrl+V always reaches the terminal; Cmd+V only surfaces as key.super under the
     // kitty keyboard protocol — see clipboard-image.ts for why this can't just read stdin) and
@@ -462,6 +486,14 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       setRewindBusy(false);
     }
   }
+  function handleThemeInput(key: Key): void {
+    const index = themeCatalog.findIndex((entry) => entry.name === themeName);
+    // Up/down apply the theme immediately (live preview across the whole
+    // TUI, including this picker); enter just confirms and returns to chat.
+    if (key.upArrow) setThemeName(themeCatalog[Math.max(0, index - 1)]?.name ?? themeName);
+    else if (key.downArrow) setThemeName(themeCatalog[Math.min(themeCatalog.length - 1, index + 1)]?.name ?? themeName);
+    else if (key.return) { setScreen("chat"); appendSystem(setMessages, `Theme: ${themeCatalog.find((entry) => entry.name === themeName)?.label ?? themeName}`); }
+  }
   function handleQuestionInput(text: string, key: Key, request: UserQuestionRequest): void {
     const question = request.questions[questionIndex];
     if (question === undefined) return;
@@ -553,6 +585,21 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       } catch (error: unknown) { appendSystem(setMessages, `Unable to list subagents: ${error instanceof Error ? error.message : String(error)}`); }
       return;
     }
+    if (name === "/mcp") {
+      try {
+        setMcpServers(await session.mcpServerStatus());
+        setScreen("mcp");
+      } catch (error: unknown) { appendSystem(setMessages, `Unable to inspect MCP servers: ${error instanceof Error ? error.message : String(error)}`); }
+      return;
+    }
+    if (name === "/theme") { setScreen("theme"); return; }
+    if (name === "/export") {
+      try {
+        const path = await exportTranscript(messages, { model: activeModel });
+        appendSystem(setMessages, `Transcript exported to ${path}`);
+      } catch (error: unknown) { appendSystem(setMessages, `Export failed: ${error instanceof Error ? error.message : String(error)}`); }
+      return;
+    }
     sendPrompt(command);
   }
   function reportFailure(label: string, promise: Promise<unknown>, onSuccess?: () => void): void {
@@ -567,6 +614,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={width - 6} /> : null}
       {screen === "permissions" ? <PermissionPicker selected={permissionMode} theme={theme} /> : null}
+      {screen === "theme" ? <ThemePicker selected={themeName} theme={theme} /> : null}
+      {screen === "mcp" ? <McpPanel servers={mcpServers} theme={theme} /> : null}
       {screen === "help" ? <Help theme={theme} commands={availableCommands} /> : null}
       {screen === "rewind" ? <RewindMenu checkpoints={visibleCheckpoints} cursor={rewindCursor} busy={rewindBusy} theme={theme} /> : null}
     </Box>
@@ -722,6 +771,29 @@ function PermissionPicker({ selected, theme }: { readonly selected: PermissionMo
   const descriptions: Partial<Record<PermissionMode, string>> = { default: "Ask before sensitive actions", acceptEdits: "Accept file edits", plan: "Read-only planning", dontAsk: "Deny unapproved actions", bypassPermissions: "Bypass every prompt", auto: "Engine evaluates risk automatically" };
   return <Box flexDirection="column"><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.text}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>↑↓ select · enter apply · esc back</HintBar></Box>;
 }
+function ThemePicker({ selected, theme }: { readonly selected: ThemeName; readonly theme: Theme }): React.JSX.Element {
+  return <Box flexDirection="column"><SectionTitle title="Theme" detail="dark, light, and colorblind-friendly variants" theme={theme} />{themeCatalog.map((entry) => {
+    const active = selected === entry.name;
+    return <Box key={entry.name} flexDirection="column" paddingLeft={active ? 0 : 2}>
+      <Text color={active ? entry.theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{entry.label}</Text>{entry.theme.colorblindSafe ? <Text color={theme.faint}> · daltonized</Text> : null}</Text>
+      {active ? <Text color={theme.faint}>  {entry.description}</Text> : null}
+    </Box>;
+  })}<HintBar theme={theme}>↑↓ preview live · enter confirm · esc back</HintBar></Box>;
+}
+
+function McpPanel({ servers, theme }: { readonly servers: readonly McpServerStatus[]; readonly theme: Theme }): React.JSX.Element {
+  if (servers.length === 0) return <Box flexDirection="column"><SectionTitle title="MCP servers" detail="0 configured" theme={theme} /><Text color={theme.muted}>No MCP servers are configured for this session.</Text><HintBar theme={theme}>esc back</HintBar></Box>;
+  return <Box flexDirection="column"><SectionTitle title="MCP servers" detail={`${servers.length} configured`} theme={theme} />{servers.map((server) => {
+    const toolCount = server.tools?.length ?? 0;
+    const tone = server.status === "connected" ? "success" : server.status === "pending" || server.status === "needs-auth" ? "warning" : server.status === "disabled" ? "muted" : "danger";
+    return <Box key={server.name} flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}>
+      <Box justifyContent="space-between"><Text bold color={theme.text}>{server.name}</Text><StatusBadge label={server.status} tone={tone} theme={theme} /></Box>
+      <Text color={theme.muted}>{toolCount} tool{toolCount === 1 ? "" : "s"}{server.scope === undefined ? "" : ` · ${server.scope}`}</Text>
+      {server.error === undefined ? null : <Text color={theme.danger} wrap="truncate-end">{sanitizeTerminalText(server.error)}</Text>}
+    </Box>;
+  })}<HintBar theme={theme}>esc back</HintBar></Box>;
+}
+
 function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const question = request.questions[questionIndex];
   if (question === undefined) return <></>;

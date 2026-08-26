@@ -47,6 +47,7 @@ function queryHarness(claudeCodeVersion: string): {
     supportedAgents: vi.fn(async () => []),
     getContextUsage: vi.fn(async () => ({ totalTokens: 0, maxTokens: 1, rawMaxTokens: 1, percentage: 0, categories: [], gridRows: [], model: "route/model", memoryFiles: [] })),
     rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: ["a.ts"], insertions: 1, deletions: 0 })),
+    mcpServerStatus: vi.fn(async () => [{ name: "docs", status: "connected", tools: [{ name: "search" }] }]),
   } as unknown as Query;
   const queryFactory = ((input: { prompt: AsyncIterable<unknown>; options: { permissionMode: unknown } }) => {
     prompt = input.prompt;
@@ -101,6 +102,7 @@ describe("AgentSession", () => {
       compatibility: { status: "compatible", compatible: true, actual: PINNED_CLAUDE_CODE_VERSION },
     });
     expect(harness.query.setPermissionMode).toHaveBeenCalledWith("default");
+    await expect(session.mcpServerStatus()).resolves.toEqual([{ name: "docs", status: "connected", tools: [{ name: "search" }] }]);
     await session.close();
     expect(harness.query.close).toHaveBeenCalled();
     expect(runtimeClose).toHaveBeenCalledOnce();

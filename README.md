@@ -43,7 +43,9 @@ Your normal `claude` installation is left untouched. AlfaCode has its own comman
 - Render terminal-safe Markdown: headings, emphasis, quotes, task lists, links, code fences, line numbers, and responsive tables.
 - Answer tool-driven questions through single choice, multiple choice, previews, custom answers, and consecutive question flows.
 - Watch tool calls and subagents live, with the same structured engine contracts used by Claude Code.
-- Switch between adaptive dark/light themes; animation automatically respects reduced-motion and non-interactive environments.
+- Switch between four built-in themes with `/theme` — dark, light, and colorblind-friendly ("daltonized") dark/light variants built on the Okabe–Ito palette; animation automatically respects reduced-motion and non-interactive environments.
+- Get a terminal bell (and, opt-in, a macOS notification) when a response finishes or a permission prompt is waiting.
+- Export the current conversation to a Markdown file with `/export`.
 
 ## Quick start
 
@@ -155,8 +157,11 @@ alfacode run --non-interactive -- -p "Run the test suite and explain any failure
 | `/connect` | Add another provider without exposing its credential to chat. |
 | `/usage` | Inspect context and locally recorded token usage. |
 | `/agents` | List the subagents exposed by the pinned engine. |
+| `/mcp` | Show configured MCP servers, their connection status, and tool counts. |
 | `/permissions` | Change the tool permission mode. |
 | `/vim` | Toggle vim-style modal editing in the composer. |
+| `/theme` | Switch between dark, light, and colorblind-friendly ("daltonized") themes. |
+| `/export` | Export the current transcript to a Markdown file under `~/.alfacode/exports/`. |
 | `/clear` | Clear the visible transcript. |
 | `/help` | Show commands and keyboard shortcuts. |
 | `/exit` | Close AlfaCode cleanly. |
@@ -167,6 +172,18 @@ The composer supports cursor editing, multiline input, paste, prompt history, co
 - **`@` file mentions** — type `@` for a filtered, navigable popup of files/directories under the working directory (same navigate/tab pattern as the `/` command palette).
 - **Image paste** — `Ctrl+V` (or `Cmd+V` on terminals that support the kitty keyboard protocol) attaches whatever image is on the system clipboard, shown in the composer as `[Image #N]`.
 - **Drag-and-drop** — dropping a file onto the terminal (delivered by most terminals as a pasted path) is detected and turned into an `@`-mention, or attached directly if it's an image.
+
+### Themes
+
+`/theme` opens a live picker across four built-in themes: `dark`, `light`, `dark-daltonized`, and `light-daltonized`. The daltonized variants use hues from the Okabe–Ito color-universal-design palette and avoid pairing red against green for success/warning/danger, so they stay distinguishable under the common forms of color-blindness. Set `ALFACODE_THEME` (any of the four names) to choose one non-interactively at launch; otherwise AlfaCode infers dark or light from `COLORFGBG`. Theme selection made through `/theme` is session-scoped — it does not persist across restarts.
+
+### Notifications
+
+AlfaCode rings the terminal bell (`\x07`) when a response finishes or a permission prompt starts waiting — on by default, disable with `ALFACODE_NOTIFY_BELL=0`. Most macOS terminals (Terminal.app, iTerm2, Ghostty, …) already turn an unfocused bell into a dock badge or banner when that terminal preference is enabled, so this is the practical way to get "notify me when I'm not looking" without AlfaCode guessing at window focus. Set `ALFACODE_NOTIFY_DESKTOP=1` to additionally fire a best-effort macOS notification (`osascript -e 'display notification …'`); it is off by default, non-blocking, and a failure to notify never affects the session.
+
+### MCP servers
+
+`/mcp` shows the MCP servers configured for the current session — name, connection status (`connected`, `pending`, `needs-auth`, `failed`, `disabled`), and tool count — sourced live from the pinned engine. AlfaCode does not manage MCP servers itself; configure them the same way you would for Claude Code (project `.mcp.json`, user settings, etc.).
 
 ## CLI reference
 
@@ -214,7 +231,7 @@ Usage records contain counters and routing metadata, not prompt or response bodi
 - Every process receives a high-entropy ephemeral gateway credential.
 - API keys are stored in macOS Keychain or read from explicitly named environment variables.
 - Config files contain secret references, never secret bytes.
-- Prompt and response bodies are not written to AlfaCode logs or usage records.
+- Prompt and response bodies are not written to AlfaCode logs or usage records. The one exception is explicit: `/export` writes the visible transcript to a file only when you run it.
 - Configuration files are owner-only, atomically written, and rejected when insecurely permissioned or symlinked.
 - AlfaCode never edits your normal Claude Code configuration directory.
 
@@ -229,6 +246,7 @@ Requests still contain repository context and are sent to the selected provider.
 | `~/.alfacode/usage/` | Content-free local usage ledger. |
 | `~/.alfacode/catalog/` | Validated dynamic catalog cache. |
 | `~/.alfacode/state/` | Model selection and provider continuation state. |
+| `~/.alfacode/exports/` | Markdown transcripts written by `/export`, owner-only. |
 | macOS Keychain service `alfacode` | Provider secret bytes entered through the TUI. |
 
 Read [SECURITY.md](SECURITY.md) before reporting a vulnerability. Never put real keys, private source, prompts, or customer data in a public issue.
