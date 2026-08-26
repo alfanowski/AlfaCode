@@ -56,17 +56,27 @@ export function splitAtCursor(state: EditorState): { readonly before: string; re
   };
 }
 
+/** Character offset (start inclusive, end exclusive of the line break) of the line containing `index`. Reused by vim-mode.ts for line-wise motions/operators. */
+export function lineRange(value: string, index: number): { readonly start: number; readonly end: number } {
+  const clamped = clampCursor(value, index);
+  const start = value.lastIndexOf("\n", clamped - 1) + 1;
+  const nextBreak = value.indexOf("\n", clamped);
+  const end = nextBreak === -1 ? value.length : nextBreak;
+  return { start, end };
+}
+
 function clampCursor(value: string, cursor: number): number {
   return Math.max(0, Math.min(value.length, cursor));
 }
 
-function previousCodePoint(value: string, cursor: number): number {
+/** Exported so callers extending cursor movement (e.g. vim-mode motions) stay UTF-16-surrogate-pair-safe instead of re-deriving this. */
+export function previousCodePoint(value: string, cursor: number): number {
   if (cursor <= 0) return 0;
   const code = value.charCodeAt(cursor - 1);
   return code >= 0xDC00 && code <= 0xDFFF ? Math.max(0, cursor - 2) : cursor - 1;
 }
 
-function nextCodePoint(value: string, cursor: number): number {
+export function nextCodePoint(value: string, cursor: number): number {
   if (cursor >= value.length) return value.length;
   const code = value.charCodeAt(cursor);
   return code >= 0xD800 && code <= 0xDBFF ? Math.min(value.length, cursor + 2) : cursor + 1;

@@ -1,3 +1,5 @@
+import { stat as statFile, readFile as readFileBytes } from "node:fs/promises";
+import { relative as relativePath } from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
@@ -5,15 +7,19 @@ import type { PermissionMode, SDKMessage, SDKResultMessage } from "@anthropic-ai
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
-import type { AgentSession, AgentSessionIdentity } from "./agent-session.js";
+import type { AgentSession, AgentSessionIdentity, PromptImageAttachment } from "./agent-session.js";
 import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
 import { formatRelativeTime } from "./session-history.js";
 import type { UsageSummary } from "./usage-ledger.js";
+import { mediaTypeForExtension, readClipboardImage } from "./ui/clipboard-image.js";
+import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } from "./ui/dropped-paths.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
+import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
 import { usePulse, useSpinner } from "./ui/motion.js";
 import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import { resolveTheme, type Theme } from "./ui/theme.js";
+import { createVimState, resetVimStateForNewBuffer, stepVim, type VimState } from "./ui/vim-mode.js";
 
 export type ChatAction =
   | { readonly type: "exit" }
@@ -53,6 +59,8 @@ type ContextUsage = {
 };
 interface Command { readonly name: string; readonly description: string; readonly shortcut?: string }
 interface Checkpoint { readonly uuid: string; readonly text: string; readonly transcriptItemId: string; readonly at: number }
+/** A pasted/dropped image pending on the next submitted prompt, referenced in the composer text as `[Image #id]`. */
+interface ImageAttachment { readonly id: number; readonly mediaType: PromptImageAttachment["mediaType"]; readonly base64: string }
 
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
 const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
@@ -66,12 +74,19 @@ const commands: readonly Command[] = [
   { name: "/compact", description: "Summarize the conversation to free up context", shortcut: "[instructions]" },
   { name: "/agents", description: "List available subagents" },
   { name: "/permissions", description: "Change tool permission mode" },
+  { name: "/vim", description: "Toggle vim-style modal editing in the composer" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
 ];
 /** Usage percentage at which we nudge toward /compact, when the engine doesn't report its own. */
 const defaultContextWarningThreshold = 80;
+
+/** `src/config.ts` (persisted settings) is out of scope for this composer work, so the "config setting" toggle for vim mode is an environment variable, matching the existing `ALFACODE_THEME`/`ALFACODE_REDUCED_MOTION` convention in `src/ui/theme.ts`. `/vim` toggles it for the rest of the session either way. */
+export function resolveInitialVimMode(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const requested = environment.ALFACODE_VIM_MODE?.trim().toLowerCase();
+  return requested === "1" || requested === "true" || requested === "yes" || requested === "on";
+}
 
 export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let resolveAction!: (action: ChatAction) => void;
@@ -120,10 +135,16 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const [rewindCursor, setRewindCursor] = useState(0);
   const [rewindBusy, setRewindBusy] = useState(false);
   const [historySearch, setHistorySearch] = useState<{ readonly query: string; readonly index: number }>();
+  const [vimEnabled, setVimEnabled] = useState(resolveInitialVimMode);
+  const [vim, setVim] = useState<VimState>(createVimState);
+  const [mentionEntries, setMentionEntries] = useState<readonly MentionEntry[]>([]);
+  const [mentionCursor, setMentionCursor] = useState(0);
+  const [attachments, setAttachments] = useState<readonly ImageAttachment[]>([]);
   const pendingTurns = useRef(0);
   const contextWarnedRef = useRef(false);
   const previousSessionCostRef = useRef(0);
   const lastEscapeAtRef = useRef(0);
+  const imageSequence = useRef(0);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
@@ -134,9 +155,11 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   const commandMatches = useMemo(() => commandSuggestions(editor.value, availableCommands), [availableCommands, editor.value]);
   const historyMatches = useMemo(() => historySearch === undefined ? [] : historySearchMatches(history, historySearch.query), [history, historySearch]);
   const visibleCheckpoints = useMemo(() => checkpoints.slice(-20), [checkpoints]);
+  const mentionQuery = useMemo(() => commandMatches.length > 0 ? undefined : activeMentionQuery(editor.value, editor.cursor), [commandMatches, editor.cursor, editor.value]);
+  const mentionMatches = useMemo(() => mentionQuery === undefined ? [] : filterMentionEntries(mentionEntries, mentionQuery.query), [mentionEntries, mentionQuery]);
   const width = Math.max(48, stdout.columns ?? 100);
   const blockingPanelRows = pendingQuestion === undefined ? pendingPermission === undefined ? 0 : 8 : 16;
-  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 ? 17 : 11) - blockingPanelRows);
+  const transcriptRows = Math.max(blockingPanelRows > 0 ? 3 : 8, (stdout.rows ?? 30) - (commandMatches.length > 0 || mentionMatches.length > 0 ? 17 : 11) - blockingPanelRows);
   const visibleMessages = useMemo(() => tailItemsByRows(messages, transcriptRows, width - 6), [messages, transcriptRows, width]);
   const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
 
@@ -196,6 +219,12 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     }
   }), [permissions]);
 
+  useEffect(() => {
+    let active = true;
+    void listMentionEntries(process.cwd()).then((entries) => { if (active) setMentionEntries(entries); }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
   useInput((text, key) => {
     if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
     if (pendingPermission !== undefined) {
@@ -222,6 +251,16 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (screen === "permissions") { handlePermissionModeInput(key); return; }
     if (screen === "rewind") { handleRewindInput(key); return; }
     if (screen === "help" || screen === "usage") return;
+
+    // Image paste (Ctrl+V always reaches the terminal; Cmd+V only surfaces as key.super under the
+    // kitty keyboard protocol — see clipboard-image.ts for why this can't just read stdin) and
+    // drag-and-drop (delivered by most terminals as a plain pasted path) are handled ahead of
+    // everything else so they work the same regardless of vim mode or an open palette.
+    if ((key.ctrl || key.super) && text.toLowerCase() === "v") { handleImagePasteShortcut(); return; }
+    if (!key.ctrl && !key.meta && text.length > 1) {
+      const dropped = detectDroppedPaths(text);
+      if (dropped !== undefined) { void handleDroppedPaste(text, dropped); return; }
+    }
 
     if (historySearch !== undefined) { handleHistorySearchInput(text, key); return; }
     if (key.ctrl && text === "r") { setHistorySearch({ query: "", index: 0 }); return; }
@@ -250,10 +289,28 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       if (completion !== undefined) setEditor({ value: completion, cursor: completion.length });
       return;
     }
+    if (mentionQuery !== undefined && mentionMatches.length > 0 && key.upArrow) { setMentionCursor((current) => Math.max(0, current - 1)); return; }
+    if (mentionQuery !== undefined && mentionMatches.length > 0 && key.downArrow) { setMentionCursor((current) => Math.min(mentionMatches.length - 1, current + 1)); return; }
+    if (mentionQuery !== undefined && mentionMatches.length > 0 && key.tab) {
+      const entry = mentionMatches[mentionCursor];
+      if (entry !== undefined) setEditor(insertMention(editor.value, mentionQuery, entry));
+      setMentionCursor(0);
+      return;
+    }
     if (key.tab && editor.value.length === 0 && promptSuggestion !== undefined) {
       setEditor({ value: promptSuggestion, cursor: promptSuggestion.length });
       setPromptSuggestion(undefined);
       return;
+    }
+    if (vimEnabled) {
+      const step = stepVim(editor, vim, text, key);
+      if (step.handled) {
+        setEditor(step.editor);
+        setVim(step.vim);
+        setCommandCursor(0);
+        setMentionCursor(0);
+        return;
+      }
     }
     if (key.upArrow) { navigateHistory(1); return; }
     if (key.downArrow) { navigateHistory(-1); return; }
@@ -264,8 +321,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (key.ctrl && text === "u") { applyEdit({ type: "delete-to-start" }); return; }
     if (key.ctrl && text === "k") { applyEdit({ type: "delete-to-end" }); return; }
     if (key.ctrl && text === "w") { applyEdit({ type: "delete-word" }); return; }
-    if (key.backspace) { applyEdit({ type: "backspace" }); setCommandCursor(0); return; }
-    if (key.delete) { applyEdit({ type: "delete" }); setCommandCursor(0); return; }
+    if (key.backspace) { applyEdit({ type: "backspace" }); setCommandCursor(0); setMentionCursor(0); return; }
+    if (key.delete) { applyEdit({ type: "delete" }); setCommandCursor(0); setMentionCursor(0); return; }
     if (key.escape && editor.value.length > 0) { clearEditor(); return; }
     if (key.return && key.shift) { applyEdit({ type: "insert", text: "\n" }); return; }
     if (key.return) { submitEditor(); return; }
@@ -273,12 +330,13 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       setPromptSuggestion(undefined);
       applyEdit({ type: "insert", text: sanitizeTerminalText(text) });
       setCommandCursor(0);
+      setMentionCursor(0);
       setHistoryCursor(-1);
     }
   });
 
   function applyEdit(operation: Parameters<typeof editInput>[1]): void { setEditor((current) => editInput(current, operation)); }
-  function clearEditor(): void { setEditor({ value: "", cursor: 0 }); setCommandCursor(0); setHistoryCursor(-1); }
+  function clearEditor(): void { setEditor({ value: "", cursor: 0 }); setCommandCursor(0); setMentionCursor(0); setHistoryCursor(-1); setVim(resetVimStateForNewBuffer); }
   function navigateHistory(direction: 1 | -1): void {
     if (history.length === 0) return;
     const next = Math.max(-1, Math.min(history.length - 1, historyCursor + direction));
@@ -296,18 +354,51 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   }
   function sendPrompt(prompt: string): void {
     setPromptSuggestion(undefined);
+    const relevantAttachments = attachments.filter((attachment) => prompt.includes(`[Image #${attachment.id}]`));
+    setAttachments([]);
     const itemId = createTranscriptItemId("user");
     setMessages((current) => [...current, { id: itemId, role: "user", text: prompt }]);
     pendingTurns.current += 1;
     setBusy(true);
     try {
-      const uuid = session.sendPrompt(prompt);
+      const uuid = session.sendPrompt(prompt, relevantAttachments.map((attachment) => ({ mediaType: attachment.mediaType, base64: attachment.base64 })));
       setCheckpoints((current) => [...current, { uuid, text: prompt, transcriptItemId: itemId, at: Date.now() }]);
     } catch (error: unknown) {
       pendingTurns.current = Math.max(0, pendingTurns.current - 1);
       setBusy(pendingTurns.current > 0);
       appendSystem(setMessages, error instanceof Error ? error.message : String(error));
     }
+  }
+  /** Reserves the `[Image #N]` index synchronously so two rapid pastes can't collide, then resolves the OS clipboard read (see clipboard-image.ts) before inserting the placeholder and queuing the attachment. */
+  function handleImagePasteShortcut(): void {
+    imageSequence.current += 1;
+    const id = imageSequence.current;
+    void readClipboardImage().then((image) => {
+      if (image === undefined) { appendSystem(setMessages, "Clipboard doesn't contain an image."); return; }
+      setAttachments((current) => [...current, { id, mediaType: image.mediaType, base64: image.base64 }]);
+      applyEdit({ type: "insert", text: `[Image #${id}] ` });
+    });
+  }
+  /** Verifies the paste's candidate paths actually exist (see dropped-paths.ts) before treating them as a drop; falls back to inserting the raw pasted text otherwise. Dropped images are read and attached exactly like a clipboard paste; other paths become @-mentions. */
+  async function handleDroppedPaste(rawText: string, candidates: readonly DroppedPathCandidate[]): Promise<void> {
+    const resolved = await resolveDroppedPaths(candidates, async (path) => statFile(path));
+    if (resolved.length === 0) { applyEdit({ type: "insert", text: sanitizeTerminalText(rawText) }); return; }
+    const parts: string[] = [];
+    for (const entry of resolved) {
+      const mediaType = entry.isDirectory ? undefined : mediaTypeForExtension(entry.absolutePath);
+      if (mediaType !== undefined) {
+        try {
+          const bytes = await readFileBytes(entry.absolutePath);
+          imageSequence.current += 1;
+          const id = imageSequence.current;
+          setAttachments((current) => [...current, { id, mediaType, base64: bytes.toString("base64") }]);
+          parts.push(`[Image #${id}]`);
+          continue;
+        } catch { /* unreadable — fall back to a plain @mention below */ }
+      }
+      parts.push(`@${toMentionPath(entry.absolutePath)}${entry.isDirectory ? "/" : ""}`);
+    }
+    applyEdit({ type: "insert", text: `${parts.join(" ")} ` });
   }
   function handleModelInput(text: string, key: Key): void {
     if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
@@ -444,6 +535,13 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
     if (name === "/providers") { setScreen("providers"); return; }
     if (name === "/model") { setScreen("models"); return; }
     if (name === "/permissions") { setScreen("permissions"); return; }
+    if (name === "/vim") {
+      const next = !vimEnabled;
+      setVimEnabled(next);
+      setVim(createVimState());
+      appendSystem(setMessages, `Vim mode ${next ? "enabled (starting in NORMAL — press i to insert)" : "disabled"}.`);
+      return;
+    }
     if (name === "/help") { setScreen("help"); return; }
     if (name === "/clear") { setMessages([]); return; }
     if (name === "/exit" || name === "/quit") return finish({ type: "exit" });
@@ -472,10 +570,11 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
       {screen === "help" ? <Help theme={theme} commands={availableCommands} /> : null}
       {screen === "rewind" ? <RewindMenu checkpoints={visibleCheckpoints} cursor={rewindCursor} busy={rewindBusy} theme={theme} /> : null}
     </Box>
-    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} /> : null}
+    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} />
+      : screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && mentionQuery !== undefined && mentionMatches.length > 0 ? <MentionPalette entries={mentionMatches} cursor={mentionCursor} theme={theme} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
-      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
+      : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} vim={vimEnabled ? vim : undefined} attachmentCount={attachments.length} theme={theme} width={width} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} theme={theme} />}
   </Box>;
 }
 
@@ -547,7 +646,7 @@ function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly
 }
 function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
 
-function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostUsd, checkpointCount, historySearch, historyMatches, messages, suggestion, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly lastTurnCostUsd: number | undefined; readonly checkpointCount: number; readonly historySearch: { readonly query: string; readonly index: number } | undefined; readonly historyMatches: readonly string[]; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostUsd, checkpointCount, historySearch, historyMatches, messages, suggestion, vim, attachmentCount, theme, width }: { readonly editor: EditorState; readonly busy: boolean; readonly screen: Screen; readonly context: ContextUsage | undefined; readonly lastTurnTokens: number | undefined; readonly lastTurnCostUsd: number | undefined; readonly checkpointCount: number; readonly historySearch: { readonly query: string; readonly index: number } | undefined; readonly historyMatches: readonly string[]; readonly messages: readonly TranscriptItem[]; readonly suggestion: string | undefined; readonly vim: VimState | undefined; readonly attachmentCount: number; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   if (historySearch !== undefined) {
     const match = historyMatches[historySearch.index % Math.max(1, historyMatches.length)];
     return <Box flexDirection="column" marginTop={1}>
@@ -564,10 +663,12 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
   const contextLeft = context === undefined ? undefined : Math.max(0, context.maxTokens - context.totalTokens);
   const compact = width < 96;
   const canRewind = screen === "chat" && !busy && editor.value.length === 0 && checkpointCount > 0;
-  const leftHint = screen !== "chat" ? "esc back" : suggestion !== undefined && editor.value.length === 0 ? "tab accept · type dismisses" : busy ? "ctrl+c stop · type to queue" : compact ? `↵ send · ⇧↵ newline · / commands${canRewind ? " · esc esc rewind" : ""}` : `enter send · shift+enter newline · / commands${canRewind ? " · esc esc rewind" : ""}`;
-  const rightHint = `${promptTokens > 0 ? `~${formatCompact(promptTokens)} draft · ` : ""}${lastTurnTokens === undefined ? "" : `${formatCompact(lastTurnTokens)} turn · `}${lastTurnCostUsd === undefined ? "" : `${formatCostUsd(lastTurnCostUsd)} turn · `}${contextLeft === undefined ? "ctx —" : `${formatCompact(contextLeft)} ctx left`}`;
+  const vimHint = vim === undefined ? undefined : vim.mode === "insert" ? "esc normal mode" : vim.mode === "visual" ? "y/d/c act on selection · esc cancel" : "i insert · hjkl/w/b/e move · dd/dw/cc/cw/yy/p/u edit";
+  const leftHint = screen !== "chat" ? "esc back" : vimHint !== undefined ? vimHint : suggestion !== undefined && editor.value.length === 0 ? "tab accept · type dismisses" : busy ? "ctrl+c stop · type to queue" : compact ? `↵ send · ⇧↵ newline · / commands${canRewind ? " · esc esc rewind" : ""}` : `enter send · shift+enter newline · / commands${canRewind ? " · esc esc rewind" : ""}`;
+  const rightHint = `${attachmentCount > 0 ? `${attachmentCount} image${attachmentCount === 1 ? "" : "s"} · ` : ""}${promptTokens > 0 ? `~${formatCompact(promptTokens)} draft · ` : ""}${lastTurnTokens === undefined ? "" : `${formatCompact(lastTurnTokens)} turn · `}${lastTurnCostUsd === undefined ? "" : `${formatCostUsd(lastTurnCostUsd)} turn · `}${contextLeft === undefined ? "ctx —" : `${formatCompact(contextLeft)} ctx left`}`;
   return <Box flexDirection="column" marginTop={1}>
     <Box borderStyle="round" borderColor={busy ? theme.secondary : screen === "chat" ? theme.accent : theme.border} paddingX={1} minHeight={3}>
+      {vim === undefined ? null : <Text bold color={vim.mode === "insert" ? theme.success : vim.mode === "visual" ? theme.secondary : theme.warning}>{vim.mode.toUpperCase()} </Text>}
       <Text bold color={theme.accent}>❯ </Text>
       {screen !== "chat" ? <Text color={theme.faint}>Press Esc to return to chat</Text> : editor.value.length === 0 ? <Text><Text inverse color={theme.text}> </Text><Text color={suggestion === undefined ? theme.faint : theme.muted}>{suggestion ?? contextualHint(messages, busy)}</Text></Text> : <Text wrap="wrap"><Text color={theme.text}>{split.before}</Text><Text inverse color={theme.text}>{split.cursor}</Text><Text color={theme.text}>{split.after}</Text></Text>}
     </Box>
@@ -578,6 +679,12 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
 function CommandPalette({ commands: matches, cursor, theme }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, matches.length - 6)));
   return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
+}
+
+/** Mirrors CommandPalette's navigate/tab/accept interaction on purpose — see mentions.ts. */
+function MentionPalette({ entries, cursor, theme }: { readonly entries: readonly MentionEntry[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+  const start = Math.max(0, Math.min(cursor - 2, Math.max(0, entries.length - 6)));
+  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath}><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
 }
 
 function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
@@ -645,7 +752,7 @@ function PermissionCard({ request, cursor, theme }: { readonly request: Permissi
   const options = request.suggestions.length > 0 ? ["Deny", "Allow once", "Always allow"] : ["Deny", "Allow once"];
   return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}><Text bold color={theme.warning}>⚠ {request.title ?? `${request.toolName} requests permission`}</Text>{request.description ? <Text color={theme.text}>{request.description}</Text> : null}<Text color={theme.muted} wrap="truncate-end">{permissionInputSummary(request)}</Text>{request.reason ? <Text color={theme.faint}>{request.reason}</Text> : null}<Box marginTop={1} columnGap={2}>{options.map((option, index) => <Text key={option} bold={index === cursor} inverse={index === cursor} color={index === 0 ? theme.danger : theme.success}> {option} </Text>)}</Box><Text color={theme.faint}>←→ choose · enter confirm</Text></Box>;
 }
-function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ctrl+r search history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>esc esc on an empty prompt rewinds · shift+tab cycles permission mode · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
+function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ctrl+r search history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>esc esc on an empty prompt rewinds · shift+tab cycles permission mode · ctrl+c interrupts or exits</Text><Text>@ mentions a file · ctrl+v pastes a clipboard image · /vim toggles modal editing</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
 function RewindMenu({ checkpoints: entries, cursor, busy, theme }: { readonly checkpoints: readonly Checkpoint[]; readonly cursor: number; readonly busy: boolean; readonly theme: Theme }): React.JSX.Element {
   if (entries.length === 0) return <Text color={theme.muted}>Nothing to rewind to yet.</Text>;
   return <Box flexDirection="column">
@@ -718,6 +825,7 @@ export function createTranscriptItemId(prefix: "user" | "assistant" | "system"):
 function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: createTranscriptItemId("system"), role: "system", text: sanitizeTerminalText(text) }]); }
 function shortModel(model: string): string { return decodeModelId(model)?.upstreamModel ?? model.split("/").at(-1) ?? model; }
 function providerFromRoute(model: string): string { return decodeModelId(model)?.providerId ?? model.split("/")[0] ?? "auto"; }
+function toMentionPath(absolutePath: string): string { const relative = relativePath(process.cwd(), absolutePath); return relative.startsWith("..") ? absolutePath : relative; }
 function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return compactNumberFormatter.format(value); }
 function estimateTokens(value: string): number { return value.length === 0 ? 0 : Math.max(1, Math.ceil(value.length / 4)); }
 function attemptHasUsage(attempt: UsageSummary["attempts"][number]): boolean { return attempt.totalTokens !== undefined || attempt.inputTokens !== undefined || attempt.outputTokens !== undefined; }

@@ -156,11 +156,17 @@ alfacode run --non-interactive -- -p "Run the test suite and explain any failure
 | `/usage` | Inspect context and locally recorded token usage. |
 | `/agents` | List the subagents exposed by the pinned engine. |
 | `/permissions` | Change the tool permission mode. |
+| `/vim` | Toggle vim-style modal editing in the composer. |
 | `/clear` | Clear the visible transcript. |
 | `/help` | Show commands and keyboard shortcuts. |
 | `/exit` | Close AlfaCode cleanly. |
 
-The composer supports cursor editing, multiline input, paste, prompt history, common Unix editing shortcuts, filtered slash commands, and engine-generated follow-up suggestions accepted with `Tab`.
+The composer supports cursor editing, multiline input, paste, prompt history, common Unix editing shortcuts, filtered slash commands, and engine-generated follow-up suggestions accepted with `Tab`. It also supports:
+
+- **Vim mode** — `/vim`, or set `ALFACODE_VIM_MODE=1`, for modal NORMAL/INSERT/VISUAL editing: `hjkl`, `w`/`b`/`e`, `0`/`$`, `gg`/`G` motions; `x`, `dd`, `dw`, `cc`, `cw`, `yy`/`p`, `u` edits (and the operator table composes further, e.g. `d$`, `yG`, `cj`).
+- **`@` file mentions** — type `@` for a filtered, navigable popup of files/directories under the working directory (same navigate/tab pattern as the `/` command palette).
+- **Image paste** — `Ctrl+V` (or `Cmd+V` on terminals that support the kitty keyboard protocol) attaches whatever image is on the system clipboard, shown in the composer as `[Image #N]`.
+- **Drag-and-drop** — dropping a file onto the terminal (delivered by most terminals as a pasted path) is detected and turned into an `@`-mention, or attached directly if it's an image.
 
 ## CLI reference
 
