@@ -212,6 +212,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const contextWarnedRef = useRef(false);
   const previousSessionCostRef = useRef(0);
   const lastEscapeAtRef = useRef(0);
+  const lastCtrlCAtRef = useRef(0);
   const imageSequence = useRef(0);
   const toolBellTimers = useRef(new Map<string, NodeJS.Timeout>());
   const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
@@ -403,7 +404,15 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       return;
     }
     if (key.ctrl && text === "c") {
-      if (busy) reportFailure("Interrupt", session.interrupt()); else finish({ type: "exit" });
+      if (busy) { reportFailure("Interrupt", session.interrupt()); return; }
+      // Matches Claude Code/OpenCode: idle Ctrl+C needs a second press within the window to
+      // actually exit, so it can't discard a session on a stray keystroke. Busy Ctrl+C above stays
+      // a single press — interrupting an in-flight turn is a different, more urgent action than
+      // exiting, and the existing double-Esc-to-rewind window (900ms) is reused for consistency.
+      const now = Date.now();
+      if (now - lastCtrlCAtRef.current < 900) { finish({ type: "exit" }); return; }
+      lastCtrlCAtRef.current = now;
+      appendSystem(setMessages, "Press Ctrl+C again to exit.");
       return;
     }
     if (key.escape && screen !== "chat") { setScreen("chat"); clearEditor(); return; }
@@ -1221,7 +1230,7 @@ function PermissionCard({ request, cursor, comment, commentMode, commentEditor, 
         </>}
   </Box>;
 }
-function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ctrl+r search history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>esc esc on an empty prompt rewinds · shift+tab cycles permission mode · ctrl+o toggles tool detail · ctrl+t toggles tasks panel</Text><Text>@ mentions a file · ctrl+v pastes a clipboard image · /vim toggles modal editing</Text><Text>tab while a permission is focused attaches an audit note · ctrl+c interrupts or exits</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
+function Help({ theme, commands: available }: { readonly theme: Theme; readonly commands: readonly Command[] }): React.JSX.Element { return <Box flexDirection="column"><SectionTitle title="Commands & shortcuts" detail={`${available.length} AlfaCode and engine commands available`} theme={theme} />{available.slice(0, 12).map((command) => <Box key={command.name}><Box width={18}><Text bold color={theme.accent}>{command.name}</Text></Box><Text color={theme.muted}>{command.description}</Text></Box>)}{available.length > 12 ? <Text color={theme.faint}>Type / and search to browse all {available.length} commands.</Text> : null}<Box marginTop={1} flexDirection="column"><Text bold color={theme.muted}>COMPOSER</Text><Text>↑↓ history · ctrl+r search history · ←→ cursor · home/end · ctrl+u/k/w · shift+enter newline</Text><Text>esc esc on an empty prompt rewinds · shift+tab cycles permission mode · ctrl+o toggles tool detail · ctrl+t toggles tasks panel</Text><Text>@ mentions a file · ctrl+v pastes a clipboard image · /vim toggles modal editing</Text><Text>tab while a permission is focused attaches an audit note · ctrl+c interrupts a running turn, or press it twice to exit</Text></Box><HintBar theme={theme}>esc back</HintBar></Box>; }
 function RewindMenu({ checkpoints: entries, cursor, busy, theme }: { readonly checkpoints: readonly Checkpoint[]; readonly cursor: number; readonly busy: boolean; readonly theme: Theme }): React.JSX.Element {
   if (entries.length === 0) return <Text color={theme.muted}>Nothing to rewind to yet.</Text>;
   return <Box flexDirection="column">
