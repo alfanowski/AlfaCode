@@ -59,4 +59,23 @@ describe("models.dev runtime metadata", () => {
       environmentVariables: ["API_KEY"],
     });
   });
+
+  it("only surfaces a suggested base URL for providers with a well-formed https or loopback-http api endpoint", () => {
+    // Regression test: the real upstream models.dev catalog legitimately contains local-gateway
+    // provider entries (e.g. LM Studio) with a loopback http:// api field, and at least one with
+    // a non-URL env-var template string. None of these may fail catalog parsing (see
+    // models-dev-catalog.test.ts), and only the safe ones should ever become a pre-fillable
+    // suggested base URL here.
+    const catalog: ModelsDevCatalog = { providers: new Map([
+      ["secure", provider("secure", [model("alpha")], { api: "https://provider.invalid/v1" })],
+      ["loopback", provider("loopback", [model("alpha")], { api: "http://127.0.0.1:1234/v1" })],
+      ["loopback-name", provider("loopback-name", [model("alpha")], { api: "http://localhost:8080/v1" })],
+      ["insecure", provider("insecure", [model("alpha")], { api: "http://provider.invalid/v1" })],
+      ["template", provider("template", [model("alpha")], { api: "${SOME_GATEWAY_BASE_URL}/v1" })],
+    ]) };
+
+    const ids = dynamicProviderDescriptors(catalog).map((entry) => entry.catalogProviderId).sort();
+
+    expect(ids).toEqual(["loopback", "loopback-name", "secure"]);
+  });
 });

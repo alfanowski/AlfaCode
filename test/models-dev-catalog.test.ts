@@ -82,13 +82,20 @@ describe("ModelsDevCatalogClient", () => {
     await expect(oversized.load()).rejects.toBeInstanceOf(ModelsDevCatalogError);
   });
 
-  it.each(["not-a-url", "http://provider.invalid/v1", "ftp://provider.invalid/v1"])("rejects an unsafe provider API endpoint: %s", async (api) => {
+  it.each(["not-a-url", "http://provider.invalid/v1", "ftp://provider.invalid/v1", "${SOME_GATEWAY_BASE_URL}/v1"])("stores an untrusted provider API endpoint as opaque data without failing catalog parsing: %s", async (api) => {
+    // The real upstream models.dev catalog legitimately contains provider entries like this
+    // (local-gateway tools publish a loopback http:// URL; some publish an env-var template
+    // string). One provider's freeform `api` field must never fail parsing for the whole
+    // catalog — the actual safety judgment for pre-filling a suggested base URL happens
+    // downstream in dynamicProviderDescriptors (see models-dev-runtime.test.ts), not here.
     const path = await cachePath();
-    const unsafe = provider("unsafe", "@ai-sdk/openai-compatible", { alpha: model("alpha") });
-    unsafe.api = api;
-    const client = new ModelsDevCatalogClient({ cachePath: path, fetch: async () => response(catalog({ unsafe })) });
+    const untrusted = provider("untrusted", "@ai-sdk/openai-compatible", { alpha: model("alpha") });
+    untrusted.api = api;
+    const client = new ModelsDevCatalogClient({ cachePath: path, fetch: async () => response(catalog({ untrusted })) });
 
-    await expect(client.load()).rejects.toBeInstanceOf(ModelsDevCatalogError);
+    const result = await client.load();
+
+    expect(result.catalog.providers.get("untrusted")?.api).toBe(api);
   });
 
   it("accepts catalog providers without an optional API endpoint", async () => {
