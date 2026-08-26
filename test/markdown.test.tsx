@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { render } from "ink-testing-library";
-import { Markdown, plainText, sanitizeTerminalText } from "../src/ui/markdown.js";
+import { Markdown, markdownToPlainText, plainText, sanitizeTerminalText } from "../src/ui/markdown.js";
 import { resolveTheme } from "../src/ui/theme.js";
 import { marked } from "marked";
 
@@ -71,5 +71,42 @@ describe("terminal markdown", () => {
       lexer.mockRestore();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("markdown-to-plain-text conversion (used by /copy)", () => {
+  it("strips inline formatting markers while keeping the text", () => {
+    expect(markdownToPlainText("**bold** and _em_ and `code` and ~~gone~~")).toBe("bold and em and code and gone");
+  });
+
+  it("drops heading/list/table syntax but keeps readable structure", () => {
+    const markdown = ["# Title", "", "- one", "- two", "", "1. first", "2. second"].join("\n");
+    expect(markdownToPlainText(markdown)).toBe("Title\n\n- one\n- two\n\n1. first\n2. second");
+  });
+
+  it("renders task list items with checkbox markers", () => {
+    expect(markdownToPlainText("- [x] done\n- [ ] todo")).toBe("[x] done\n[ ] todo");
+  });
+
+  it("keeps code block content verbatim, including angle brackets stripHtml would otherwise eat", () => {
+    const markdown = ["```ts", "const items: Array<string> = [];", "```"].join("\n");
+    expect(markdownToPlainText(markdown)).toBe("const items: Array<string> = [];");
+  });
+
+  it("keeps a link's visible text and appends its URL", () => {
+    expect(markdownToPlainText("[AlfaCode](https://example.test)")).toBe("AlfaCode (https://example.test)");
+  });
+
+  it("renders a table as pipe-separated plain rows", () => {
+    const markdown = ["| Provider | Ready |", "| --- | --- |", "| Zen | yes |"].join("\n");
+    expect(markdownToPlainText(markdown)).toBe("Provider | Ready\nZen | yes");
+  });
+
+  it("strips terminal control sequences embedded in unsanitized source before parsing", () => {
+    expect(markdownToPlainText("safe[31mred[0m text")).toBe("safered text");
+  });
+
+  it("collapses blank/space-only blocks instead of emitting empty paragraphs", () => {
+    expect(markdownToPlainText("first\n\n\n\nsecond")).toBe("first\n\nsecond");
   });
 });
