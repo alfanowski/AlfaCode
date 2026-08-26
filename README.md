@@ -37,7 +37,7 @@ Your normal `claude` installation is left untouched. AlfaCode has its own comman
 ## Product tour
 
 - Type `/` for a filtered command palette without leaving the conversation.
-- Use `/model` to search every currently callable model across every connected provider.
+- Use `/model` to search every currently callable model across every connected provider, and adjust its reasoning effort level with `←`/`→` on models that support it.
 - Use `/providers` to connect, reconnect, select, inspect, or delete providers.
 - See exact engine context left and locally recorded token usage after each turn.
 - Render terminal-safe Markdown: headings, emphasis, quotes, task lists, links, code fences, line numbers, and responsive tables.
@@ -171,6 +171,8 @@ alfacode run --non-interactive -- -p "Run the test suite and explain any failure
 | `/theme` | Switch between dark, light, and colorblind-friendly ("daltonized") themes. |
 | `/spellcheck [on\|off\|checker <name>\|dictionary <code>\|color <name>]` | Toggle or configure composer spell-checking. |
 | `/export` | Export the current transcript to a Markdown file under `~/.alfacode/exports/`. |
+| `/copy [n]` | Copy the last `n` (default 1) assistant responses to the system clipboard. |
+| `/copy on\|off` | Enable or disable clipboard copying (on by default). |
 | `/clear` | Clear the visible transcript. |
 | `/help` | Show commands and keyboard shortcuts. |
 | `/exit` | Close AlfaCode cleanly. |
@@ -207,6 +209,10 @@ AlfaCode rings the terminal bell (`\x07`) when a response finishes or a permissi
 ### Spell-check
 
 `/spellcheck` toggles opt-in composer spell-checking (off by default). It requires `aspell`, `hunspell`, or `ispell` on `PATH` — detected automatically, or pick one with `/spellcheck checker <name>`. Misspelled words underline live in the composer after a short pause in typing; code-looking tokens, URLs, CLI flags, camelCase/PascalCase identifiers, and backtick-quoted text are skipped. `/spellcheck dictionary <code>` sets the dictionary (e.g. `en_US`) and `/spellcheck color <name>` sets the underline color. The preference is stored locally, independent of `~/.alfacode/config.json`.
+
+### Copy to clipboard
+
+`/copy [n]` copies the last `n` assistant responses (default 1) to the system clipboard, rendered as plain text. It uses the terminal-protocol OSC 52 escape sequence rather than a native clipboard binary or DBus session, so it works the same way locally and over SSH — the terminal you're physically looking at receives the request over the same stream as everything else AlfaCode prints. Most modern terminal emulators honor it (iTerm2, Kitty, WezTerm, Windows Terminal, recent xterm/VTE, …); inside `tmux` the request is automatically wrapped in `tmux`'s passthrough sequence. Copying is on by default and only ever fires on the explicit `/copy` command — nothing is copied ambiently; disable it with `/copy off`. This is deliberately a one-shot command rather than live mouse-selection tracking, which Ink's terminal renderer doesn't support.
 
 ### Fullscreen mode
 
