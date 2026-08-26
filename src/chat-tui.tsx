@@ -1,9 +1,10 @@
+import type { EventEmitter } from "node:events";
 import { stat as statFile, readFile as readFileBytes } from "node:fs/promises";
 import { relative as relativePath } from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
-import type { McpServerStatus, PermissionMode, SDKAssistantMessage, SDKMessage, SDKResultMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { EffortLevel, McpServerStatus, PermissionMode, SDKAssistantMessage, SDKMessage, SDKResultMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
@@ -14,12 +15,13 @@ import { formatRelativeTime } from "./session-history.js";
 import { exportTranscript } from "./transcript-export.js";
 import type { UsageSummary } from "./usage-ledger.js";
 import { BackgroundTasksPanel, parseBackgroundTasksChanged, type BackgroundTask } from "./ui/background-tasks-panel.js";
+import { writeClipboardText } from "./ui/clipboard-copy.js";
 import { mediaTypeForExtension, readClipboardImage } from "./ui/clipboard-image.js";
 import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } from "./ui/dropped-paths.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
-import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
+import { Markdown, markdownToPlainText, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { useFlash, usePulse, useSpinner } from "./ui/motion.js";
+import { useAnimationFrame, useFlash, usePulse, useSpinner } from "./ui/motion.js";
 import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
@@ -100,9 +102,15 @@ interface Checkpoint { readonly uuid: string; readonly text: string; readonly tr
 interface ImageAttachment { readonly id: number; readonly mediaType: PromptImageAttachment["mediaType"]; readonly base64: string }
 
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
+/** Ordered low→max, matching the SDK's own `EffortLevel` union; `undefined` (not a member here) stands for "engine default, no explicit override". */
+export const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+/** EFFORT_LEVELS prefixed with the explicit "no override" position, for rendering the picker's segmented effort control. */
+const EFFORT_PIPS: readonly ("default" | EffortLevel)[] = ["default", ...EFFORT_LEVELS];
 const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 /** How long a running tool call may run before screen-reader mode rings the bell about it. */
 const TOOL_BELL_THRESHOLD_MS = 3_000;
+/** Debounce window for `useTerminalResize`'s re-render — see its doc comment for why. */
+const RESIZE_DEBOUNCE_MS = 50;
 let transcriptItemSequence = 0;
 const commands: readonly Command[] = [
   { name: "/model", description: "Switch across every live model", shortcut: "⌘M" },
@@ -119,6 +127,7 @@ const commands: readonly Command[] = [
   { name: "/export", description: "Export this transcript to a file" },
   { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
   { name: "/notifications", description: "Toggle the turn-complete bell", shortcut: "on|off" },
+  { name: "/copy", description: "Copy the last N assistant responses to the clipboard", shortcut: "[n]|on|off" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -130,6 +139,43 @@ const defaultContextWarningThreshold = 80;
 export function resolveInitialVimMode(environment: NodeJS.ProcessEnv = process.env): boolean {
   const requested = environment.ALFACODE_VIM_MODE?.trim().toLowerCase();
   return requested === "1" || requested === "true" || requested === "yes" || requested === "on";
+}
+
+/**
+ * Ink's own internal resize handling relayouts+repaints the *already* rendered tree on every raw
+ * `stdout` `resize` event with no debouncing of its own — fine, since that reuses the existing
+ * DOM/Yoga node tree and is cheap — but it does not re-invoke this component. `useStdout()`'s
+ * context value doesn't change identity when the terminal is resized (see Ink's `App` component:
+ * the `StdoutContext` value is memoized on `[stdout, writeToStdout]`, neither of which changes),
+ * so nothing else re-renders `ChatTui` on resize either. That leaves `width`/`height` (and every
+ * row budget, `modelWidth`, and scroll-window size derived from them below) frozen at whatever they
+ * were on the last render triggered by something unrelated (a keypress, a streamed token) until
+ * this hook forces one. The returned generation counter only exists to make this independently
+ * testable; callers that just want the rerender side effect can ignore it.
+ *
+ * Debounced rather than firing once per raw event: some terminals emit a burst of `resize` events
+ * per drag-resize gesture, and reacting to every one would pile a full React re-render on top of
+ * Ink's own already-unthrottled per-event repaint — exactly the kind of independent, uncoordinated
+ * repaint source motion.ts's shared clock was built to eliminate for animation. The debounce window
+ * mirrors Ink's own `pendingInputFlushDelayMilliseconds` pattern for chunked escape sequences: a
+ * plain trailing debounce, not a full leading+trailing throttle — simplest fix that still converges
+ * promptly (well under human perception) once a resize gesture settles.
+ */
+export function useTerminalResize(stdout: EventEmitter, debounceMs: number = RESIZE_DEBOUNCE_MS): number {
+  const [generation, setGeneration] = useState(0);
+  useEffect(() => {
+    let timer: NodeJS.Timeout | undefined;
+    const onResize = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => { timer = undefined; setGeneration((value) => value + 1); }, debounceMs);
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [stdout, debounceMs]);
+  return generation;
 }
 
 export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
@@ -149,6 +195,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
   const theme = useMemo(() => getTheme(themeName), [themeName]);
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => resolveNotificationSettings());
+  // Unlike /notifications (background bell, defaults off after being too intrusive) or /spellcheck
+  // (needs an external dependency, defaults off), /copy only ever does something when the user
+  // explicitly types it — no ambient behavior to be surprised by — so it defaults on.
+  const [copyEnabled, setCopyEnabled] = useState(true);
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
@@ -182,6 +232,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     setPermissionModeState(mode);
   };
   const [activeModel, setActiveModel] = useState(identity.model);
+  // `undefined` means "engine default, no explicit override" (collapsing the SDK's own `null` —
+  // "no effort parameter will be sent" — with "the handshake hasn't reported one yet"; both render
+  // identically in the picker and both mean AlfaCode isn't currently asking for a specific level).
+  const [effortLevel, setEffortLevelState] = useState<EffortLevel | undefined>(undefined);
   const [commandCursor, setCommandCursor] = useState(0);
   const [history, setHistory] = useState<string[]>([]);
   const [historyCursor, setHistoryCursor] = useState(-1);
@@ -217,6 +271,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const toolBellTimers = useRef(new Map<string, NodeJS.Timeout>());
   const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
   const spellCheckController = useRef<SpellCheckController | undefined>(undefined);
+  // Keeps width/height (and everything derived from them below) live across a terminal resize —
+  // see useTerminalResize's doc comment. The generation counter itself is unused here; calling the
+  // hook is what matters.
+  useTerminalResize(stdout);
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
@@ -302,6 +360,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     void session.identity().then((resolved) => {
       if (!active) return;
       setActiveModel(resolved.model);
+      setEffortLevelState(resolved.effort ?? undefined);
       setLiveCompatibility(resolved.compatibility);
       setPermissionModeState((current) => resolvePermissionModeAfterIdentity(current, resolved.compatibility.compatible, permissionModeTouchedByUserRef.current));
       if (!resolved.compatibility.compatible) appendSystem(setMessages, resolved.compatibility.reason ?? "Unsupported Claude Code engine version.");
@@ -588,9 +647,18 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     const route = encodeModelId(model.providerId, model.id);
     reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${model.providerId}] ${model.displayName}`); });
   }
+  /** Left/right in the model picker: live, no transcript noise on every keystroke (only a failure is worth reporting) — mirrors selectModel's "await success before updating local state" convention. No-ops silently when the highlighted row can't carry an effort parameter; ModelPicker shows why. */
+  function adjustEffortLevel(model: ModelDescriptor | undefined, direction: -1 | 1): void {
+    if (model === undefined || !modelSupportsEffort(model)) return;
+    const next = nextEffortLevel(effortLevel, direction);
+    if (next === effortLevel) return;
+    reportFailure("Effort level", session.setEffortLevel(next ?? null), () => setEffortLevelState(next));
+  }
   function handleModelInput(text: string, key: Key): void {
     if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
     else if (key.downArrow) setModelCursor((current) => Math.min(Math.max(0, filteredModels.length - 1), current + 1));
+    else if (key.leftArrow) adjustEffortLevel(filteredModels[modelCursor], -1);
+    else if (key.rightArrow) adjustEffortLevel(filteredModels[modelCursor], 1);
     else if (key.backspace || key.delete) { setModelFilter((current) => current.slice(0, -1)); setModelCursor(0); }
     else if (key.return) {
       const selected = filteredModels[modelCursor];
@@ -830,6 +898,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     }
     if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
     if (name === "/notifications") { handleNotificationsCommand(command); return; }
+    if (name === "/copy") { handleCopyCommand(command); return; }
     sendPrompt(command);
   }
   function handleNotificationsCommand(command: string): void {
@@ -838,6 +907,22 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
     setNotificationSettings((current) => ({ ...current, bell }));
     appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
+  }
+  function handleCopyCommand(command: string): void {
+    const parsed = parseCopyCommand(command);
+    if (parsed === undefined) { appendSystem(setMessages, "Usage: /copy [n] or /copy [on|off]"); return; }
+    if (parsed.kind === "toggle") {
+      setCopyEnabled(parsed.enabled);
+      appendSystem(setMessages, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
+      return;
+    }
+    if (!copyEnabled) { appendSystem(setMessages, "Copy to clipboard is off. Enable it with /copy on."); return; }
+    const responses = lastAssistantResponses(messages, parsed.count);
+    if (responses.length === 0) { appendSystem(setMessages, "No assistant responses to copy yet."); return; }
+    const text = responses.map(markdownToPlainText).join("\n\n");
+    const { truncated } = writeClipboardText(text);
+    const label = responses.length === 1 ? "Copied last response to clipboard." : `Copied last ${responses.length} responses to clipboard.`;
+    appendSystem(setMessages, truncated ? `${label} (truncated to fit terminal limits)` : label);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -880,8 +965,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
         lives in <Static> above this frame instead, so a fixed minHeight would only pad the
         live, redrawn region with blank lines. */}
     <Box flexDirection="column" {...(screenReader ? {} : { minHeight: transcriptRows })} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
-      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} busy={busy} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
-      {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
+      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
+      {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} width={transcriptWidth} activeRoute={activeModel} effortLevel={effortLevel} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={transcriptWidth} /> : null}
       {screen === "permissions" ? <PermissionPicker selected={permissionMode} theme={theme} /> : null}
@@ -986,22 +1071,36 @@ function extractToolResultText(content: unknown): string {
 }
 
 /**
- * The app's single always-on-screen signature element: a taller, tinted panel (two information
- * rows instead of one) topped by the brand mark and capped with an `ActivityRule` — a full-width
- * strip that stays a quiet, still line when idle and switches to a flat accent color when busy.
+ * The app's single always-on-screen signature element — deliberately chrome-light: no enclosing
+ * border box and no background fill (an earlier tinted-panel treatment read as heavy and, per
+ * direct feedback, too close to a generic dashboard widget), just two information rows under the
+ * compact brand mark and an `ActivityRule` beneath them doing the one job a frame needs to do —
+ * separate the header from the transcript and signal busy/ready with a color, not a shape.
+ *
+ * The ready/busy indicator itself is a flat color+label swap, not an animated glyph: it used to
+ * cycle through `usePulse`'s frames continuously for the entire busy duration, which is exactly
+ * the kind of sustained repaint this component's history warns against (see `ActivityRule` below).
+ * A flat swap loses nothing — the label text already carries the state unambiguously — while
+ * guaranteeing this always-mounted element never animates while a response is streaming.
  */
 export function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
-  const pulse = usePulse(busy);
   const modelWidth = Math.max(16, Math.min(34, width - 36));
   const ruleWidth = Math.max(4, width - 8);
-  return <Box flexDirection="column" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1} backgroundColor={theme.surfaceRaised}>
+  // Pre-existing math, unchanged — but it was only ever exercised with the meta text at its
+  // shortest ("3P · default"); its own `wrap="truncate-end"` couldn't do anything without a
+  // bounded box, so adding " · mismatch" at a narrow width let it run straight into the model box
+  // with no separation at all. Bounding it the same way modelWidth already bounds its neighbor
+  // makes the mismatch warning degrade the same way the model name already does, instead of
+  // overlapping it.
+  const metaWidth = Math.max(14, width - modelWidth - 6);
+  return <Box flexDirection="column" paddingX={1} marginBottom={1}>
     <Box justifyContent="space-between">
       <Brand theme={theme} compact />
-      <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
+      <Text color={busy ? theme.accent : theme.success}>● <Text bold>{busy ? "working" : "ready"}</Text></Text>
     </Box>
-    <Box justifyContent="space-between">
+    <Box justifyContent="space-between" columnGap={1}>
       <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
-      <Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text>
+      <Box width={metaWidth} justifyContent="flex-end"><Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text></Box>
     </Box>
     <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
   </Box>;
@@ -1013,36 +1112,65 @@ export function Header({ model, mode, providers, compatible, busy, theme, width 
  * tick throughout the whole busy period, which is exactly when a user is most likely to want to
  * select or scroll the streaming response; Ink has no way to repaint just this row in isolation
  * (there's no `<Static>` boundary around the live transcript), so the whole visible frame repainted
- * with it. A flat color change already communicates "busy" (paired with the panel's own border
- * color and the working/ready label) without needing continuous animation to do it.
+ * with it. A flat color change already communicates "busy" (paired with the working/ready label)
+ * without needing continuous animation to do it.
  */
 function ActivityRule({ busy, width, theme }: { readonly busy: boolean; readonly width: number; readonly theme: Theme }): React.JSX.Element {
   return <Text color={busy ? theme.accent : theme.border}>{"━".repeat(width)}</Text>;
 }
 
-export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
-  if (items.length === 0) return <EmptyState theme={theme} width={width} />;
+export type TranscriptStage = "idle" | "thinking" | "writing" | "tool";
+
+/**
+ * Derives what the busy period is actually doing right now from the same transcript state both
+ * the boxed UI and the screen-reader log already observe, so the two surfaces can never drift
+ * apart: "tool" while the last row is a running tool call (it carries its own spinner/phrasing —
+ * see ToolActivity), "writing" once the last row is the assistant's own growing reply, and
+ * "thinking" for the gap before either of those exists yet. Idle whenever nothing is in flight.
+ */
+export function transcriptStage(items: readonly TranscriptItem[], busy: boolean): TranscriptStage {
+  if (!busy) return "idle";
   const last = items.at(-1);
-  // Visible for the whole busy stretch, not just the gap before the first token: a running tool
-  // row already carries its own spinner, so this only steps aside once the last row is a tool.
-  const streaming = busy && last?.role !== "tool";
-  return <>{items.map((item) => {
-    if (item.role === "assistant") return <Box key={item.id} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
-    if (item.role === "user") return <Box key={item.id} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} />;
-    return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
-  })}{streaming ? <ThinkingLine theme={theme} writing={last?.role === "assistant"} /> : null}</>;
+  if (last?.role === "tool") return "tool";
+  return last?.role === "assistant" ? "writing" : "thinking";
 }
-function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
+
+export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
+  // A single shared trigger for the whole transcript — keyed on the newest item's identity — so a
+  // burst of several items landing in quick succession (e.g. parallel tool calls) still drives just
+  // one flash/timeout, not one per row. Whichever row is currently newest picks it up below; a row
+  // that stops being the newest simply stops rendering the highlight, it never keeps its own timer.
+  const last = items.at(-1);
+  const arrived = useFlash(last?.id);
+  if (items.length === 0) return <EmptyState theme={theme} width={width} />;
+  const stage = transcriptStage(items, busy);
+  return <>{items.map((item, index) => {
+    const highlight = index === items.length - 1 && arrived ? { backgroundColor: theme.surfaceRaised } : {};
+    if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1} {...highlight}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
+    if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1} {...highlight}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} justArrived={index === items.length - 1 && arrived} />;
+    return <Box key={item.id} marginTop={1} {...highlight}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
+  })}{stage === "thinking" || stage === "writing" ? <ThinkingLine theme={theme} writing={stage === "writing"} /> : null}</>;
+}
+function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly justArrived?: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
   // A brief highlight pulse whenever this row's status changes (most visibly running → completed/failed
   // — the moment a tool call actually lands something worth noticing) — never on the row's own first
   // mount, per useFlash's contract, so a burst of freshly-started tool calls doesn't flash all at once.
-  const flash = useFlash(item.status);
+  // `justArrived` (the transcript-level "something new landed" pulse — see Transcript) covers that
+  // first-mount moment instead, as one shared, already-time-boxed trigger rather than a second timer
+  // per row.
+  const statusFlash = useFlash(item.status);
   const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
   const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
-  const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {item.detail === undefined ? "tool" : item.detail} · </Text><Text color={theme.text}>{item.text}</Text></Box>;
-  const highlight = flash ? { backgroundColor: theme.surfaceRaised } : {};
+  // Status-aware phrasing instead of one static "tool · Bash" label regardless of what's actually
+  // happening: "Running Bash…" while in flight (this is the "waiting for a tool result" cue),
+  // "Bash" once it lands (the ✓/× icon already carries the outcome), "Bash" prefixed with a failure
+  // callout when it doesn't.
+  const prefix = item.status === "running" ? "Running " : item.status === "failed" ? "Failed — " : "";
+  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}`;
+  const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
+  const highlight = statusFlash || justArrived ? { backgroundColor: theme.surfaceRaised } : {};
   if (!detailed) return <Box paddingLeft={2} {...highlight}>{summary}</Box>;
   const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
   const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
@@ -1052,16 +1180,23 @@ function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
   </Box>;
 }
+/** Slowly cycled through while nothing has been written yet, so a long pre-token wait doesn't sit
+ * on one static word — still a single word at a time, changing at a deliberately slow, bounded
+ * cadence (every ~2.4s, and only during this pre-token phase, never for the length of a streaming
+ * reply) and riding the same shared clock the spinner beside it already subscribes to, not a timer
+ * of its own. Reduced motion / screen-reader mode pins it to the first phrase, unchanged. */
+const thinkingPhrases = ["Thinking", "Reasoning", "Working"] as const;
 /**
  * Two related but distinct states, not one generic label that vanishes once content starts:
- * "thinking" (nothing written yet for this turn — an orbiting accent spinner) vs. "writing" (text
- * is actively growing — a gold star-glint pulse), so the cue itself communicates which phase of
- * the busy period is in progress rather than just that *something* is happening.
+ * "thinking" (nothing written yet for this turn — an orbiting accent spinner, with slowly varying
+ * phrasing) vs. "writing" (text is actively growing — a gold star-glint pulse, phrasing held
+ * steady so it doesn't compete with the reply itself for attention).
  */
 export function ThinkingLine({ theme, writing }: { readonly theme: Theme; readonly writing: boolean }): React.JSX.Element {
   const spinner = useSpinner(!writing);
   const pulse = usePulse(writing);
-  return <Box paddingLeft={2}><Text color={writing ? theme.secondary : theme.accent}>{writing ? pulse : spinner}</Text><Text bold color={theme.muted}> {writing ? "Writing…" : "Thinking…"}</Text></Box>;
+  const phrase = thinkingPhrases[useAnimationFrame(writing ? 1 : thinkingPhrases.length, 2400)] ?? thinkingPhrases[0];
+  return <Box paddingLeft={2}><Text color={writing ? theme.secondary : theme.accent}>{writing ? pulse : spinner}</Text><Text bold color={theme.muted}> {writing ? "Writing…" : `${phrase}…`}</Text></Box>;
 }
 function ScrollIndicator({ count, theme }: { readonly count: number; readonly theme: Theme }): React.JSX.Element {
   return <Box paddingX={1}><Text color={theme.accent}>↓ {count > 0 ? `${count} new message${count === 1 ? "" : "s"} below` : "scrolled up"} · Ctrl+End to jump to bottom</Text></Box>;
@@ -1118,13 +1253,80 @@ function MentionPalette({ entries, cursor, theme, width }: { readonly entries: r
   return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath} width={innerWidth}><Text color={active ? theme.accent : theme.muted} wrap="truncate-end">{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
 }
 
-function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
+export function ModelPicker({ models, cursor, filter, theme, height, width, activeRoute, effortLevel }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number; readonly width: number; readonly activeRoute: string; readonly effortLevel: EffortLevel | undefined }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   // -6 (not -4) accounts for the picker's own outer panelBorder (2 rows) on top of the section
-  // title and search box already reserved for.
+  // title and search box already reserved for. Provider group headers add further rows on top of
+  // this budget, same "content-dependent, soft" tradeoff the cursor row's own extra detail line
+  // already made before this redesign.
   const visibleRows = Math.max(5, height - 6);
   const start = Math.max(0, Math.min(cursor - Math.floor(visibleRows / 2), Math.max(0, models.length - visibleRows)));
-  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box {...panelBorder(theme, "active")} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model, index) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : ""}<Text bold={active}>{numbered ? numberedLabel(start + index, model.displayName) : model.displayName}</Text><Text color={theme.faint}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · enter switch · esc back</HintBar></Box>;
+  const slice = models.slice(start, start + visibleRows);
+  const innerWidth = Math.max(20, width - 4);
+  const providerCount = new Set(models.map((model) => model.providerId)).size;
+  return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1}>
+    <SectionTitle title="Models" detail={`${models.length} live, tool-capable match${models.length === 1 ? "" : "es"} across ${providerCount} provider${providerCount === 1 ? "" : "s"}`} theme={theme} />
+    <Box {...panelBorder(theme, "active")} paddingX={1} marginBottom={1}>
+      <Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>
+      {filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}
+    </Box>
+    {slice.map((model, index) => {
+      const absoluteIndex = start + index;
+      const previousProviderId = index === 0 ? models[start - 1]?.providerId : slice[index - 1]?.providerId;
+      const groupSize = previousProviderId === model.providerId ? 0 : models.filter((candidate) => candidate.providerId === model.providerId).length;
+      const isCursor = absoluteIndex === cursor;
+      const isRouted = encodeModelId(model.providerId, model.id) === activeRoute;
+      const supportsEffort = modelSupportsEffort(model);
+      const capabilityTags = [
+        model.capabilities.vision ? "vision" : undefined,
+        model.capabilities.reasoningState !== "none" ? "reasoning" : undefined,
+      ].filter((tag): tag is string => tag !== undefined);
+      // Yoga's box model adds padding on top of an explicit width (content-box sizing), so an
+      // indented row needs its declared width reduced by exactly that padding or it overflows the
+      // panel by 2 columns — invisible at a wide terminal, but enough to visibly wrap a badge onto
+      // its own line at a narrow one. The name gets its own further-reserved, truncating sub-box
+      // (mirroring Header's modelWidth) so a long display name can never crowd the badge off the
+      // row instead of just truncating.
+      const rowIndent = isCursor ? 0 : 2;
+      const rowWidth = Math.max(10, innerWidth - rowIndent);
+      const badgeReserve = 14; // widest badge, "● best-effort", plus a spare column.
+      const nameWidth = Math.max(10, rowWidth - badgeReserve);
+      return <React.Fragment key={`${model.providerId}/${model.id}`}>
+        {groupSize > 0 ? <Box marginTop={index === 0 ? 0 : 1}>
+          <Text bold color={theme.secondary}>{model.providerId}</Text>
+          <Text color={theme.faint}> · {groupSize} model{groupSize === 1 ? "" : "s"}</Text>
+        </Box> : null}
+        <Box flexDirection="column" width={rowWidth} paddingLeft={rowIndent}>
+          {/* height=1 on both this row and the name sub-box pins a single terminal row: an
+              explicit-width Box with auto height, next to a StatusBadge sibling under
+              justifyContent="space-between", otherwise leaves Yoga to reserve a second, blank
+              row here at some terminal widths. */}
+          <Box justifyContent="space-between" height={1}>
+            <Box width={nameWidth} height={1}>
+              <Text color={isCursor ? theme.accent : theme.muted} wrap="truncate-end">
+                {isCursor ? "❯ " : ""}
+                <Text bold={isCursor}>{numbered ? numberedLabel(absoluteIndex, model.displayName) : model.displayName}</Text>
+                {isRouted ? <Text color={theme.success}> ● current</Text> : null}
+              </Text>
+            </Box>
+            <StatusBadge label={model.support === "contract-tested" ? "verified" : "best-effort"} tone={model.support === "contract-tested" ? "success" : "warning"} theme={theme} />
+          </Box>
+          {isCursor ? <Box flexDirection="column">
+            <Text color={theme.faint}>  {model.id} · {formatCompact(model.contextWindow)} context{capabilityTags.length > 0 ? ` · ${capabilityTags.join(" · ")}` : ""}</Text>
+            <Text color={theme.faint}>  Effort  {supportsEffort
+              ? EFFORT_PIPS.map((pip) => {
+                const isActive = pip === "default" ? effortLevel === undefined : effortLevel === pip;
+                return <Text key={pip} color={isActive ? theme.accent : theme.faint} bold={isActive}>{isActive ? `[${pip}]` : pip} </Text>;
+              })
+              : <Text color={theme.faint}>not available for this model (Anthropic-routed models only)</Text>}
+            </Text>
+          </Box> : null}
+        </Box>
+      </React.Fragment>;
+    })}
+    {models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}
+    <HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · ←→ effort (Anthropic models) · enter switch · esc back</HintBar>
+  </Box>;
 }
 
 function ProviderManager({ providers, models, cursor, defaultId, theme }: { readonly providers: readonly ProviderRecord[]; readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly defaultId?: string; readonly theme: Theme }): React.JSX.Element {
@@ -1247,6 +1449,20 @@ function RewindMenu({ checkpoints: entries, cursor, busy, theme }: { readonly ch
 }
 
 export function commandSuggestions(value: string, available: readonly Command[] = commands): readonly Command[] { if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return []; const needle = value.toLowerCase(); return available.filter((command) => command.name.startsWith(needle)); }
+/** Parses `/copy`'s optional argument: bare (`/copy`) or a count (`/copy 3`) requests a copy, `on`/`off` requests the toggle. `undefined` means the argument was malformed and the caller should show usage. */
+export function parseCopyCommand(command: string): { readonly kind: "toggle"; readonly enabled: boolean } | { readonly kind: "copy"; readonly count: number } | undefined {
+  const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
+  if (sub === undefined) return { kind: "copy", count: 1 };
+  if (sub === "on" || sub === "off") return { kind: "toggle", enabled: sub === "on" };
+  const count = Number.parseInt(sub, 10);
+  if (!Number.isInteger(count) || count < 1 || String(count) !== sub) return undefined;
+  return { kind: "copy", count };
+}
+/** The last `count` assistant transcript rows' raw (markdown-source) text, oldest first — `/copy` renders each through `markdownToPlainText` before writing it to the clipboard. */
+export function lastAssistantResponses(items: readonly TranscriptItem[], count: number): readonly string[] {
+  const assistantTexts = items.filter((item) => item.role === "assistant").map((item) => item.text);
+  return assistantTexts.slice(Math.max(0, assistantTexts.length - count));
+}
 /** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
 export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
   if (key.leftArrow) return { type: "left" };
@@ -1357,6 +1573,25 @@ export function contextFullWarning(context: ContextUsage, alreadyWarned: boolean
  */
 export function resolvePermissionModeAfterIdentity(current: PermissionMode, resolvedCompatible: boolean, userTouched: boolean): PermissionMode {
   return resolvedCompatible && !userTouched ? "default" : current;
+}
+/**
+ * Whether AlfaCode's own gateway will actually forward an effort/thinking parameter for this
+ * model. The engine attaches `effort` to every outgoing request regardless of which model is
+ * routed — but `AnthropicMessagesAdapter` is the only adapter that passes the request body through
+ * verbatim to a real Anthropic-compatible endpoint (see src/providers/anthropic/messages.ts); the
+ * OpenAI-compatible and Gemini adapters rebuild the request from known fields and never read
+ * `effort`, so it would silently do nothing there. Gate any effort UI on this, not on the model's
+ * own advertised capabilities, since AlfaCode's synthetic model ids never match the engine's own
+ * per-model effort-support table anyway.
+ */
+export function modelSupportsEffort(model: Pick<ModelDescriptor, "wireProtocol">): boolean {
+  return model.wireProtocol === "anthropic-messages";
+}
+/** Steps one position through `undefined` ("engine default") followed by EFFORT_LEVELS low→max, clamped at both ends (no wraparound). */
+export function nextEffortLevel(current: EffortLevel | undefined, direction: -1 | 1): EffortLevel | undefined {
+  const index = current === undefined ? -1 : EFFORT_LEVELS.indexOf(current);
+  const nextIndex = Math.max(-1, Math.min(EFFORT_LEVELS.length - 1, index + direction));
+  return nextIndex === -1 ? undefined : EFFORT_LEVELS[nextIndex];
 }
 /** This turn's estimated cost (USD), derived from the engine's cumulative session total. Undefined when the engine didn't report a cost. */
 export function turnCostFromResult(message: SDKResultMessage, previousCumulativeUsd: number): { readonly turnCostUsd: number; readonly cumulativeCostUsd: number } | undefined {

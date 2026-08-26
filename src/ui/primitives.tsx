@@ -15,7 +15,7 @@ export function panelBorder(theme: Theme, emphasis: "active" | "quiet" = "quiet"
 }
 
 export function Brand({ theme, compact = false }: { readonly theme: Theme; readonly compact?: boolean }): React.JSX.Element {
-  return <Text bold><Text color={theme.accent}>✦</Text><Text color={theme.text}> Alfa</Text><Text color={theme.secondary}>Code</Text>{compact ? null : <Text color={theme.faint}> / agent terminal</Text>}</Text>;
+  return <Text bold><Text color={theme.accent}>✦</Text><Text color={theme.accent}> Alfa</Text><Text color={theme.secondary}>Code</Text>{compact ? null : <Text color={theme.faint}> / agent terminal</Text>}</Text>;
 }
 
 export function KeyHint({ shortcut, label, theme }: { readonly shortcut: string; readonly label: string; readonly theme: Theme }): React.JSX.Element {
@@ -164,10 +164,67 @@ function Starburst({ theme, width }: { readonly theme: Theme; readonly width?: n
   </Box>;
 }
 
+const WORDMARK_ROWS = 5;
+const WORDMARK_COLS = 4;
+
+/**
+ * A tiny 4×5 dot-matrix font — just enough strokes to keep every letter unambiguous at a glance —
+ * used to render the AlfaCode wordmark as genuine block art rather than colored text. "#" is a lit
+ * cell, "." a gap; every glyph's rows are exactly WORDMARK_COLS long (checked by a unit test), so
+ * layout only ever depends on (letter index, row, col) — the same discipline `burstPoints` above
+ * keeps by using coordinates instead of hand-aligned strings.
+ */
+const wordmarkGlyphs: Record<string, readonly string[]> = {
+  A: [".##.", "#..#", "####", "#..#", "#..#"],
+  L: ["#...", "#...", "#...", "#...", "####"],
+  F: ["####", "#...", "###.", "#...", "#..."],
+  C: [".###", "#...", "#...", "#...", ".###"],
+  O: [".##.", "#..#", "#..#", "#..#", ".##."],
+  D: ["###.", "#..#", "#..#", "#..#", "###."],
+  E: ["####", "#...", "###.", "#...", "####"],
+};
+
+/** Below this width the block wordmark can't fit without wrapping mid-letter; `EmptyState` falls
+ * back to a plain two-tone label instead of letting it clip (see `EmptyState`). */
+const WORDMARK_MIN_WIDTH = 40;
+
+/**
+ * The AlfaCode wordmark rendered in the dot-matrix font above, swept end-to-end by the same
+ * accent→secondary blend `ProgressBar` and `Starburst` already use, so it reads as "red field,
+ * yellow glow" like the rest of the nova palette rather than a flat two-color label. Each letter
+ * also gets its own slow brightness ripple via `useTwinkle` (whole-letter, not per-pixel, so the
+ * motion stays a single soft wave rather than something flickery) — the "occasionally, very
+ * lightly animated" identity mark, on the same idle-only footing as `Starburst`'s twinkle: this
+ * only ever mounts pre-conversation (`EmptyState` is swapped out the moment the first message
+ * lands), so it never runs during a busy turn. Unlike `Starburst`'s decorative points, which are
+ * fine to dim all the way to `theme.faint`, the ripple's floor here is clamped to `WORDMARK_DIM`
+ * (85% of full color) rather than 0 — this is the word itself, and a twinkle strong enough to swing
+ * a whole letter down to near-invisible would actively hurt legibility instead of just adding
+ * texture, the opposite of "very lightly animated."
+ */
+const WORDMARK_DIM = 0.85;
+
+function Wordmark({ theme, word }: { readonly theme: Theme; readonly word: string }): React.JSX.Element {
+  const letters = word.split("").map((char) => wordmarkGlyphs[char]).filter((glyph): glyph is readonly string[] => glyph !== undefined);
+  const twinkle = useTwinkle(letters.length, { interval: 800 });
+  return <Box flexDirection="column" alignItems="center">
+    {Array.from({ length: WORDMARK_ROWS }, (_, row) => <Text key={row}>{letters.map((glyph, index) => {
+      const hue = mixHex(theme.accent, theme.secondary, letters.length <= 1 ? 0 : index / (letters.length - 1));
+      const dim = mixHex(theme.faint, hue, WORDMARK_DIM);
+      const color = mixHex(dim, hue, (twinkle[index] ?? 2) / 2);
+      const cells = (glyph[row] ?? "").padEnd(WORDMARK_COLS).slice(0, WORDMARK_COLS).split("").map((cell) => cell === "#" ? "█" : " ").join("");
+      return <Text key={index} color={color}>{cells}{index < letters.length - 1 ? " " : ""}</Text>;
+    })}</Text>)}
+  </Box>;
+}
+
 export function EmptyState({ theme, width }: { readonly theme: Theme; readonly width?: number }): React.JSX.Element {
+  const roomy = width === undefined || width >= WORDMARK_MIN_WIDTH;
   return <Box flexDirection="column" alignItems="center" justifyContent="center" flexGrow={1}>
     <Starburst theme={theme} {...(width === undefined ? {} : { width })} />
-    <Box><Text bold color={theme.text}>ALFA</Text><Text bold color={theme.secondary}>CODE</Text></Box>
+    {roomy
+      ? <Wordmark theme={theme} word="ALFACODE" />
+      : <Box><Text bold color={theme.accent}>ALFA</Text><Text bold color={theme.secondary}>CODE</Text></Box>}
     <Box marginTop={1}><Text color={theme.muted}>One agent. Every model. Your terminal.</Text></Box>
     <Box marginTop={1} columnGap={2} flexWrap="wrap" justifyContent="center">
       <KeyHint shortcut="/model" label="switch" theme={theme} />

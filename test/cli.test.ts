@@ -322,6 +322,151 @@ describe("createCli", () => {
     expect(await configStore.read()).toMatchObject({ defaultProviderId: "zen", providers: [{ id: "zen", type: "opencode-zen" }] });
   });
 
+  describe("default provider bootstrap", () => {
+    it("seeds the anonymous Zen provider on a genuinely fresh install and skips the setup wizard", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      expect(await configStore.exists()).toBe(false);
+
+      let wizardLaunched = false;
+      let runtimeClosed = false;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined },
+        providerSetup: async () => { wizardLaunched = true; },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => { runtimeClosed = true; } }),
+        startAgentSession: async (input) => ({ close: async () => input.runtime.close() }) as unknown as AgentSession,
+        chatTui: async () => ({ type: "exit" }),
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode"], { from: "node" });
+
+      expect(wizardLaunched).toBe(false);
+      expect(runtimeClosed).toBe(true);
+      expect(await configStore.read()).toEqual({
+        version: 1,
+        defaultProviderId: "zen",
+        providers: [{ id: "zen", type: "opencode-zen", options: { catalogProviderId: "opencode" } }],
+      });
+    });
+
+    it("seeds the same default through the classic (`launch`) entrypoint", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-classic-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      let wizardLaunched = false;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined },
+        providerSetup: async () => { wizardLaunched = true; },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        launch: async () => 0,
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "launch"], { from: "node" });
+
+      expect(wizardLaunched).toBe(false);
+      expect((await configStore.read()).providers).toEqual([{ id: "zen", type: "opencode-zen", options: { catalogProviderId: "opencode" } }]);
+    });
+
+    it("never touches an existing config that already has providers", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-existing-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      await configStore.write({
+        version: 1,
+        defaultProviderId: "google",
+        providers: [{ id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } }],
+      });
+
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined, retrieve: async () => "configured" },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        startAgentSession: async (input) => ({ close: async () => input.runtime.close() }) as unknown as AgentSession,
+        chatTui: async () => ({ type: "exit" }),
+        ui: fakeUi(),
+      });
+
+      await cli.parseAsync(["node", "alfacode"], { from: "node" });
+
+      expect(await configStore.read()).toEqual({
+        version: 1,
+        defaultProviderId: "google",
+        providers: [{ id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } }],
+      });
+    });
+
+    it("does not seed a default when a config file exists but the user deliberately emptied it", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-emptied-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      await configStore.write({ version: 1, providers: [] });
+      expect(await configStore.exists()).toBe(true);
+
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        providerSetup: async () => {
+          // The wizard being reached at all, with the config still untouched, is the assertion:
+          // an existing-but-empty config must never be silently repopulated with a default.
+          expect(await configStore.read()).toEqual({ version: 1, providers: [] });
+          throw new Error("stop-after-assertion");
+        },
+        ui: fakeUi(),
+      });
+
+      await expect(cli.parseAsync(["node", "alfacode"], { from: "node" })).rejects.toThrow("stop-after-assertion");
+    });
+
+    it("bootstraps a fresh install under `run --non-interactive` instead of failing", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-run-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      let launched = false;
+      const cli = createCli({
+        configStore,
+        keychain: { store: async () => undefined },
+        startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+        launch: async () => { launched = true; return 0; },
+        ui: fakeUi({ interactive: false }),
+      });
+
+      await cli.parseAsync(["node", "alfacode", "run", "--non-interactive"], { from: "node" });
+
+      expect(launched).toBe(true);
+      expect((await configStore.read()).providers).toEqual([{ id: "zen", type: "opencode-zen", options: { catalogProviderId: "opencode" } }]);
+    });
+
+    it("still fails `run --non-interactive` when the config file exists but has zero providers", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-run-empty-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      await configStore.write({ version: 1, providers: [] });
+      const cli = createCli({ configStore, ui: fakeUi({ interactive: false }) });
+
+      await expect(cli.parseAsync(["node", "alfacode", "run", "--non-interactive"], { from: "node" })).rejects.toThrow("No provider configured");
+    });
+
+    it("reports a ready status with the seeded provider from `doctor` on a fresh install", async () => {
+      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-doctor-"));
+      directories.push(home);
+      const configStore = new ConfigStore({ homeDirectory: home });
+      const written: string[] = [];
+      const cli = createCli({ configStore, ui: fakeUi({ write: (message) => { written.push(message); } }) });
+
+      await cli.parseAsync(["node", "alfacode", "doctor"], { from: "node" });
+
+      expect(written.join("\n")).toContain("Status: ready");
+      expect(written.join("\n")).toContain("Default provider: zen");
+      expect((await configStore.read()).providers).toEqual([{ id: "zen", type: "opencode-zen", options: { catalogProviderId: "opencode" } }]);
+    });
+  });
+
   describe("session resume, continue, and naming", () => {
     async function nativeConfig(): Promise<ConfigStore> {
       const home = await mkdtemp(join(tmpdir(), "alfacode-cli-native-"));

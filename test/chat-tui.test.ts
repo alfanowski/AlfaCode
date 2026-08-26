@@ -7,9 +7,14 @@ import {
   contextFullWarning,
   createTranscriptItemId,
   describePermissionDecision,
+  EFFORT_LEVELS,
   formatCostUsd,
   historySearchMatches,
+  lastAssistantResponses,
   maxScrollOffsetRows,
+  modelSupportsEffort,
+  nextEffortLevel,
+  parseCopyCommand,
   reduceSdkMessage,
   resolveInitialVimMode,
   resolveLineEditorOperation,
@@ -162,6 +167,10 @@ describe("chat transcript reducer", () => {
     expect(commandSuggestions("/notifications").map((command) => command.name)).toEqual(["/notifications"]);
   });
 
+  it("registers /copy in the default command list", () => {
+    expect(commandSuggestions("/copy").map((command) => command.name)).toEqual(["/copy"]);
+  });
+
   it("registers the discovery and export commands alongside the built-ins", () => {
     expect(commandSuggestions("/the").map((command) => command.name)).toEqual(["/theme"]);
     expect(commandSuggestions("/mcp").map((command) => command.name)).toEqual(["/mcp"]);
@@ -235,6 +244,36 @@ describe("permission mode resync after identity resolves", () => {
 
   it("leaves an untouched, already-'default' mode as 'default' (idempotent)", () => {
     expect(resolvePermissionModeAfterIdentity("default", true, false)).toBe("default");
+  });
+});
+
+describe("model picker effort control", () => {
+  it("only forwards effort for models routed over the Anthropic Messages wire protocol", () => {
+    expect(modelSupportsEffort({ wireProtocol: "anthropic-messages" })).toBe(true);
+    expect(modelSupportsEffort({ wireProtocol: "openai-chat" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "openai-responses" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "gemini-generate-content" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "ollama-native" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "unsupported" })).toBe(false);
+  });
+
+  it("steps right from 'default' (undefined) through low, medium, high, xhigh, to max, then clamps", () => {
+    let level: (typeof EFFORT_LEVELS)[number] | undefined;
+    for (const expected of EFFORT_LEVELS) {
+      level = nextEffortLevel(level, 1);
+      expect(level).toBe(expected);
+    }
+    expect(nextEffortLevel(level, 1)).toBe("max");
+  });
+
+  it("steps left from max back down to 'default' (undefined), then clamps", () => {
+    let level: (typeof EFFORT_LEVELS)[number] | undefined = "max";
+    for (const expected of [...EFFORT_LEVELS].reverse().slice(1)) {
+      level = nextEffortLevel(level, -1);
+      expect(level).toBe(expected);
+    }
+    expect(nextEffortLevel(level, -1)).toBeUndefined();
+    expect(nextEffortLevel(undefined, -1)).toBeUndefined();
   });
 });
 
@@ -461,5 +500,53 @@ describe("scroll-offset windowing (fullscreen mode)", () => {
     // a phantom "N new messages below" — atTail must reflect what actually moved, not the raw request.
     const windowed = windowItemsByRows([items[0]!], rows, width, 500);
     expect(windowed).toMatchObject({ atTail: true, hasMoreAbove: false, newerItemCount: 0 });
+  });
+});
+
+describe("/copy command parsing and transcript selection", () => {
+  it("defaults to copying one response when called bare", () => {
+    expect(parseCopyCommand("/copy")).toEqual({ kind: "copy", count: 1 });
+  });
+
+  it("parses an explicit count", () => {
+    expect(parseCopyCommand("/copy 3")).toEqual({ kind: "copy", count: 3 });
+  });
+
+  it("parses on/off as a toggle request", () => {
+    expect(parseCopyCommand("/copy on")).toEqual({ kind: "toggle", enabled: true });
+    expect(parseCopyCommand("/copy off")).toEqual({ kind: "toggle", enabled: false });
+  });
+
+  it("rejects malformed arguments", () => {
+    expect(parseCopyCommand("/copy 0")).toBeUndefined();
+    expect(parseCopyCommand("/copy -1")).toBeUndefined();
+    expect(parseCopyCommand("/copy abc")).toBeUndefined();
+    expect(parseCopyCommand("/copy 2.5")).toBeUndefined();
+    expect(parseCopyCommand("/copy 02")).toBeUndefined();
+  });
+
+  it("collects the last N assistant rows, oldest first, ignoring other roles", () => {
+    const transcript: readonly TranscriptItem[] = [
+      { id: "u1", role: "user", text: "hi" },
+      { id: "a1", role: "assistant", text: "first" },
+      { id: "t1", role: "tool", text: "Read" },
+      { id: "a2", role: "assistant", text: "second" },
+      { id: "s1", role: "system", text: "note" },
+      { id: "a3", role: "assistant", text: "third" },
+    ];
+    expect(lastAssistantResponses(transcript, 2)).toEqual(["second", "third"]);
+    expect(lastAssistantResponses(transcript, 1)).toEqual(["third"]);
+  });
+
+  it("returns everything available when N exceeds the number of assistant responses", () => {
+    const transcript: readonly TranscriptItem[] = [
+      { id: "a1", role: "assistant", text: "only" },
+    ];
+    expect(lastAssistantResponses(transcript, 5)).toEqual(["only"]);
+  });
+
+  it("returns an empty list when there are no assistant responses yet", () => {
+    const transcript: readonly TranscriptItem[] = [{ id: "u1", role: "user", text: "hi" }];
+    expect(lastAssistantResponses(transcript, 1)).toEqual([]);
   });
 });

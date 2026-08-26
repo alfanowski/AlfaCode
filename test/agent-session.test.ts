@@ -225,6 +225,51 @@ describe("AgentSession", () => {
     expect(vi.mocked(renameAlfaCodeSession)).toHaveBeenCalledWith("session-1", "My session", { cwd: "/repo", configDir });
   });
 
+  it("forwards setEffortLevel to the query's applyFlagSettings control request", async () => {
+    const applyFlagSettings = vi.fn(async () => undefined);
+    const session = await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      canUseTool: async () => ({ behavior: "allow" }),
+      queryFactory: (() => makeFakeQuery({ applyFlagSettings })) as never,
+    });
+
+    await session.setEffortLevel("high");
+    expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: "high" });
+
+    await session.setEffortLevel(null);
+    expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: null });
+    await session.close();
+  });
+
+  it("captures the engine's reported effort level from the init message", async () => {
+    const fakeQuery = makeFakeQuery({
+      [Symbol.asyncIterator]: async function* (): AsyncIterator<SDKMessage> {
+        yield {
+          type: "system", subtype: "init", session_id: "session-1", model: "route/model",
+          claude_code_version: "2.1.241", capabilities: [], effort: "medium",
+        } as unknown as SDKMessage;
+      },
+    });
+    const session = await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      canUseTool: async () => ({ behavior: "allow" }),
+      queryFactory: (() => fakeQuery) as never,
+    });
+    await expect(session.identity()).resolves.toMatchObject({ effort: "medium" });
+    await session.close();
+  });
+
+  it("omits effort from identity when the engine's init message doesn't report it (older CLIs)", async () => {
+    const session = await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      canUseTool: async () => ({ behavior: "allow" }),
+      queryFactory: (() => makeFakeQuery()) as never,
+    });
+    const identity = await session.identity();
+    expect("effort" in identity).toBe(false);
+    await session.close();
+  });
+
   it("sends image attachments as content blocks ahead of the text block", async () => {
     let prompt: AsyncIterable<unknown> | undefined;
     const fakeQuery = {
