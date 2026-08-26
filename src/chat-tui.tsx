@@ -34,6 +34,17 @@ import {
   type SpellCheckerName,
   type SpellCheckSettings,
 } from "./spellcheck.js";
+import {
+  appendTranscriptLog,
+  emptyTranscriptLog,
+  isScreenReaderMode,
+  numberedLabel,
+  parseNumberedSelection,
+  parseYesNoDecision,
+  ringBell,
+  type TranscriptLogState,
+} from "./ui/screen-reader-mode.js";
+import { ScreenReaderTranscript } from "./ui/screen-reader-transcript.js";
 import { getTheme, resolveThemeName, supportsMotion, themeCatalog, type Theme, type ThemeName } from "./ui/theme.js";
 import { parseTodoWriteTodos, TodoPanel, type TodoItem } from "./ui/todo-panel.js";
 import { stringifyToolPayload, truncateForDisplay } from "./ui/tool-output.js";
@@ -90,6 +101,8 @@ interface ImageAttachment { readonly id: number; readonly mediaType: PromptImage
 
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
 const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+/** How long a running tool call may run before screen-reader mode rings the bell about it. */
+const TOOL_BELL_THRESHOLD_MS = 3_000;
 let transcriptItemSequence = 0;
 const commands: readonly Command[] = [
   { name: "/model", description: "Switch across every live model", shortcut: "⌘M" },
@@ -123,7 +136,7 @@ export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let settled = false;
   const action = new Promise<ChatAction>((resolve) => { resolveAction = resolve; });
   const settle = (value: ChatAction): void => { if (!settled) { settled = true; resolveAction(value); } };
-  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, ...(options.fullscreen ? { alternateScreen: true } : {}) });
+  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, isScreenReaderEnabled: isScreenReaderMode(), ...(options.fullscreen ? { alternateScreen: true } : {}) });
   await instance.waitUntilExit();
   settle({ type: "exit" });
   return action;
@@ -184,11 +197,13 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [spellChecker, setSpellChecker] = useState<SpellCheckerName>();
   const [misspelledRanges, setMisspelledRanges] = useState<readonly MisspelledRange[]>([]);
   const [scrollOffset, setScrollOffset] = useState(0);
+  const [screenReaderLog, setScreenReaderLog] = useState<TranscriptLogState>(emptyTranscriptLog);
   const pendingTurns = useRef(0);
   const contextWarnedRef = useRef(false);
   const previousSessionCostRef = useRef(0);
   const lastEscapeAtRef = useRef(0);
   const imageSequence = useRef(0);
+  const toolBellTimers = useRef(new Map<string, NodeJS.Timeout>());
   const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
   const spellCheckController = useRef<SpellCheckController | undefined>(undefined);
 
@@ -233,6 +248,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (message.type === "result") {
       pendingTurns.current = Math.max(0, pendingTurns.current - 1);
       setBusy(pendingTurns.current > 0);
+      if (isScreenReaderMode()) ringBell();
       const cost = turnCostFromResult(message, previousSessionCostRef.current);
       if (cost !== undefined) {
         previousSessionCostRef.current = cost.cumulativeCostUsd;
@@ -246,6 +262,29 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       });
     }
   }), [loadUsage, session]);
+
+  // Screen-reader mode: turn the mutation-friendly `messages` model into an append-only log
+  // (see appendTranscriptLog) so the transcript can render through Ink's <Static> without ever
+  // rewriting a line already handed to the terminal. Held-back "still streaming" assistant text
+  // is flushed once the turn is no longer busy.
+  useEffect(() => {
+    if (!isScreenReaderMode()) return;
+    setScreenReaderLog((log) => appendTranscriptLog(log, messages, !busy));
+  }, [messages, busy]);
+
+  // Screen-reader mode: ring the bell if a tool call runs past a short threshold, since there's
+  // no spinner to glance at. One timer per in-flight tool id, cleared as soon as it settles.
+  useEffect(() => {
+    if (!isScreenReaderMode()) return;
+    const runningIds = new Set(messages.filter((item) => item.role === "tool" && item.status === "running").map((item) => item.id));
+    for (const id of runningIds) {
+      if (!toolBellTimers.current.has(id)) toolBellTimers.current.set(id, setTimeout(() => ringBell(), TOOL_BELL_THRESHOLD_MS));
+    }
+    for (const [id, timer] of toolBellTimers.current) {
+      if (!runningIds.has(id)) { clearTimeout(timer); toolBellTimers.current.delete(id); }
+    }
+  }, [messages]);
+  useEffect(() => () => { for (const timer of toolBellTimers.current.values()) clearTimeout(timer); }, []);
 
   useEffect(() => {
     let active = true;
@@ -271,6 +310,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       setPermissionComment(undefined);
       setPermissionCommentMode(false);
       setPermissionCommentEditor({ value: "", cursor: 0 });
+      if (isScreenReaderMode()) ringBell();
     }
   }), [permissions]);
 
@@ -282,6 +322,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       setQuestionSelections({});
       setQuestionOtherMode(false);
       setQuestionOtherEditor({ value: "", cursor: 0 });
+      if (isScreenReaderMode()) ringBell();
     }
   }), [permissions]);
 
@@ -357,7 +398,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (key.escape && screen !== "chat") { setScreen("chat"); clearEditor(); return; }
     if (screen === "models") { handleModelInput(text, key); return; }
     if (screen === "providers") { handleProviderInput(text, key); return; }
-    if (screen === "permissions") { handlePermissionModeInput(key); return; }
+    if (screen === "permissions") { handlePermissionModeInput(text, key); return; }
     if (screen === "rewind") { handleRewindInput(key); return; }
     if (screen === "theme") { handleThemeInput(key); return; }
     if (screen === "help" || screen === "usage" || screen === "mcp") return;
@@ -406,6 +447,11 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       const completion = commandMatches[commandCursor]?.name;
       if (completion !== undefined) setEditor({ value: completion, cursor: completion.length });
       return;
+    }
+    if (commandMatches.length > 0 && isScreenReaderMode() && !key.ctrl && !key.meta && /^[1-9]$/.test(text)) {
+      const index = Number(text) - 1;
+      const completion = commandMatches[index]?.name;
+      if (completion !== undefined) { setEditor({ value: completion, cursor: completion.length }); setCommandCursor(index); return; }
     }
     if (mentionQuery !== undefined && mentionMatches.length > 0 && key.upArrow) { setMentionCursor((current) => Math.max(0, current - 1)); return; }
     if (mentionQuery !== undefined && mentionMatches.length > 0 && key.downArrow) { setMentionCursor((current) => Math.min(mentionMatches.length - 1, current + 1)); return; }
@@ -518,20 +564,34 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     }
     applyEdit({ type: "insert", text: `${parts.join(" ")} ` });
   }
+  function selectModel(model: ModelDescriptor): void {
+    const route = encodeModelId(model.providerId, model.id);
+    reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${model.providerId}] ${model.displayName}`); });
+  }
   function handleModelInput(text: string, key: Key): void {
     if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
     else if (key.downArrow) setModelCursor((current) => Math.min(Math.max(0, filteredModels.length - 1), current + 1));
     else if (key.backspace || key.delete) { setModelFilter((current) => current.slice(0, -1)); setModelCursor(0); }
     else if (key.return) {
       const selected = filteredModels[modelCursor];
-      if (selected !== undefined) {
-        const route = encodeModelId(selected.providerId, selected.id);
-        reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${selected.providerId}] ${selected.displayName}`); });
-      }
-    } else if (!key.ctrl && !key.meta && text) { setModelFilter((current) => current + sanitizeTerminalText(text)); setModelCursor(0); }
+      if (selected !== undefined) selectModel(selected);
+    } else if (!key.ctrl && !key.meta && text) {
+      // Screen-reader mode: a single typed digit picks a numbered-list entry (see ModelPicker)
+      // immediately, resolved against the *current* (pre-keystroke) filtered list — deferring to
+      // Enter would be wrong here, since the digit would itself keep narrowing the free-text
+      // search below and the numbering would shift out from under it. Narrow with letters first,
+      // then pick a short list by number; arrow+enter keeps working too either way.
+      const numbered = isScreenReaderMode() ? parseNumberedSelection(text, filteredModels.length) : undefined;
+      const selected = numbered === undefined ? undefined : filteredModels[numbered];
+      if (selected !== undefined) { selectModel(selected); return; }
+      setModelFilter((current) => current + sanitizeTerminalText(text));
+      setModelCursor(0);
+    }
   }
   function handleProviderInput(text: string, key: Key): void {
     const providers = config.providers;
+    const numbered = isScreenReaderMode() ? parseNumberedSelection(text, providers.length) : undefined;
+    if (numbered !== undefined) { setProviderCursor(numbered); return; }
     if (key.upArrow) setProviderCursor((current) => Math.max(0, current - 1));
     else if (key.downArrow) setProviderCursor((current) => Math.min(Math.max(0, providers.length - 1), current + 1));
     else if (text === "a") finish({ type: "connect" });
@@ -539,8 +599,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     else if (text === "r" && providers[providerCursor] !== undefined) finish({ type: "reconnect-provider", providerId: providers[providerCursor]!.id });
     else if (key.return && providers[providerCursor] !== undefined) finish({ type: "set-default-provider", providerId: providers[providerCursor]!.id });
   }
-  function handlePermissionModeInput(key: Key): void {
+  function handlePermissionModeInput(text: string, key: Key): void {
     const index = modes.indexOf(permissionMode);
+    const numbered = isScreenReaderMode() ? parseNumberedSelection(text, modes.length) : undefined;
+    if (numbered !== undefined) { setPermissionModeState(modes[numbered] ?? "default"); return; }
     if (key.upArrow) setPermissionModeState(modes[Math.max(0, index - 1)] ?? "default");
     else if (key.downArrow) setPermissionModeState(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
     else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
@@ -605,15 +667,20 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       setPermissionCommentEditor({ value: permissionComment ?? "", cursor: (permissionComment ?? "").length });
       return;
     }
+    const decideAndRecord = (decidedCursor: number): void => {
+      const label = decidedCursor === 0 ? "Deny" : request.suggestions.length > 0 && decidedCursor === 2 ? "Always allow" : "Allow once";
+      appendSystem(setMessages, describePermissionDecision(request.toolName, label, permissionComment));
+      if (decidedCursor === 0) permissions.deny(permissionComment !== undefined && permissionComment.length > 0 ? permissionComment : undefined);
+      else permissions.allow(decidedCursor === 2);
+      setPermissionComment(undefined);
+    };
+    if (isScreenReaderMode() && !key.ctrl && !key.meta) {
+      const decision = parseYesNoDecision(text, request.suggestions.length > 0);
+      if (decision !== undefined) { decideAndRecord(decision === "deny" ? 0 : decision === "allow-always" ? 2 : 1); return; }
+    }
     if (key.leftArrow) { setPermissionCursor((current) => Math.max(0, current - 1)); return; }
     if (key.rightArrow) { setPermissionCursor((current) => Math.min(request.suggestions.length > 0 ? 2 : 1, current + 1)); return; }
-    if (key.return) {
-      const label = permissionCursor === 0 ? "Deny" : request.suggestions.length > 0 && permissionCursor === 2 ? "Always allow" : "Allow once";
-      appendSystem(setMessages, describePermissionDecision(request.toolName, label, permissionComment));
-      if (permissionCursor === 0) permissions.deny(permissionComment !== undefined && permissionComment.length > 0 ? permissionComment : undefined);
-      else permissions.allow(permissionCursor === 2);
-      setPermissionComment(undefined);
-    }
+    if (key.return) decideAndRecord(permissionCursor);
   }
   function handleQuestionInput(text: string, key: Key, request: UserQuestionRequest): void {
     const question = request.questions[questionIndex];
@@ -632,6 +699,22 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     }
     const otherIndex = question.options.length;
     if (key.escape) { permissions.cancelQuestions(); return; }
+    // Screen-reader mode: type a number instead of arrowing to an option (0 is "Other"). Single
+    // choice answers and advances immediately, like Enter; multiple choice toggles, like Space.
+    if (isScreenReaderMode() && !key.ctrl && !key.meta && /^[0-9]$/.test(text)) {
+      if (text === "0") { setQuestionCursor(otherIndex); setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
+      const digitIndex = Number(text) - 1;
+      const label = question.options[digitIndex]?.label;
+      if (label !== undefined) {
+        setQuestionCursor(digitIndex);
+        if (!question.multiSelect) { completeQuestion(request, [label]); return; }
+        setQuestionSelections((current) => {
+          const selected = current[questionIndex] ?? [];
+          return { ...current, [questionIndex]: selected.includes(label) ? selected.filter((item) => item !== label) : [...selected, label] };
+        });
+        return;
+      }
+    }
     if (key.upArrow) { setQuestionCursor((current) => Math.max(0, current - 1)); return; }
     if (key.downArrow) { setQuestionCursor((current) => Math.min(otherIndex, current + 1)); return; }
     if (key.tab) { setQuestionCursor((current) => (current + 1) % (otherIndex + 1)); return; }
@@ -690,7 +773,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       return;
     }
     if (name === "/help") { setScreen("help"); return; }
-    if (name === "/clear") { setMessages([]); return; }
+    if (name === "/clear") { setMessages([]); setScreenReaderLog(emptyTranscriptLog); return; }
     if (name === "/exit" || name === "/quit") return finish({ type: "exit" });
     if (name === "/usage" || name === "/context") { await refreshTelemetry(session, loadUsage, setContextUsage, setUsage); setScreen("usage"); return; }
     if (name === "/agents") {
@@ -749,13 +832,17 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
+  const screenReader = isScreenReaderMode();
   const scrollIndicatorVisible = fullscreen && screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && !scrollWindow.atTail;
   return <Box flexDirection="column" paddingX={1} width={width} {...(fullscreen ? { height } : {})}>
     <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={identity.compatibility.compatible} busy={busy} theme={theme} width={width} />
     {screen === "chat" ? <BackgroundTasksPanel tasks={backgroundTasks} theme={theme} /> : null}
     {screen === "chat" ? <TodoPanel todos={todos} collapsed={todoPanelCollapsed} theme={theme} /> : null}
-    <Box flexDirection="column" minHeight={transcriptRows} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
-      {screen === "chat" ? <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} /> : null}
+    {/* Screen-reader mode doesn't reserve a fixed-height scrolling viewport: the transcript
+        lives in <Static> above this frame instead, so a fixed minHeight would only pad the
+        live, redrawn region with blank lines. */}
+    <Box flexDirection="column" {...(screenReader ? {} : { minHeight: transcriptRows })} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
+      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} busy={busy} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={transcriptWidth} /> : null}
@@ -932,8 +1019,9 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
 }
 
 function CommandPalette({ commands: matches, cursor, theme }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, matches.length - 6)));
-  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
+  return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : "  "}<Text bold={active}>{numbered ? numberedLabel(start + index, command.name) : command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
 }
 
 /** Mirrors CommandPalette's navigate/tab/accept interaction on purpose — see mentions.ts. */
@@ -943,13 +1031,15 @@ function MentionPalette({ entries, cursor, theme }: { readonly entries: readonly
 }
 
 function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
   const visibleRows = Math.max(5, height - 4);
   const start = Math.max(0, Math.min(cursor - Math.floor(visibleRows / 2), Math.max(0, models.length - visibleRows)));
-  return <Box flexDirection="column"><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{model.displayName}</Text><Text color={theme.muted}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>↑↓ navigate · enter switch · esc back</HintBar></Box>;
+  return <Box flexDirection="column"><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model, index) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.text}>{active ? "❯ " : ""}<Text bold={active}>{numbered ? numberedLabel(start + index, model.displayName) : model.displayName}</Text><Text color={theme.muted}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · enter switch · esc back</HintBar></Box>;
 }
 
 function ProviderManager({ providers, models, cursor, defaultId, theme }: { readonly providers: readonly ProviderRecord[]; readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly defaultId?: string; readonly theme: Theme }): React.JSX.Element {
-  return <Box flexDirection="column"><SectionTitle title="Providers" detail="all active simultaneously · routing is automatic" theme={theme} />{providers.map((provider, index) => { const available = models.filter((model) => model.providerId === provider.id && model.availability === "available" && model.capabilities.tools).length; const active = cursor === index; return <Box key={provider.id} flexDirection="column" borderStyle="round" borderColor={active ? theme.accent : theme.border} paddingX={1} marginBottom={1}><Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{provider.id}</Text><StatusBadge label={available > 0 ? "ready" : "unavailable"} tone={available > 0 ? "success" : "danger"} theme={theme} /></Box><Text color={theme.muted}>{provider.type} · {provider.apiKey === undefined ? "public access" : provider.apiKey.kind === "keychain" ? "Keychain" : `env ${provider.apiKey.name}`} · {available} callable model{available === 1 ? "" : "s"}{provider.id === defaultId ? " · preferred tie-breaker" : ""}</Text></Box>; })}{providers.length === 0 ? <Text color={theme.muted}>No provider connected. Press a to add one.</Text> : null}<HintBar theme={theme}>a add · d delete · r reconnect · enter prefer · esc back</HintBar></Box>;
+  const numbered = isScreenReaderMode();
+  return <Box flexDirection="column"><SectionTitle title="Providers" detail="all active simultaneously · routing is automatic" theme={theme} />{providers.map((provider, index) => { const available = models.filter((model) => model.providerId === provider.id && model.availability === "available" && model.capabilities.tools).length; const active = cursor === index; return <Box key={provider.id} flexDirection="column" borderStyle="round" borderColor={active ? theme.accent : theme.border} paddingX={1} marginBottom={1}><Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{numbered ? numberedLabel(index, provider.id) : provider.id}</Text><StatusBadge label={available > 0 ? "ready" : "unavailable"} tone={available > 0 ? "success" : "danger"} theme={theme} /></Box><Text color={theme.muted}>{provider.type} · {provider.apiKey === undefined ? "public access" : provider.apiKey.kind === "keychain" ? "Keychain" : `env ${provider.apiKey.name}`} · {available} callable model{available === 1 ? "" : "s"}{provider.id === defaultId ? " · preferred tie-breaker" : ""}</Text></Box>; })}{providers.length === 0 ? <Text color={theme.muted}>No provider connected. Press a to add one.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to focus · " : ""}a add · d delete · r reconnect · enter prefer · esc back</HintBar></Box>;
 }
 function DeleteConfirmation({ providerId, theme }: { readonly providerId: string; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column" borderStyle="double" borderColor={theme.danger} paddingX={2} paddingY={1}><Text bold color={theme.danger}>Delete “{providerId}”?</Text><Text color={theme.text}>Its AlfaCode configuration and Keychain credential will be removed.</Text><Box marginTop={1} columnGap={2}><KeyHint shortcut="y" label="delete permanently" theme={theme} /><KeyHint shortcut="n" label="cancel" theme={theme} /></Box></Box>; }
 
@@ -974,8 +1064,9 @@ function UsagePanel({ usage, context, sessionCostUsd, theme, width }: { readonly
 }
 function Metric({ label, value, format, theme }: { readonly label: string; readonly value: number; readonly format?: (value: number) => string; readonly theme: Theme }): React.JSX.Element { return <Box flexDirection="column"><Text bold color={theme.secondarySoft}>{format === undefined ? formatCompact(value) : format(value)}</Text><Text color={theme.faint}>{label}</Text></Box>; }
 function PermissionPicker({ selected, theme }: { readonly selected: PermissionMode; readonly theme: Theme }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
   const descriptions: Partial<Record<PermissionMode, string>> = { default: "Ask before sensitive actions", acceptEdits: "Accept file edits", plan: "Read-only planning", dontAsk: "Deny unapproved actions", bypassPermissions: "Bypass every prompt", auto: "Engine evaluates risk automatically" };
-  return <Box flexDirection="column"><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.text}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>↑↓ select · enter apply · esc back</HintBar></Box>;
+  return <Box flexDirection="column"><SectionTitle title="Permission mode" detail="controls how tools are approved" theme={theme} />{modes.map((mode, index) => <Box key={mode} flexDirection="column" paddingLeft={selected === mode ? 0 : 2}><Text color={selected === mode ? theme.accent : theme.text}>{selected === mode ? "❯ " : ""}<Text bold={selected === mode}>{numbered ? numberedLabel(index, mode) : mode}</Text></Text>{selected === mode ? <Text color={theme.faint}>  {descriptions[mode] ?? "Custom engine permission mode"}</Text> : null}</Box>)}<HintBar theme={theme}>{numbered ? "type a number · " : ""}↑↓ select · enter apply · esc back</HintBar></Box>;
 }
 function ThemePicker({ selected, theme }: { readonly selected: ThemeName; readonly theme: Theme }): React.JSX.Element {
   return <Box flexDirection="column"><SectionTitle title="Theme" detail="dark, light, and colorblind-friendly variants" theme={theme} />{themeCatalog.map((entry) => {
@@ -1001,6 +1092,7 @@ function McpPanel({ servers, theme }: { readonly servers: readonly McpServerStat
 }
 
 function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
   const question = request.questions[questionIndex];
   if (question === undefined) return <></>;
   const selected = selections[questionIndex] ?? [];
@@ -1014,19 +1106,20 @@ function QuestionCard({ request, questionIndex, cursor, selections, otherMode, o
       const active = cursor === index && !otherMode;
       const checked = selected.includes(option.label);
       return <Box key={option.label} flexDirection="column" paddingLeft={active ? 0 : 2}>
-        <Text color={active ? theme.accent : checked ? theme.success : theme.text}>{active ? "❯ " : ""}{question.multiSelect ? checked ? "[✓] " : "[ ] " : checked ? "◉ " : "○ "}<Text bold={active || checked}>{option.label}</Text></Text>
+        <Text color={active ? theme.accent : checked ? theme.success : theme.text}>{active ? "❯ " : ""}{question.multiSelect ? checked ? "[✓] " : "[ ] " : checked ? "◉ " : "○ "}<Text bold={active || checked}>{numbered ? numberedLabel(index, option.label) : option.label}</Text></Text>
         {active ? <Text color={theme.muted}>    {option.description}</Text> : null}
       </Box>;
     })}
       <Box flexDirection="column" paddingLeft={cursor === question.options.length && !otherMode ? 0 : 2}>
-        <Text color={cursor === question.options.length || otherMode ? theme.accent : theme.text}>{cursor === question.options.length && !otherMode ? "❯ " : ""}○ <Text bold={otherMode}>Other</Text><Text color={theme.faint}>  type a custom answer</Text></Text>
+        <Text color={cursor === question.options.length || otherMode ? theme.accent : theme.text}>{cursor === question.options.length && !otherMode ? "❯ " : ""}○ <Text bold={otherMode}>{numbered ? "0) Other" : "Other"}</Text><Text color={theme.faint}>  type a custom answer</Text></Text>
       </Box>
     </Box>
     {preview === undefined || otherMode ? null : <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1} marginTop={1}><Text bold color={theme.faint}>PREVIEW</Text><Markdown theme={theme} width={Math.max(20, width - 8)}>{preview}</Markdown></Box>}
-    {otherMode ? <Box flexDirection="column" marginTop={1}><Text bold color={theme.muted}>YOUR ANSWER</Text><Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box><Text color={theme.faint}>enter confirm · esc return to choices</Text></Box> : <Text color={theme.faint}>{question.multiSelect ? "space toggle · enter confirm · " : "enter select · "}↑↓ navigate · tab next · esc dismiss</Text>}
+    {otherMode ? <Box flexDirection="column" marginTop={1}><Text bold color={theme.muted}>YOUR ANSWER</Text><Box borderStyle="round" borderColor={theme.accent} paddingX={1}><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Box><Text color={theme.faint}>enter confirm · esc return to choices</Text></Box> : <Text color={theme.faint}>{numbered ? "type a number (0 for other) · " : ""}{question.multiSelect ? "space toggle · enter confirm · " : "enter select · "}↑↓ navigate · tab next · esc dismiss</Text>}
   </Box>;
 }
 function PermissionCard({ request, cursor, comment, commentMode, commentEditor, theme }: { readonly request: PermissionRequest; readonly cursor: number; readonly comment: string | undefined; readonly commentMode: boolean; readonly commentEditor: EditorState; readonly theme: Theme }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
   const options = request.suggestions.length > 0 ? ["Deny", "Allow once", "Always allow"] : ["Deny", "Allow once"];
   const split = splitAtCursor(commentEditor);
   return <Box flexDirection="column" borderStyle="double" borderColor={theme.warning} paddingX={2} paddingY={1} marginTop={1}>
@@ -1043,7 +1136,7 @@ function PermissionCard({ request, cursor, comment, commentMode, commentEditor, 
       : <>
           {comment === undefined ? null : <Text color={theme.secondarySoft}>note: “{comment}”</Text>}
           <Box marginTop={1} columnGap={2}>{options.map((option, index) => <Text key={option} bold={index === cursor} inverse={index === cursor} color={index === 0 ? theme.danger : theme.success}> {option} </Text>)}</Box>
-          <Text color={theme.faint}>←→ choose · tab {comment === undefined ? "add" : "edit"} note · enter confirm</Text>
+          <Text color={theme.faint}>{numbered ? `←→ choose · tab ${comment === undefined ? "add" : "edit"} note · enter confirm · or type y${request.suggestions.length > 0 ? "/a" : ""}/n` : `←→ choose · tab ${comment === undefined ? "add" : "edit"} note · enter confirm`}</Text>
         </>}
   </Box>;
 }

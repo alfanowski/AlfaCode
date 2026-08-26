@@ -65,7 +65,7 @@ export interface CreateCliOptions {
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
 interface RemoveFlags { readonly deleteKeychain?: boolean; }
 interface UsageFlags { readonly json?: boolean; readonly provider?: string; readonly model?: string; readonly session?: string; readonly limit?: string; }
-interface NativeLaunchFlags { readonly fullscreen?: boolean; }
+interface NativeLaunchFlags { readonly fullscreen?: boolean; readonly screenReader?: boolean; }
 
 export function createCli(options: CreateCliOptions = {}): Command {
   const configStore = options.configStore ?? new ConfigStore();
@@ -275,6 +275,10 @@ export function createCli(options: CreateCliOptions = {}): Command {
   };
 
   const nativeLaunch = async (args: readonly string[], flags: NativeLaunchFlags = {}): Promise<void> => {
+    // Minimal additive opt-in: --screen-reader is sugar for ALFACODE_SCREEN_READER=1, read
+    // directly by the UI modules (see ui/screen-reader-mode.ts), the same way ALFACODE_THEME and
+    // ALFACODE_REDUCED_MOTION already work.
+    if (flags.screenReader) process.env.ALFACODE_SCREEN_READER = "1";
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     const resumeFlag = parseResumeFlag(args);
     const continueFlag = parseContinueFlag(args);
@@ -353,6 +357,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
   const program = new Command();
   program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true)
     .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer")
+    .option("--screen-reader", "Render a plain, linear, screen-reader-friendly UI (same as ALFACODE_SCREEN_READER=1)")
     .action(nativeLaunch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
     .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely").option("--base-url <url>", "Base URL for an OpenAI-compatible provider")

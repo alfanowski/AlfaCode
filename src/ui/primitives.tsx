@@ -2,6 +2,7 @@ import React from "react";
 import { Box, Text } from "ink";
 import type { Theme } from "./theme.js";
 import { useSpinner } from "./motion.js";
+import { isScreenReaderMode } from "./screen-reader-mode.js";
 
 export function Brand({ theme, compact = false }: { readonly theme: Theme; readonly compact?: boolean }): React.JSX.Element {
   return <Text bold><Text color={theme.accent}>◆</Text><Text color={theme.text}> Alfa</Text><Text color={theme.secondary}>Code</Text>{compact ? null : <Text color={theme.faint}> / agent terminal</Text>}</Text>;
@@ -29,6 +30,9 @@ export function StatusBadge({ label, tone, theme }: { readonly label: string; re
 
 export function LoadingLabel({ children, theme }: React.PropsWithChildren<{ readonly theme: Theme }>): React.JSX.Element {
   const spinner = useSpinner();
+  // Screen-reader mode disables the animation itself (see ui/motion.ts), but the glyph would
+  // still render as one static, meaningless braille character; a plain label reads better.
+  if (isScreenReaderMode()) return <Text color={theme.text}>{children}</Text>;
   return <Text color={theme.accent}>{spinner} <Text color={theme.text}>{children}</Text></Text>;
 }
 
