@@ -36,6 +36,7 @@ export interface TranscriptItem {
   readonly text: string;
   readonly status?: "running" | "completed" | "failed";
   readonly detail?: string;
+  readonly streamId?: string | null;
 }
 
 type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help";
@@ -43,6 +44,8 @@ type ContextUsage = { readonly totalTokens: number; readonly maxTokens: number; 
 interface Command { readonly name: string; readonly description: string; readonly shortcut?: string }
 
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
+const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+let transcriptItemSequence = 0;
 const commands: readonly Command[] = [
   { name: "/model", description: "Switch across every live model", shortcut: "⌘M" },
   { name: "/providers", description: "Manage connected providers" },
@@ -243,7 +246,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, re
   }
   function sendPrompt(prompt: string): void {
     setPromptSuggestion(undefined);
-    setMessages((current) => [...current, { id: `user-${Date.now()}`, role: "user", text: prompt }]);
+    setMessages((current) => [...current, { id: createTranscriptItemId("user"), role: "user", text: prompt }]);
     pendingTurns.current += 1;
     setBusy(true);
     try { session.sendPrompt(prompt); }
@@ -411,9 +414,9 @@ export function reduceSdkMessage(current: readonly TranscriptItem[], message: SD
 
 function appendAssistantDelta(items: TranscriptItem[], text: string, parent: string | null): TranscriptItem[] {
   const last = items.at(-1);
-  const id = parent === null ? "assistant-main" : `assistant-${parent}`;
-  if (last?.role === "assistant" && last.id === id) return [...items.slice(0, -1), { ...last, text: last.text + text }];
-  return [...items, { id, role: "assistant", text }];
+  const streamId = parent;
+  if (last?.role === "assistant" && last.streamId === streamId) return [...items.slice(0, -1), { ...last, text: last.text + text }];
+  return [...items, { id: createTranscriptItemId("assistant"), role: "assistant", text, streamId }];
 }
 function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string): TranscriptItem[] {
   const index = items.findIndex((item) => item.id === id);
@@ -436,11 +439,11 @@ function Header({ model, mode, providers, compatible, busy, theme, width }: { re
 
 function Transcript({ items, theme, width, busy }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean }): React.JSX.Element {
   if (items.length === 0) return <EmptyState theme={theme} />;
-  return <>{items.map((item, index) => {
-    if (item.role === "assistant") return <Box key={`${item.id}-${index}`} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
-    if (item.role === "user") return <Box key={`${item.id}-${index}`} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={`${item.id}-${index}`} item={item} theme={theme} />;
-    return <Box key={`${item.id}-${index}`} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
+  return <>{items.map((item) => {
+    if (item.role === "assistant") return <Box key={item.id} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
+    if (item.role === "user") return <Box key={item.id} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} />;
+    return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
   })}{busy && items.at(-1)?.role !== "tool" ? <ThinkingLine theme={theme} /> : null}</>;
 }
 function ToolActivity({ item, theme }: { readonly item: TranscriptItem; readonly theme: Theme }): React.JSX.Element {
@@ -551,10 +554,11 @@ async function refreshTelemetry(session: AgentSession, loadUsage: () => Promise<
 function contextualHint(messages: readonly TranscriptItem[], busy: boolean): string { if (busy) return "Queue your next request…"; const last = messages.at(-1); if (last === undefined) return "Ask AlfaCode anything, or type / for commands"; if (last.role === "system") return "Retry, switch /model, or inspect /usage"; if (last.role === "tool") return "Follow up on the tool result…"; return "Ask a follow-up, request a change, or type /"; }
 function truncatePreview(value: string): string { const lines = value.split("\n"); const visible = lines.slice(0, 8).join("\n").slice(0, 1_200); return visible.length < value.length ? `${visible}\n\n_…preview truncated_` : visible; }
 function safeCommandName(value: string): string | undefined { const sanitized = sanitizeTerminalText(value).trim().replace(/^\/+/, ""); return sanitized.length === 0 || /\s/u.test(sanitized) ? undefined : `/${sanitized.slice(0, 100)}`; }
-function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: `system-${Date.now()}`, role: "system", text: sanitizeTerminalText(text) }]); }
+export function createTranscriptItemId(prefix: "user" | "assistant" | "system"): string { transcriptItemSequence += 1; return `${prefix}-${transcriptItemSequence}`; }
+function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: createTranscriptItemId("system"), role: "system", text: sanitizeTerminalText(text) }]); }
 function shortModel(model: string): string { return decodeModelId(model)?.upstreamModel ?? model.split("/").at(-1) ?? model; }
 function providerFromRoute(model: string): string { return decodeModelId(model)?.providerId ?? model.split("/")[0] ?? "auto"; }
-function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value); }
+function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return compactNumberFormatter.format(value); }
 function estimateTokens(value: string): number { return value.length === 0 ? 0 : Math.max(1, Math.ceil(value.length / 4)); }
 function attemptHasUsage(attempt: UsageSummary["attempts"][number]): boolean { return attempt.totalTokens !== undefined || attempt.inputTokens !== undefined || attempt.outputTokens !== undefined; }
 function attemptTokenCount(attempt: UsageSummary["attempts"][number]): number { return attempt.totalTokens ?? (attempt.inputTokens ?? 0) + (attempt.outputTokens ?? 0); }

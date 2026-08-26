@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { commandSuggestions, reduceSdkMessage, tailItemsByRows } from "../src/chat-tui.js";
+import { commandSuggestions, createTranscriptItemId, reduceSdkMessage, tailItemsByRows } from "../src/chat-tui.js";
 
 describe("chat transcript reducer", () => {
   it("assembles streamed assistant text and exposes tool activity", () => {
@@ -17,10 +17,33 @@ describe("chat transcript reducer", () => {
       event: { type: "content_block_start", content_block: { type: "tool_use", id: "tool", name: "Read", input: {} } },
     } as unknown as SDKMessage);
 
-    expect(tool).toEqual([
-      { id: "assistant-main", role: "assistant", text: "AlfaCode" },
+    expect(tool).toMatchObject([
+      { role: "assistant", text: "AlfaCode", streamId: null },
       { id: "tool-three-1", role: "tool", text: "Read", status: "running" },
     ]);
+  });
+
+  it("keeps assistant row ids unique across non-adjacent stream segments", () => {
+    const first = reduceSdkMessage([], {
+      type: "stream_event", uuid: "one", session_id: "session", parent_tool_use_id: null,
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "Before tool" } },
+    } as unknown as SDKMessage);
+    const tool = reduceSdkMessage(first, {
+      type: "stream_event", uuid: "two", session_id: "session", parent_tool_use_id: null,
+      event: { type: "content_block_start", content_block: { type: "tool_use", id: "tool", name: "Read", input: {} } },
+    } as unknown as SDKMessage);
+    const resumed = reduceSdkMessage(tool, {
+      type: "stream_event", uuid: "three", session_id: "session", parent_tool_use_id: null,
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "After" } },
+    } as unknown as SDKMessage);
+    const continued = reduceSdkMessage(resumed, {
+      type: "stream_event", uuid: "four", session_id: "session", parent_tool_use_id: null,
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: " tool" } },
+    } as unknown as SDKMessage);
+    const assistantRows = continued.filter((item) => item.role === "assistant");
+
+    expect(assistantRows.map((item) => item.text)).toEqual(["Before tool", "After tool"]);
+    expect(new Set(assistantRows.map((item) => item.id)).size).toBe(2);
   });
 
   it("collapses subagent lifecycle events into one live activity row", () => {
@@ -48,5 +71,14 @@ describe("chat transcript reducer", () => {
       { id: "three", role: "assistant", text: "third" },
     ] as const;
     expect(tailItemsByRows(items, 4, 80).map((item) => item.id)).toEqual(["two", "three"]);
+  });
+
+  it("assigns distinct transcript ids to items created in the same tick", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      expect(createTranscriptItemId("user")).not.toBe(createTranscriptItemId("user"));
+    } finally {
+      now.mockRestore();
+    }
   });
 });

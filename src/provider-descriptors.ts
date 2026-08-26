@@ -1,4 +1,5 @@
 import type { DynamicProviderDescriptorData } from "./models-dev-runtime.js";
+import { sanitizeTerminalText } from "./ui/markdown.js";
 
 export interface ProviderDescriptor {
   readonly id: string;
@@ -28,7 +29,7 @@ export function descriptorsFromDynamicCatalog(entries: readonly DynamicProviderD
       id: `catalog-${safeId(entry.catalogProviderId)}-${safeId(entry.wireProtocol)}`,
       configType: "catalog",
       displayName: `${entry.displayName} · ${entry.wireProtocol}`,
-      description: `Dynamic models from ${entry.catalogProviderId}`,
+      description: `Dynamic models from ${sanitizeTerminalText(entry.catalogProviderId)}`,
       requiresBaseUrl: true,
       suggestedBaseUrl: entry.baseUrl,
       configurationOptions: { catalogProviderId: entry.catalogProviderId, wireProtocol: entry.wireProtocol },
