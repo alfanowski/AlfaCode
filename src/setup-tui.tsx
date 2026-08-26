@@ -3,7 +3,7 @@ import { Box, Text, render, useApp, useInput, useStdout, type Key } from "ink";
 import type { ProviderDescriptor } from "./provider-descriptors.js";
 import { editInput, splitAtCursor, type EditorOperation, type EditorState } from "./ui/input-editor.js";
 import { sanitizeTerminalText } from "./ui/markdown.js";
-import { Brand, HintBar, LoadingLabel, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { Brand, HintBar, LoadingLabel, panelBorder, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import { resolveTheme, type Theme } from "./ui/theme.js";
 import { isScreenReaderMode, numberedLabel, parseNumberedSelection } from "./ui/screen-reader-mode.js";
 
@@ -135,13 +135,13 @@ export function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOpt
     setStage("provider");
   }
 
-  return <Box flexDirection="column" paddingX={2} width={Math.max(52, stdout.columns ?? 92)}>
-    <Box justifyContent="space-between" borderStyle="round" borderColor={theme.border} paddingX={1} marginBottom={1}>
+  return <Box flexDirection="column" paddingX={2} paddingY={1} width={Math.max(52, stdout.columns ?? 92)}>
+    <Box justifyContent="space-between" {...panelBorder(theme, "quiet")} paddingX={1} marginBottom={1}>
       <Brand theme={theme} compact />
       <Text color={theme.muted}>Provider setup</Text>
     </Box>
     <StepRail stage={stage} theme={theme} />
-    {notice === undefined ? null : <Box borderStyle="single" borderColor={theme.warning} paddingX={1} marginBottom={1}><Text color={theme.warning}>! </Text><Text>{notice}</Text></Box>}
+    {notice === undefined ? null : <Box borderStyle="round" borderColor={theme.warning} paddingX={1} marginBottom={1}><Text color={theme.warning}>! </Text><Text>{notice}</Text></Box>}
     <Box flexDirection="column" minHeight={height}>
       {stage === "provider" ? <ProviderList filtered={filtered} visible={visible} cursor={cursor} query={query} theme={theme} /> : null}
       {stage === "auth" ? <AuthChoice selected={selected} cursor={authCursor} theme={theme} /> : null}
@@ -156,14 +156,14 @@ export function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOpt
 function ProviderList({ filtered, visible, cursor, query, theme }: { readonly filtered: readonly ProviderDescriptor[]; readonly visible: readonly ProviderDescriptor[]; readonly cursor: number; readonly query: EditorState; readonly theme: Theme }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const start = filtered.length === 0 ? 0 : filtered.indexOf(visible[0]!);
-  return <Box flexDirection="column">
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}>
     <SectionTitle title="Choose a provider" detail={`${filtered.length} connector${filtered.length === 1 ? "" : "s"} available`} theme={theme} />
     <SearchBox editor={query} placeholder="Search Google, Zen, Anthropic, OpenAI…" theme={theme} />
     <Box flexDirection="column" marginTop={1}>{visible.map((item, index) => {
       const active = filtered[cursor]?.id === item.id;
-      return <Box key={item.id} flexDirection="column" borderStyle="round" borderColor={active ? theme.accent : theme.border} paddingX={1} marginBottom={1}>
-        <Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{numbered ? numberedLabel(start + index, item.displayName) : item.displayName}</Text>{item.allowsAnonymous ? <StatusBadge label="free option" tone="success" theme={theme} /> : null}</Box>
-        <Text color={theme.muted}>{item.description}</Text>
+      return <Box key={item.id} flexDirection="column" paddingLeft={active ? 0 : 2} marginBottom={1}>
+        <Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.muted}>{active ? "❯ " : ""}{numbered ? numberedLabel(start + index, item.displayName) : item.displayName}</Text>{item.allowsAnonymous ? <StatusBadge label="free option" tone="success" theme={theme} /> : null}</Box>
+        {active ? <Text color={theme.faint}>  {item.description}</Text> : null}
       </Box>;
     })}</Box>
     {filtered.length === 0 ? <Text color={theme.muted}>No provider matches “{query.value}”. Press Esc to clear the search.</Text> : null}
@@ -177,12 +177,15 @@ function AuthChoice({ selected, cursor, theme }: { readonly selected: ProviderDe
     { title: "Free public models", description: "No account, API key or billing setup required", badge: "recommended" },
     { title: "Zen API key", description: "Use account models, limits and billing", badge: "advanced" },
   ];
-  return <Box flexDirection="column">
+  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}>
     <SectionTitle title={`Connect ${selected?.displayName ?? "provider"}`} detail="choose how AlfaCode should authenticate" theme={theme} />
-    {options.map((option, index) => <Box key={option.title} flexDirection="column" borderStyle="round" borderColor={cursor === index ? theme.accent : theme.border} paddingX={2} paddingY={1} marginBottom={1}>
-      <Box justifyContent="space-between"><Text bold color={cursor === index ? theme.accent : theme.text}>{cursor === index ? "◆ " : "◇ "}{numbered ? numberedLabel(index, option.title) : option.title}</Text><Text color={index === 0 ? theme.success : theme.muted}>{option.badge}</Text></Box>
-      <Text color={theme.muted}>{option.description}</Text>
-    </Box>)}
+    {options.map((option, index) => {
+      const active = cursor === index;
+      return <Box key={option.title} flexDirection="column" paddingLeft={active ? 0 : 2} marginBottom={1}>
+        <Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.muted}>{active ? "❯ " : ""}{numbered ? numberedLabel(index, option.title) : option.title}</Text><Text color={index === 0 ? theme.success : theme.faint}>{option.badge}</Text></Box>
+        {active ? <Text color={theme.faint}>  {option.description}</Text> : null}
+      </Box>;
+    })}
     <HintBar theme={theme}>{numbered ? "type 1 or 2 · " : ""}↑↓ choose · enter continue · esc back</HintBar>
   </Box>;
 }
@@ -192,7 +195,7 @@ function Prompt({ title, description, editor, masked, theme, environmentVariable
   return <Box flexDirection="column">
     <Text bold color={theme.text}>{title}</Text>
     <Text color={theme.muted}>{description}</Text>
-    <Box borderStyle="round" borderColor={theme.accent} paddingX={1} minHeight={3} marginTop={1}><Text color={theme.text}>{shown.before}</Text><Text inverse color={theme.text}>{shown.cursor}</Text><Text color={theme.text}>{shown.after}</Text>{editor.value.length === 0 ? <Text color={theme.faint}>{masked ? " Paste your API key here" : " Enter the endpoint URL"}</Text> : null}</Box>
+    <Box {...panelBorder(theme, "active")} paddingX={1} minHeight={3} marginTop={1}><Text color={theme.text}>{shown.before}</Text><Text inverse color={theme.text}>{shown.cursor}</Text><Text color={theme.text}>{shown.after}</Text>{editor.value.length === 0 ? <Text color={theme.faint}>{masked ? " Paste your API key here" : " Enter the endpoint URL"}</Text> : null}</Box>
     <Box marginTop={1} flexDirection="column">
       {masked ? <Text color={theme.success}>◆ Will be stored in the system credential vault; never written to config or sent to the chat.</Text> : null}
       {environmentVariables === undefined || environmentVariables.length === 0 ? null : <Text color={theme.faint}>Provider variable: {environmentVariables.join(" or ")}</Text>}
@@ -203,7 +206,7 @@ function Prompt({ title, description, editor, masked, theme, environmentVariable
 
 function SearchBox({ editor, placeholder, theme }: { readonly editor: EditorState; readonly placeholder: string; readonly theme: Theme }): React.JSX.Element {
   const split = splitAtCursor(editor);
-  return <Box borderStyle="round" borderColor={theme.border} paddingX={1}><Text color={theme.accent}>⌕ </Text>{editor.value.length === 0 ? <Text><Text inverse> </Text><Text color={theme.faint}>{placeholder}</Text></Text> : <Text><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Text>}</Box>;
+  return <Box {...panelBorder(theme, "active")} paddingX={1}><Text color={theme.accent}>⌕ </Text>{editor.value.length === 0 ? <Text><Text inverse> </Text><Text color={theme.faint}>{placeholder}</Text></Text> : <Text><Text>{split.before}</Text><Text inverse>{split.cursor}</Text><Text>{split.after}</Text></Text>}</Box>;
 }
 
 function Connecting({ selected, theme }: { readonly selected: ProviderDescriptor | undefined; readonly theme: Theme }): React.JSX.Element {

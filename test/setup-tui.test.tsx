@@ -59,3 +59,36 @@ describe("screen-reader numbered provider selection (setup-tui ProviderList)", (
     expect(frame).not.toContain("Connect Bravo Sky");
   });
 });
+
+describe("selected-row treatment (setup-tui pickers)", () => {
+  // StepRail (Provider / Credentials / Verify) legitimately keeps its own ◆/◇/✓ progress glyphs —
+  // a different concept (wizard step position) from a list's selected-row marker — so these
+  // assertions target the specific provider/option rows rather than the whole frame.
+  it("marks the current provider row with a chevron instead of the old diamond markers", () => {
+    const view = render(<ProviderSetup descriptors={descriptors} connect={async () => {}} />);
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("❯ Alpha Cloud");
+    expect(frame).not.toContain("◆ Alpha Cloud");
+    expect(frame).not.toContain("◇ Bravo Sky");
+    expect(frame).not.toContain("◇ Charlie Base");
+  });
+
+  it("moves the chevron to the newly-focused row after navigating down", async () => {
+    const view = render(<ProviderSetup descriptors={descriptors} connect={async () => {}} />);
+    view.stdin.write(`${ESC}[B`); // down arrow: alpha -> bravo
+    await settle();
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("❯ Bravo Sky");
+    expect(frame).not.toContain("❯ Alpha Cloud");
+  });
+
+  it("marks the current auth option with a chevron instead of the old diamond markers", async () => {
+    const view = render(<ProviderSetup descriptors={descriptors} connect={async () => {}} />);
+    view.stdin.write("\r"); // enter: select "Alpha Cloud" (allowsAnonymous) -> auth stage
+    await settle();
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("❯ Free public models");
+    expect(frame).not.toContain("◆ Free public models");
+    expect(frame).not.toContain("◇ Zen API key");
+  });
+});
