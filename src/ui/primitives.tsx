@@ -169,7 +169,7 @@ export function EmptyState({ theme, width }: { readonly theme: Theme; readonly w
     <Starburst theme={theme} {...(width === undefined ? {} : { width })} />
     <Box><Text bold color={theme.text}>ALFA</Text><Text bold color={theme.secondary}>CODE</Text></Box>
     <Box marginTop={1}><Text color={theme.muted}>One agent. Every model. Your terminal.</Text></Box>
-    <Box marginTop={1} columnGap={2}>
+    <Box marginTop={1} columnGap={2} flexWrap="wrap" justifyContent="center">
       <KeyHint shortcut="/model" label="switch" theme={theme} />
       <KeyHint shortcut="/connect" label="add provider" theme={theme} />
       <KeyHint shortcut="/help" label="commands" theme={theme} />
