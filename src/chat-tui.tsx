@@ -19,8 +19,8 @@ import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } fr
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { useFlash, usePulse, useSpinner, useTwinkle } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, mixHex, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { useFlash, usePulse, useSpinner } from "./ui/motion.js";
+import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -784,7 +784,17 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       return;
     }
     if (name === "/help") { setScreen("help"); return; }
-    if (name === "/clear") { setMessages([]); setScreenReaderLog(emptyTranscriptLog); return; }
+    if (name === "/clear") {
+      // Clearing the local transcript alone left the engine's own session context untouched —
+      // total_tokens/context-left kept growing across a "cleared" conversation because nothing
+      // ever told the engine to actually reset. The SDK's own /clear handling does reset it
+      // (SDKResultMessage.modelUsage docs: "a mid-session /clear resets the running total"), so
+      // forward it the same way /compact already falls through to the engine unintercepted.
+      setMessages([]);
+      setScreenReaderLog(emptyTranscriptLog);
+      sendPrompt("/clear");
+      return;
+    }
     if (name === "/exit" || name === "/quit") return finish({ type: "exit" });
     if (name === "/usage" || name === "/context") { await refreshTelemetry(session, loadUsage, setContextUsage, setUsage); setScreen("usage"); return; }
     if (name === "/agents") {
@@ -967,11 +977,9 @@ function extractToolResultText(content: unknown): string {
 }
 
 /**
- * The app's single always-on-screen signature element, so it earns more than a flat status line:
- * a taller, tinted panel (two information rows instead of one) topped by the brand mark and
- * capped with an `ActivityRule` — a full-width accent→secondary energy strip that sits idle
- * (a quiet, still line) when ready and shimmers a traveling gradient when busy, in the same
- * mixHex-gradient language `ProgressBar` already established elsewhere in the app.
+ * The app's single always-on-screen signature element: a taller, tinted panel (two information
+ * rows instead of one) topped by the brand mark and capped with an `ActivityRule` — a full-width
+ * strip that stays a quiet, still line when idle and switches to a flat accent color when busy.
  */
 export function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const pulse = usePulse(busy);
@@ -989,15 +997,18 @@ export function Header({ model, mode, providers, compatible, busy, theme, width 
     <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
   </Box>;
 }
-/** A quiet, still line when idle; a traveling accent→secondary shimmer (via `useTwinkle`'s staggered per-index phases) when busy — a richer, always-legible "actively working" cue than a single pulsing dot. */
+/**
+ * A still line, in `theme.border` when idle and `theme.accent` when busy. Used to animate this
+ * with a per-character traveling gradient (`useTwinkle` over every column) — continuously, for the
+ * entire duration of a response. That meant a full-width repaint of this row on every animation
+ * tick throughout the whole busy period, which is exactly when a user is most likely to want to
+ * select or scroll the streaming response; Ink has no way to repaint just this row in isolation
+ * (there's no `<Static>` boundary around the live transcript), so the whole visible frame repainted
+ * with it. A flat color change already communicates "busy" (paired with the panel's own border
+ * color and the working/ready label) without needing continuous animation to do it.
+ */
 function ActivityRule({ busy, width, theme }: { readonly busy: boolean; readonly width: number; readonly theme: Theme }): React.JSX.Element {
-  const twinkle = useTwinkle(busy ? width : 0, { interval: 90 });
-  if (!busy) return <Text color={theme.border}>{"━".repeat(width)}</Text>;
-  return <Text>{Array.from({ length: width }, (_, index) => {
-    const level = (twinkle[index] ?? 2) / 2;
-    const hue = mixHex(theme.accent, theme.secondary, width <= 1 ? 0 : index / (width - 1));
-    return <Text key={index} color={mixHex(theme.surfaceRaised, hue, level)}>━</Text>;
-  })}</Text>;
+  return <Text color={busy ? theme.accent : theme.border}>{"━".repeat(width)}</Text>;
 }
 
 export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {

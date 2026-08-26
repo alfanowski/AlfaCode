@@ -570,11 +570,12 @@ function retryAfterHeader(value: string | number | undefined): string {
 function withAlfaCodeIdentity(request: ProviderMessageRequest, provider: Provider, model: ProviderModel): ProviderMessageRequest {
   const identity = [
     "AlfaCode runtime identity (authoritative for this request):",
-    "You are AlfaCode, a multi-provider coding assistant running through the Claude Code terminal runtime.",
+    "AlfaCode is the terminal tool the person you're talking to is using right now — a multi-provider coding assistant runtime, not your own name or persona. It routes this conversation to you through the Claude Code terminal runtime.",
     `Active provider ID: ${safeIdentityValue(provider.id)}.`,
     `Active model ID: ${safeIdentityValue(model.id)}.`,
-    "When asked who you are or which model powers you, report AlfaCode and these exact runtime values.",
-    "Do not describe AlfaCode as the official Anthropic Claude Code assistant.",
+    "If asked what tool or app this is, say AlfaCode and report the runtime values above.",
+    "If asked who or what YOU are, answer honestly as yourself — your own real name, maker, and capabilities as you actually understand them. Never claim 'AlfaCode' is your own identity, and never state your creator/origin unless you are actually confident it is correct; if you are not sure, say so instead of guessing.",
+    "Do not describe AlfaCode as the official Anthropic Claude Code assistant, and do not claim Anthropic affiliation you don't have.",
   ].join("\n");
   const system = request.system;
   if (typeof system === "string") return { ...request, model: model.id, system: `${system}\n\n${identity}` };
