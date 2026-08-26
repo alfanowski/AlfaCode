@@ -1000,14 +1000,18 @@ function ActivityRule({ busy, width, theme }: { readonly busy: boolean; readonly
   })}</Text>;
 }
 
-function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
+export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
   if (items.length === 0) return <EmptyState theme={theme} width={width} />;
+  const last = items.at(-1);
+  // Visible for the whole busy stretch, not just the gap before the first token: a running tool
+  // row already carries its own spinner, so this only steps aside once the last row is a tool.
+  const streaming = busy && last?.role !== "tool";
   return <>{items.map((item) => {
     if (item.role === "assistant") return <Box key={item.id} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
     if (item.role === "user") return <Box key={item.id} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
     if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} />;
     return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
-  })}{busy && items.at(-1)?.role !== "tool" ? <ThinkingLine theme={theme} /> : null}</>;
+  })}{streaming ? <ThinkingLine theme={theme} writing={last?.role === "assistant"} /> : null}</>;
 }
 function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
@@ -1028,7 +1032,17 @@ function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
   </Box>;
 }
-function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
+/**
+ * Two related but distinct states, not one generic label that vanishes once content starts:
+ * "thinking" (nothing written yet for this turn — an orbiting accent spinner) vs. "writing" (text
+ * is actively growing — a gold star-glint pulse), so the cue itself communicates which phase of
+ * the busy period is in progress rather than just that *something* is happening.
+ */
+export function ThinkingLine({ theme, writing }: { readonly theme: Theme; readonly writing: boolean }): React.JSX.Element {
+  const spinner = useSpinner(!writing);
+  const pulse = usePulse(writing);
+  return <Box paddingLeft={2}><Text color={writing ? theme.secondary : theme.accent}>{writing ? pulse : spinner}</Text><Text bold color={theme.muted}> {writing ? "Writing…" : "Thinking…"}</Text></Box>;
+}
 function ScrollIndicator({ count, theme }: { readonly count: number; readonly theme: Theme }): React.JSX.Element {
   return <Box paddingX={1}><Text color={theme.accent}>↓ {count > 0 ? `${count} new message${count === 1 ? "" : "s"} below` : "scrolled up"} · Ctrl+End to jump to bottom</Text></Box>;
 }
