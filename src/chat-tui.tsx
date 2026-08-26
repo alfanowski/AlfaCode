@@ -971,7 +971,7 @@ function Header({ model, mode, providers, compatible, busy, theme, width }: { re
 }
 
 function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
-  if (items.length === 0) return <EmptyState theme={theme} />;
+  if (items.length === 0) return <EmptyState theme={theme} width={width} />;
   return <>{items.map((item) => {
     if (item.role === "assistant") return <Box key={item.id} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
     if (item.role === "user") return <Box key={item.id} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;

@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { supportsMotion } from "./theme.js";
 import { isScreenReaderMode } from "./screen-reader-mode.js";
 
-const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
-const pulseFrames = ["·", "•", "●", "•"] as const;
+export const spinnerFrames = ["◐", "◓", "◑", "◒"] as const;
+export const pulseFrames = ["·", "✧", "✦", "✧"] as const;
 
 /**
  * Whether frame-based animation should run at all. Extends `supportsMotion` (CI, `TERM=dumb`,

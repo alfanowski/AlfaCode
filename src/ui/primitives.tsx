@@ -5,7 +5,7 @@ import { useSpinner } from "./motion.js";
 import { isScreenReaderMode } from "./screen-reader-mode.js";
 
 export function Brand({ theme, compact = false }: { readonly theme: Theme; readonly compact?: boolean }): React.JSX.Element {
-  return <Text bold><Text color={theme.accent}>◆</Text><Text color={theme.text}> Alfa</Text><Text color={theme.secondary}>Code</Text>{compact ? null : <Text color={theme.faint}> / agent terminal</Text>}</Text>;
+  return <Text bold><Text color={theme.accent}>✦</Text><Text color={theme.text}> Alfa</Text><Text color={theme.secondary}>Code</Text>{compact ? null : <Text color={theme.faint}> / agent terminal</Text>}</Text>;
 }
 
 export function KeyHint({ shortcut, label, theme }: { readonly shortcut: string; readonly label: string; readonly theme: Theme }): React.JSX.Element {
@@ -36,17 +36,47 @@ export function LoadingLabel({ children, theme }: React.PropsWithChildren<{ read
   return <Text color={theme.accent}>{spinner} <Text color={theme.text}>{children}</Text></Text>;
 }
 
+function hexToRgb(hex: string): readonly [number, number, number] {
+  const value = hex.replace("#", "");
+  return [Number.parseInt(value.slice(0, 2), 16), Number.parseInt(value.slice(2, 4), 16), Number.parseInt(value.slice(4, 6), 16)];
+}
+
+/** Linear RGB interpolation between two hex colors; no perceptual color space math needed here. */
+export function mixHex(from: string, to: string, ratio: number): string {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  const [fr, fg, fb] = hexToRgb(from);
+  const [tr, tg, tb] = hexToRgb(to);
+  const mix = (a: number, b: number): number => Math.round(a + (b - a) * clamped);
+  return `#${[mix(fr, tr), mix(fg, tg), mix(fb, tb)].map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
 export function ProgressBar({ value, width, theme }: { readonly value: number; readonly width: number; readonly theme: Theme }): React.JSX.Element {
   const safeWidth = Math.max(4, width);
   const clamped = Math.max(0, Math.min(1, value));
   const filled = Math.round(safeWidth * clamped);
-  const tone = clamped >= 0.9 ? theme.danger : clamped >= 0.7 ? theme.warning : theme.accent;
-  return <Text><Text color={tone}>{"━".repeat(filled)}</Text><Text color={theme.surfaceRaised}>{"━".repeat(safeWidth - filled)}</Text></Text>;
+  // Below the warning threshold, the filled portion gradients from accent to secondary
+  // (a supernova-style glow under the nova theme). At warning/danger thresholds a flat,
+  // unambiguous color communicates urgency better than a gradient would.
+  const urgent = clamped >= 0.9 ? theme.danger : clamped >= 0.7 ? theme.warning : undefined;
+  const fill = Array.from({ length: filled }, (_, index) => {
+    const color = urgent ?? mixHex(theme.accent, theme.secondary, filled <= 1 ? 0 : index / (filled - 1));
+    return <Text key={index} color={color}>━</Text>;
+  });
+  return <Text>{fill}<Text color={theme.surfaceRaised}>{"━".repeat(safeWidth - filled)}</Text></Text>;
 }
 
-export function EmptyState({ theme }: { readonly theme: Theme }): React.JSX.Element {
+function Starfield({ theme, width }: { readonly theme: Theme; readonly width?: number }): React.JSX.Element | null {
+  if (width !== undefined && width < 30) return null;
+  return <Box flexDirection="column" alignItems="center">
+    <Text color={theme.faint}>·        ✧           ·</Text>
+    <Text color={theme.faint}>    ✧         <Text color={theme.secondary}>✦</Text>       ·  </Text>
+  </Box>;
+}
+
+export function EmptyState({ theme, width }: { readonly theme: Theme; readonly width?: number }): React.JSX.Element {
   return <Box flexDirection="column" alignItems="center" justifyContent="center" flexGrow={1}>
-    <Box><Text bold color={theme.accent}>     ◆</Text></Box>
+    <Starfield theme={theme} {...(width === undefined ? {} : { width })} />
+    <Box><Text bold color={theme.accent}>     ✦</Text></Box>
     <Box><Text bold color={theme.text}>ALFA</Text><Text bold color={theme.secondary}>CODE</Text></Box>
     <Box marginTop={1}><Text color={theme.muted}>One agent. Every model. Your terminal.</Text></Box>
     <Box marginTop={1} columnGap={2}>
