@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { render } from "ink-testing-library";
-import { Brand, EmptyState, mixHex, ProgressBar } from "../src/ui/primitives.js";
+import { Brand, EmptyState, mixHex, panelBorder, ProgressBar } from "../src/ui/primitives.js";
 import { getTheme } from "../src/ui/theme.js";
 
 const theme = getTheme("nova");
+
+describe("panelBorder", () => {
+  it("defaults to a quiet, neutral border", () => {
+    expect(panelBorder(theme)).toEqual({ borderStyle: "round", borderColor: theme.border });
+  });
+
+  it("uses the accent color when a panel needs to read as active", () => {
+    expect(panelBorder(theme, "active")).toEqual({ borderStyle: "round", borderColor: theme.accent });
+  });
+});
 
 describe("Brand", () => {
   it("renders the star wordmark glyph in the theme's accent color", () => {
@@ -14,20 +24,37 @@ describe("Brand", () => {
 });
 
 describe("EmptyState", () => {
-  it("renders the star wordmark and a starfield flourish at a comfortable width", () => {
+  it("renders the starburst core, its ray glyphs, and the outer ring at a comfortable width", () => {
     const view = render(<EmptyState theme={theme} width={60} />);
     const frame = view.lastFrame() ?? "";
-    expect(frame).toContain("✦");
-    expect(frame).toContain("✧");
+    expect(frame).toContain("✦"); // burst center
+    expect(frame).toContain("─"); // horizontal ray
+    expect(frame).toContain("│"); // vertical ray
+    expect(frame).toContain("╲");
+    expect(frame).toContain("╱");
+    expect(frame).toContain("✧"); // outer ring
     expect(frame).not.toContain("◆");
   });
 
-  it("skips the starfield flourish at a narrow width without breaking the rest of the layout", () => {
+  it("keeps the burst's core row horizontally symmetric around its center", () => {
+    // The center "✦" should have the same number of ray characters on each side on its own row —
+    // a lopsided burst would silently break this without any exception being thrown.
+    const view = render(<EmptyState theme={theme} width={60} />);
+    const coreLine = (view.lastFrame() ?? "").split("\n").find((line) => line.includes("✦"));
+    expect(coreLine).toBeDefined();
+    const centerIndex = coreLine?.indexOf("✦") ?? -1;
+    const left = (coreLine ?? "").slice(0, centerIndex).trimStart();
+    const right = (coreLine ?? "").slice(centerIndex + 1).trimEnd();
+    expect(left.length).toBe(right.length);
+  });
+
+  it("skips the starburst below its width threshold without breaking the rest of the layout", () => {
     const view = render(<EmptyState theme={theme} width={20} />);
     const frame = view.lastFrame() ?? "";
     expect(frame).toContain("ALFA");
     expect(frame).toContain("CODE");
     expect(frame).not.toContain("✧");
+    expect(frame).not.toContain("✦");
   });
 
   it("still renders correctly with no width provided at all", () => {

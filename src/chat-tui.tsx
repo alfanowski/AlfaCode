@@ -20,7 +20,7 @@ import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
 import { usePulse, useSpinner } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -960,7 +960,7 @@ function extractToolResultText(content: unknown): string {
 function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const pulse = usePulse(busy);
   const modelWidth = Math.max(16, Math.min(34, width - 48));
-  return <Box justifyContent="space-between" borderStyle="round" borderColor={busy ? theme.secondary : theme.border} paddingX={1} marginBottom={1}>
+  return <Box justifyContent="space-between" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1}>
     <Box width={12}><Brand theme={theme} compact /></Box>
     <Box columnGap={2} justifyContent="flex-end" flexGrow={1}>
       <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
