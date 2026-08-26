@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   query as createQuery,
   type CanUseTool,
+  type EffortLevel,
   type PermissionMode,
   type Query,
   type RewindFilesResult,
@@ -45,6 +46,15 @@ export interface AgentSessionIdentity {
   readonly claudeCodeVersion: string;
   readonly compatibility: EngineCompatibility;
   readonly capabilities: readonly string[];
+  /**
+   * The effort level the engine will send on its next request, as reported by the init message
+   * (see `SDKSystemMessage.effort`): `null` when no effort parameter will be sent at all (e.g. an
+   * engine build too old to publish this field, or CLAUDE_CODE_EFFORT_LEVEL unset), and `undefined`
+   * only when this AgentSession hasn't finished its handshake yet. This mirrors the engine's own
+   * notion of "effort" — a request parameter the underlying Claude Code engine attaches to its own
+   * outgoing Anthropic Messages requests, not something AlfaCode's gateway translates per provider.
+   */
+  readonly effort?: EffortLevel | null;
 }
 
 /**
@@ -204,6 +214,21 @@ export class AgentSession {
     return this.query.setPermissionMode(mode);
   }
 
+  /**
+   * Sets the reasoning-effort level the engine attaches to its own subsequent requests. Only
+   * available in streaming input mode, same as `setPermissionMode`/`setModel`. Pass `null` to clear
+   * an explicit level and fall back to the engine's own default. This is a genuine, real-time
+   * control request (`Query.applyFlagSettings`) — not a slash command sent as chat text — but it is
+   * still an Anthropic Messages API-level parameter: AlfaCode's own gateway only forwards it
+   * verbatim to a real Anthropic-compatible backend (`wireProtocol === "anthropic-messages"`); its
+   * OpenAI-compatible and Gemini adapters rebuild the outgoing request from scratch and never read
+   * this field, so it silently has no effect when the active model routes through those wire
+   * protocols. Callers should gate this on the active model's wire protocol before offering it.
+   */
+  public setEffortLevel(level: EffortLevel | null): Promise<void> {
+    return this.query.applyFlagSettings({ effortLevel: level });
+  }
+
   public supportedCommands(): ReturnType<Query["supportedCommands"]> {
     return this.query.supportedCommands();
   }
@@ -272,6 +297,7 @@ export class AgentSession {
             claudeCodeVersion: message.claude_code_version,
             compatibility,
             capabilities: message.capabilities ?? [],
+            ...(message.effort === undefined ? {} : { effort: message.effort }),
           });
         }
         await this.deliverMessage(message);
