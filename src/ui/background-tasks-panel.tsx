@@ -2,6 +2,8 @@ import React from "react";
 import { Box, Text } from "ink";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { sanitizeTerminalText } from "./markdown.js";
+import { useFlash } from "./motion.js";
+import { panelBorder } from "./primitives.js";
 import type { Theme } from "./theme.js";
 
 export interface BackgroundTask {
@@ -26,10 +28,15 @@ export function parseBackgroundTasksChanged(message: SDKMessage): readonly Backg
 }
 
 export function BackgroundTasksPanel({ tasks, theme }: { readonly tasks: readonly BackgroundTask[]; readonly theme: Theme }): React.JSX.Element | null {
+  // Flashes briefly whenever the live task set changes shape (one starts or finishes), same
+  // signature-over-content approach as TodoPanel — see its comment for why a plain identity
+  // trigger would be either too noisy or miss changes.
+  const signature = tasks.map((task) => task.taskId).join("|");
+  const flash = useFlash(signature);
   if (tasks.length === 0) return null;
   const visible = tasks.slice(0, 4);
   const extra = tasks.length - visible.length;
-  return <Box flexDirection="column" borderStyle="round" borderColor={theme.secondary} paddingX={1} marginBottom={1}>
+  return <Box flexDirection="column" {...panelBorder(theme, flash ? "active" : "quiet")} paddingX={1} marginBottom={1}>
     <Text bold color={theme.secondarySoft}>⚙ BACKGROUND · {tasks.length} running</Text>
     {visible.map((task) => <Text key={task.taskId} color={theme.muted}>· {task.taskType} — {task.description}</Text>)}
     {extra > 0 ? <Text color={theme.faint}>+{extra} more</Text> : null}

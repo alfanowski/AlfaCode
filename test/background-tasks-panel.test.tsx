@@ -66,4 +66,20 @@ describe("BackgroundTasksPanel", () => {
     const frame = view.lastFrame() ?? "";
     expect(frame).toContain("+2 more");
   });
+
+  // Mirrors the TodoPanel regression test: the panel border flashes "active" (via useFlash) when
+  // the live task set changes shape, driven by a hook called unconditionally ahead of the panel's
+  // own "no tasks -> render nothing" early return. Cycling empty <-> populated a few times is what
+  // would trip a Rules-of-Hooks violation if that ordering were ever wrong; the flash's border
+  // color itself isn't inspectable through ink-testing-library's rendered frames.
+  it("keeps rendering correctly as the live task set appears, changes, and clears", () => {
+    const view = render(<BackgroundTasksPanel tasks={[]} theme={theme} />);
+    expect(view.lastFrame()).toBe("");
+    view.rerender(<BackgroundTasksPanel tasks={[{ taskId: "1", taskType: "local_bash", description: "npm run build" }]} theme={theme} />);
+    expect(view.lastFrame() ?? "").toContain("npm run build");
+    view.rerender(<BackgroundTasksPanel tasks={[{ taskId: "1", taskType: "local_bash", description: "npm run build" }, { taskId: "2", taskType: "local_agent", description: "Refactor module" }]} theme={theme} />);
+    expect(view.lastFrame() ?? "").toContain("2 running");
+    view.rerender(<BackgroundTasksPanel tasks={[]} theme={theme} />);
+    expect(view.lastFrame()).toBe("");
+  });
 });
