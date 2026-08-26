@@ -101,7 +101,19 @@ const inheritedRoutingKeys = new Set([
   "NODE_TLS_REJECT_UNAUTHORIZED",
 ]);
 
-const inheritedCloudPrefixes = ["AWS_", "GOOGLE_", "GEMINI_", "VERTEX_", "AZURE_"] as const;
+const inheritedCloudPrefixes = [
+  "AWS_",
+  "GOOGLE_",
+  "GEMINI_",
+  "VERTEX_",
+  "AZURE_",
+  "OPENAI_",
+  "XAI_",
+  "GROQ_",
+  "MISTRAL_",
+  "COHERE_",
+  "OPENROUTER_",
+] as const;
 
 /** Safe child-process defaults. Explicit launch extraEnv values may opt back in deliberately. */
 const safeClaudeDefaults: Readonly<Record<string, string>> = {
@@ -124,7 +136,13 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
   }
   Object.assign(environment, safeClaudeDefaults, options.extraEnv);
   for (const key of Object.keys(environment)) {
-    if (shouldScrubEnvironmentKey(key, secretKeys) && key.toUpperCase() !== "ANTHROPIC_CUSTOM_HEADERS") delete environment[key];
+    const normalized = key.toUpperCase();
+    if (!shouldScrubEnvironmentKey(key, secretKeys)) continue;
+    // ANTHROPIC_CUSTOM_HEADERS is exempt from the blanket ANTHROPIC_ prefix scrub by default
+    // (it's a request-header customization, not a credential) — but an explicit caller request
+    // to scrub this exact name (via scrubEnvironmentKeys) always takes precedence.
+    if (normalized === "ANTHROPIC_CUSTOM_HEADERS" && !secretKeys.has(normalized)) continue;
+    delete environment[key];
   }
   Object.assign(environment, {
     ANTHROPIC_BASE_URL: options.baseUrl,

@@ -99,6 +99,51 @@ describe("launchClaude", () => {
     expect(result).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:4317", ANTHROPIC_AUTH_TOKEN: "token" });
   });
 
+  it("scrubs common AI provider credential prefixes from process.env", () => {
+    const keys = ["OPENAI_API_KEY", "XAI_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "COHERE_API_KEY", "OPENROUTER_API_KEY"] as const;
+    for (const key of keys) vi.stubEnv(key, "leak");
+
+    const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "http://127.0.0.1:4317", authToken: "token" });
+
+    for (const key of keys) expect(result[key], key).toBeUndefined();
+  });
+
+  it("exempts an explicitly-passed ANTHROPIC_CUSTOM_HEADERS override from the blanket ANTHROPIC_ scrub", () => {
+    // Only an explicit extraEnv override (AlfaCode's own internal passthrough) is exempt — a
+    // value merely inherited from the ambient shell environment is still scrubbed like any other
+    // ANTHROPIC_-prefixed variable (see the next test).
+    const result = buildClaudeEnvironment({
+      claudeArgs: [],
+      baseUrl: "http://127.0.0.1:4317",
+      authToken: "token",
+      extraEnv: { ANTHROPIC_CUSTOM_HEADERS: "x-team: infra" },
+      environment: { ANTHROPIC_API_KEY: "leak" },
+    });
+    expect(result.ANTHROPIC_CUSTOM_HEADERS).toBe("x-team: infra");
+    expect(result.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("never inherits ANTHROPIC_CUSTOM_HEADERS from the ambient shell environment", () => {
+    const result = buildClaudeEnvironment({
+      claudeArgs: [],
+      baseUrl: "http://127.0.0.1:4317",
+      authToken: "token",
+      environment: { ANTHROPIC_CUSTOM_HEADERS: "x-team: infra" },
+    });
+    expect(result.ANTHROPIC_CUSTOM_HEADERS).toBeUndefined();
+  });
+
+  it("still scrubs an explicit ANTHROPIC_CUSTOM_HEADERS override when a caller explicitly requests it", () => {
+    const result = buildClaudeEnvironment({
+      claudeArgs: [],
+      baseUrl: "http://127.0.0.1:4317",
+      authToken: "token",
+      scrubEnvironmentKeys: ["ANTHROPIC_CUSTOM_HEADERS"],
+      extraEnv: { ANTHROPIC_CUSTOM_HEADERS: "x-team: infra" },
+    });
+    expect(result.ANTHROPIC_CUSTOM_HEADERS).toBeUndefined();
+  });
+
   it("allows explicit launch options to opt into a safe default", () => {
     const result = buildClaudeEnvironment({
       claudeArgs: [],
