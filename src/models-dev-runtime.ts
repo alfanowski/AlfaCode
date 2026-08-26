@@ -41,7 +41,7 @@ export interface DynamicProviderDescriptorData {
 export function dynamicProviderDescriptors(catalog: ModelsDevCatalog): readonly DynamicProviderDescriptorData[] {
   const descriptors: DynamicProviderDescriptorData[] = [];
   for (const provider of catalog.providers.values()) {
-    if (provider.api === undefined) continue;
+    if (provider.api === undefined || !isSafeSuggestedBaseUrl(provider.api)) continue;
     for (const wireProtocol of providerWireProtocols(provider)) {
       descriptors.push({
         catalogProviderId: provider.id,
@@ -53,6 +53,25 @@ export function dynamicProviderDescriptors(catalog: ModelsDevCatalog): readonly 
     }
   }
   return descriptors.sort((left, right) => JSON.stringify([left.displayName, left.catalogProviderId, left.wireProtocol]).localeCompare(JSON.stringify([right.displayName, right.catalogProviderId, right.wireProtocol])));
+}
+
+/**
+ * A provider's catalog-supplied `api` field is untrusted, freeform upstream data (not every
+ * models.dev entry uses one, e.g. local-gateway providers publish a loopback http:// URL, and a
+ * minority publish a non-URL template string). The catalog schema deliberately does not enforce a
+ * strict URL shape here (one malformed entry must never fail parsing for the whole catalog) — this
+ * is the actual security boundary: only a well-formed absolute HTTPS URL, or an HTTP URL pointing
+ * at a loopback host, is ever surfaced as a pre-fillable suggested base URL. Mirrors `cli.ts`'s
+ * `isHttpUrl`.
+ */
+function isSafeSuggestedBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "https:") return true;
+    return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]");
+  } catch {
+    return false;
+  }
 }
 
 function catalogProviderKey(type: string, options: Readonly<Record<string, unknown>> | undefined): string {

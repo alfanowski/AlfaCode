@@ -211,7 +211,7 @@ const Model = z.object({
   experimental: z.object({ modes: z.record(z.string(), z.object({ cost: Cost.optional(), provider: z.object({ body: z.record(z.string(), JsonValue).optional(), headers: z.record(z.string(), z.string()).optional() }).strict().optional() }).strict()).optional() }).strict().optional(),
   provider: ProviderOverride.optional(), cost: OutputCost.optional(),
 }).strict();
-const Provider = z.object({ id: z.string().min(1), env: z.array(z.string().min(1)).min(1), npm: z.string().min(1), api: z.url({ protocol: /^https$/ }).optional(), name: z.string().min(1), doc: z.string().min(1), models: z.record(z.string(), Model) }).strict().superRefine((provider, context) => {
+const Provider = z.object({ id: z.string().min(1), env: z.array(z.string().min(1)).min(1), npm: z.string().min(1), api: z.string().min(1).optional(), name: z.string().min(1), doc: z.string().min(1), models: z.record(z.string(), Model) }).strict().superRefine((provider, context) => {
   for (const [id, model] of Object.entries(provider.models)) if (id !== model.id) context.addIssue({ code: "custom", message: "Model key must equal model id", path: ["models", id, "id"] });
 });
 const Catalog = z.record(z.string(), Provider).superRefine((catalog, context) => {
