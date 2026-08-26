@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { AgentSession } from "../src/agent-session.js";
 import { PINNED_CLAUDE_CODE_VERSION } from "../src/engine-compatibility.js";
+import { renameAlfaCodeSession } from "../src/session-history.js";
+
+vi.mock("../src/session-history.js", () => ({ renameAlfaCodeSession: vi.fn(async () => undefined) }));
 
 const directories: string[] = [];
 
@@ -43,6 +46,7 @@ function queryHarness(claudeCodeVersion: string): {
     supportedCommands: vi.fn(async () => []),
     supportedAgents: vi.fn(async () => []),
     getContextUsage: vi.fn(async () => ({ totalTokens: 0, maxTokens: 1, rawMaxTokens: 1, percentage: 0, categories: [], gridRows: [], model: "route/model", memoryFiles: [] })),
+    rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: ["a.ts"], insertions: 1, deletions: 0 })),
   } as unknown as Query;
   const queryFactory = ((input: { prompt: AsyncIterable<unknown>; options: { permissionMode: unknown } }) => {
     prompt = input.prompt;
@@ -50,6 +54,26 @@ function queryHarness(claudeCodeVersion: string): {
     return query;
   }) as typeof import("@anthropic-ai/claude-agent-sdk").query;
   return { query, queryFactory, permissionMode: () => initialPermissionMode };
+}
+
+function makeFakeQuery(overrides: Partial<Record<string, unknown>> = {}): Query {
+  return {
+    async *[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+      yield {
+        type: "system", subtype: "init", session_id: "session-1", model: "route/model",
+        claude_code_version: "2.1.241", capabilities: ["tools"],
+      } as SDKMessage;
+    },
+    close: vi.fn(),
+    interrupt: vi.fn(async () => undefined),
+    setModel: vi.fn(async () => undefined),
+    setPermissionMode: vi.fn(async () => undefined),
+    supportedCommands: vi.fn(async () => []),
+    supportedAgents: vi.fn(async () => []),
+    getContextUsage: vi.fn(async () => ({ totalTokens: 0, maxTokens: 1, rawMaxTokens: 1, percentage: 0, categories: [], gridRows: [], model: "route/model", memoryFiles: [] })),
+    rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: ["a.ts"], insertions: 1, deletions: 0 })),
+    ...overrides,
+  } as unknown as Query;
 }
 
 describe("AgentSession", () => {
@@ -147,5 +171,55 @@ describe("AgentSession", () => {
       queryFactory: queryFactory as never,
     })).rejects.toThrow(/chmod 700/);
     expect(queryFactory).not.toHaveBeenCalled();
+  });
+
+  it("wires continue and file checkpointing into the query options, without resume", async () => {
+    let capturedOptions: Record<string, unknown> | undefined;
+    await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      canUseTool: async () => ({ behavior: "allow" }),
+      continue: true,
+      queryFactory: ((input: { options: Record<string, unknown> }) => { capturedOptions = input.options; return makeFakeQuery(); }) as never,
+    });
+    expect(capturedOptions).toMatchObject({ continue: true, enableFileCheckpointing: true, persistSession: true });
+    expect(capturedOptions?.resume).toBeUndefined();
+  });
+
+  it("wires resume into the query options, without continue", async () => {
+    let capturedOptions: Record<string, unknown> | undefined;
+    await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      canUseTool: async () => ({ behavior: "allow" }),
+      resume: "session-abc",
+      queryFactory: ((input: { options: Record<string, unknown> }) => { capturedOptions = input.options; return makeFakeQuery(); }) as never,
+    });
+    expect(capturedOptions).toMatchObject({ resume: "session-abc", enableFileCheckpointing: true });
+    expect(capturedOptions?.continue).toBeUndefined();
+  });
+
+  it("forwards rewindFiles to the underlying query", async () => {
+    const rewindFilesMock = vi.fn(async () => ({ canRewind: true, filesChanged: ["a.ts"], insertions: 1, deletions: 0 }));
+    const fakeQuery = makeFakeQuery({ rewindFiles: rewindFilesMock });
+    const session = await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      canUseTool: async () => ({ behavior: "allow" }),
+      queryFactory: (() => fakeQuery) as never,
+    });
+    const result = await session.rewindFiles("prompt-uuid", { dryRun: true });
+    expect(result).toMatchObject({ canRewind: true, filesChanged: ["a.ts"] });
+    expect(rewindFilesMock).toHaveBeenCalledWith("prompt-uuid", { dryRun: true });
+  });
+
+  it("renames the session once identity resolves, scoped to cwd and configDir", async () => {
+    const configDir = await isolatedConfigDir();
+    const session = await AgentSession.start({
+      runtime: { baseUrl: "http://127.0.0.1:1", authToken: "token", close: async () => undefined },
+      cwd: "/repo",
+      configDir,
+      canUseTool: async () => ({ behavior: "allow" }),
+      queryFactory: (() => makeFakeQuery()) as never,
+    });
+    await session.rename("My session");
+    expect(vi.mocked(renameAlfaCodeSession)).toHaveBeenCalledWith("session-1", "My session", { cwd: "/repo", configDir });
   });
 });

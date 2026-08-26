@@ -6,12 +6,14 @@ import {
   type CanUseTool,
   type PermissionMode,
   type Query,
+  type RewindFilesResult,
   type SDKMessage,
   type SDKSystemMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { buildClaudeEnvironment, ensurePrivateDirectory } from "./claude-launcher.js";
 import { ALFACODE_CLIENT_ID, checkEngineCompatibility, type EngineCompatibility } from "./engine-compatibility.js";
+import { renameAlfaCodeSession } from "./session-history.js";
 
 export interface AgentRuntimeHandle {
   readonly baseUrl: string;
@@ -29,6 +31,8 @@ export interface AgentSessionOptions {
   readonly permissionMode?: PermissionMode;
   readonly canUseTool: CanUseTool;
   readonly resume?: string;
+  /** Continue the most recent conversation in `cwd` instead of starting a new one (`claude --continue`). Mutually exclusive with `resume`. */
+  readonly continue?: boolean;
   readonly onMessage?: (message: SDKMessage) => void | Promise<void>;
   readonly onStderr?: (message: string) => void;
   readonly queryFactory?: typeof createQuery;
@@ -84,6 +88,8 @@ export class AgentSession {
   private didInitialize = false;
   private initializationTimer: NodeJS.Timeout | undefined;
   private readonly listeners = new Set<(message: SDKMessage) => void | Promise<void>>();
+  private readonly configDir: string;
+  private readonly cwd: string;
 
   private constructor(private readonly options: AgentSessionOptions) {
     this.initialized = new Promise((resolve, reject) => {
@@ -95,6 +101,8 @@ export class AgentSession {
     // if initialization fails before the UI asks for it.
     void this.initialized.catch(() => undefined);
     const configDir = options.configDir ?? join(homedir(), ".alfacode", "claude");
+    this.configDir = configDir;
+    this.cwd = options.cwd ?? process.cwd();
     const env = buildClaudeEnvironment({
       claudeArgs: [],
       baseUrl: options.runtime.baseUrl,
@@ -108,7 +116,7 @@ export class AgentSession {
     this.query = (options.queryFactory ?? createQuery)({
       prompt: this.input,
       options: {
-        cwd: options.cwd ?? process.cwd(),
+        cwd: this.cwd,
         env,
         canUseTool: options.canUseTool,
         // Stay restrictive until the init message proves the embedded engine
@@ -122,7 +130,10 @@ export class AgentSession {
         tools: { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project", "local"],
         persistSession: true,
+        // Lets Query.rewindFiles() restore file edits from AlfaCode's rewind menu.
+        enableFileCheckpointing: true,
         ...(options.resume === undefined ? {} : { resume: options.resume }),
+        ...(options.continue === undefined ? {} : { continue: options.continue }),
         ...(options.onStderr === undefined ? {} : { stderr: options.onStderr }),
       },
     });
@@ -185,6 +196,21 @@ export class AgentSession {
 
   public contextUsage(): ReturnType<Query["getContextUsage"]> {
     return this.query.getContextUsage();
+  }
+
+  /**
+   * Restores tracked files to their state at `userMessageId` (a prompt uuid previously returned
+   * by {@link sendPrompt}). Requires the engine to support file checkpointing (see
+   * `enableFileCheckpointing` above); older engines reject with a clear error instead of a crash.
+   */
+  public rewindFiles(userMessageId: string, options?: { readonly dryRun?: boolean }): Promise<RewindFilesResult> {
+    return this.query.rewindFiles(userMessageId, options);
+  }
+
+  /** Sets this session's display title (Claude Code's own `/rename`), for the resume picker. */
+  public async rename(title: string): Promise<void> {
+    const identity = await this.identity();
+    await renameAlfaCodeSession(identity.sessionId, title, { cwd: this.cwd, configDir: this.configDir });
   }
 
   public async close(): Promise<void> {
