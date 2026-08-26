@@ -141,6 +141,28 @@ describe("createCli", () => {
     expect(runtimeClosed).toBe(true);
   });
 
+  it("only enables fullscreen mode when --fullscreen is passed, leaving the default chat UI unaffected", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-fullscreen-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, defaultProviderId: "google", providers: [
+      { id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } },
+    ] });
+    const seenFullscreen: (boolean | undefined)[] = [];
+    const cli = createCli({
+      configStore,
+      keychain: { store: async () => undefined, retrieve: async () => "configured" },
+      startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }),
+      startAgentSession: async (input) => ({ close: async () => input.runtime.close() }) as unknown as AgentSession,
+      chatTui: async (input) => { seenFullscreen.push(input.fullscreen); return { type: "exit" }; },
+      ui: fakeUi(),
+    });
+
+    await cli.parseAsync(["node", "alfacode"], { from: "node" });
+    await cli.parseAsync(["node", "alfacode", "--fullscreen"], { from: "node" });
+    expect(seenFullscreen).toEqual([undefined, true]);
+  });
+
   it("restores the previous Keychain secret when reconnect validation fails", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-cli-reconnect-"));
     directories.push(home);
