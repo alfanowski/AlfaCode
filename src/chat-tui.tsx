@@ -8,7 +8,7 @@ import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
 import type { AgentSession, AgentSessionIdentity, PromptImageAttachment } from "./agent-session.js";
-import { notifyTurnComplete, resolveNotificationSettings } from "./notifications.js";
+import { notifyTurnComplete, resolveNotificationSettings, type NotificationSettings } from "./notifications.js";
 import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
 import { formatRelativeTime } from "./session-history.js";
 import { exportTranscript } from "./transcript-export.js";
@@ -19,8 +19,8 @@ import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } fr
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { useFlash, usePulse, useSpinner } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { useFlash, usePulse, useSpinner, useTwinkle } from "./ui/motion.js";
+import { Brand, EmptyState, HintBar, KeyHint, mixHex, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -118,6 +118,7 @@ const commands: readonly Command[] = [
   { name: "/theme", description: "Switch the color theme" },
   { name: "/export", description: "Export this transcript to a file" },
   { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
+  { name: "/notifications", description: "Toggle the turn-complete bell", shortcut: "on|off" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -147,7 +148,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const { stdout } = useStdout();
   const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
   const theme = useMemo(() => getTheme(themeName), [themeName]);
-  const notificationSettings = useMemo(() => resolveNotificationSettings(), []);
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => resolveNotificationSettings());
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
@@ -809,7 +810,15 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       return;
     }
     if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
+    if (name === "/notifications") { handleNotificationsCommand(command); return; }
     sendPrompt(command);
+  }
+  function handleNotificationsCommand(command: string): void {
+    const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
+    if (sub !== undefined && sub !== "on" && sub !== "off") { appendSystem(setMessages, "Usage: /notifications [on|off]"); return; }
+    const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
+    setNotificationSettings((current) => ({ ...current, bell }));
+    appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -863,8 +872,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       {screen === "rewind" ? <RewindMenu checkpoints={visibleCheckpoints} cursor={rewindCursor} busy={rewindBusy} theme={theme} /> : null}
     </Box>
     {scrollIndicatorVisible ? <ScrollIndicator count={scrollWindow.newerItemCount} theme={theme} /> : null}
-    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} />
-      : screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && mentionQuery !== undefined && mentionMatches.length > 0 ? <MentionPalette entries={mentionMatches} cursor={mentionCursor} theme={theme} /> : null}
+    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} width={width - 2} />
+      : screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && mentionQuery !== undefined && mentionMatches.length > 0 ? <MentionPalette entries={mentionMatches} cursor={mentionCursor} theme={theme} width={width - 2} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
       : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} vim={vimEnabled ? vim : undefined} attachmentCount={attachments.length} theme={theme} width={width} misspelledRanges={misspelledRanges} underlineColor={spellCheckSettings.underlineColor ?? theme.danger} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} comment={permissionComment} commentMode={permissionCommentMode} commentEditor={permissionCommentEditor} theme={theme} />}
@@ -957,27 +966,52 @@ function extractToolResultText(content: unknown): string {
   return "";
 }
 
-function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+/**
+ * The app's single always-on-screen signature element, so it earns more than a flat status line:
+ * a taller, tinted panel (two information rows instead of one) topped by the brand mark and
+ * capped with an `ActivityRule` — a full-width accent→secondary energy strip that sits idle
+ * (a quiet, still line) when ready and shimmers a traveling gradient when busy, in the same
+ * mixHex-gradient language `ProgressBar` already established elsewhere in the app.
+ */
+export function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const pulse = usePulse(busy);
-  const modelWidth = Math.max(16, Math.min(34, width - 48));
-  return <Box justifyContent="space-between" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1}>
-    <Box width={12}><Brand theme={theme} compact /></Box>
-    <Box columnGap={2} justifyContent="flex-end" flexGrow={1}>
+  const modelWidth = Math.max(16, Math.min(34, width - 36));
+  const ruleWidth = Math.max(4, width - 8);
+  return <Box flexDirection="column" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1} backgroundColor={theme.surfaceRaised}>
+    <Box justifyContent="space-between">
+      <Brand theme={theme} compact />
       <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
+    </Box>
+    <Box justifyContent="space-between">
       <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
       <Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text>
     </Box>
+    <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
   </Box>;
 }
+/** A quiet, still line when idle; a traveling accent→secondary shimmer (via `useTwinkle`'s staggered per-index phases) when busy — a richer, always-legible "actively working" cue than a single pulsing dot. */
+function ActivityRule({ busy, width, theme }: { readonly busy: boolean; readonly width: number; readonly theme: Theme }): React.JSX.Element {
+  const twinkle = useTwinkle(busy ? width : 0, { interval: 90 });
+  if (!busy) return <Text color={theme.border}>{"━".repeat(width)}</Text>;
+  return <Text>{Array.from({ length: width }, (_, index) => {
+    const level = (twinkle[index] ?? 2) / 2;
+    const hue = mixHex(theme.accent, theme.secondary, width <= 1 ? 0 : index / (width - 1));
+    return <Text key={index} color={mixHex(theme.surfaceRaised, hue, level)}>━</Text>;
+  })}</Text>;
+}
 
-function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
+export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
   if (items.length === 0) return <EmptyState theme={theme} width={width} />;
+  const last = items.at(-1);
+  // Visible for the whole busy stretch, not just the gap before the first token: a running tool
+  // row already carries its own spinner, so this only steps aside once the last row is a tool.
+  const streaming = busy && last?.role !== "tool";
   return <>{items.map((item) => {
     if (item.role === "assistant") return <Box key={item.id} marginTop={1} paddingLeft={2}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
     if (item.role === "user") return <Box key={item.id} marginTop={1}><Box width={2}><Text bold color={theme.secondary}>❯</Text></Box><Text color={theme.text}>{item.text}</Text></Box>;
     if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} />;
     return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
-  })}{busy && items.at(-1)?.role !== "tool" ? <ThinkingLine theme={theme} /> : null}</>;
+  })}{streaming ? <ThinkingLine theme={theme} writing={last?.role === "assistant"} /> : null}</>;
 }
 function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
@@ -998,7 +1032,17 @@ function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
   </Box>;
 }
-function ThinkingLine({ theme }: { readonly theme: Theme }): React.JSX.Element { const spinner = useSpinner(); return <Box paddingLeft={2}><Text color={theme.accent}>{spinner}</Text><Text color={theme.muted}> Thinking…</Text></Box>; }
+/**
+ * Two related but distinct states, not one generic label that vanishes once content starts:
+ * "thinking" (nothing written yet for this turn — an orbiting accent spinner) vs. "writing" (text
+ * is actively growing — a gold star-glint pulse), so the cue itself communicates which phase of
+ * the busy period is in progress rather than just that *something* is happening.
+ */
+export function ThinkingLine({ theme, writing }: { readonly theme: Theme; readonly writing: boolean }): React.JSX.Element {
+  const spinner = useSpinner(!writing);
+  const pulse = usePulse(writing);
+  return <Box paddingLeft={2}><Text color={writing ? theme.secondary : theme.accent}>{writing ? pulse : spinner}</Text><Text bold color={theme.muted}> {writing ? "Writing…" : "Thinking…"}</Text></Box>;
+}
 function ScrollIndicator({ count, theme }: { readonly count: number; readonly theme: Theme }): React.JSX.Element {
   return <Box paddingX={1}><Text color={theme.accent}>↓ {count > 0 ? `${count} new message${count === 1 ? "" : "s"} below` : "scrolled up"} · Ctrl+End to jump to bottom</Text></Box>;
 }
@@ -1033,16 +1077,25 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
   </Box>;
 }
 
-function CommandPalette({ commands: matches, cursor, theme }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+function CommandPalette({ commands: matches, cursor, theme, width }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, matches.length - 6)));
-  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}<Text bold={active}>{numbered ? numberedLabel(start + index, command.name) : command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => {
+    const active = start + index === cursor;
+    const label = numbered ? numberedLabel(start + index, command.name) : command.name;
+    return <Box key={command.name} width={innerWidth} justifyContent="space-between">
+      <Text color={active ? theme.accent : theme.muted} wrap="truncate-end">{active ? "❯ " : "  "}<Text bold={active}>{label}</Text><Text color={theme.muted}>  {command.description}</Text></Text>
+      {command.shortcut === undefined ? null : <Text color={theme.faint} wrap="truncate-start"> {command.shortcut}</Text>}
+    </Box>;
+  })}</Box>;
 }
 
 /** Mirrors CommandPalette's navigate/tab/accept interaction on purpose — see mentions.ts. */
-function MentionPalette({ entries, cursor, theme }: { readonly entries: readonly MentionEntry[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+function MentionPalette({ entries, cursor, theme, width }: { readonly entries: readonly MentionEntry[]; readonly cursor: number; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, entries.length - 6)));
-  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath}><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath} width={innerWidth}><Text color={active ? theme.accent : theme.muted} wrap="truncate-end">{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
 }
 
 function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
