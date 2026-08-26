@@ -82,4 +82,24 @@ describe("TodoPanel", () => {
     expect(frame).toContain("Plan");
     expect(frame).toContain("ctrl+t collapse");
   });
+
+  // The panel border reads "active" for a moment (via useFlash, see ui/motion.ts) whenever the
+  // todo list's status/content signature changes, then settles back to "quiet" — a hook called
+  // unconditionally ahead of the panel's own "no todos -> render nothing" early return. Rerendering
+  // across the empty <-> populated boundary a few times is what would trip a Rules-of-Hooks
+  // violation (mismatched hook count between renders) if that ordering were ever wrong; ANSI border
+  // color itself isn't inspectable through ink-testing-library's rendered frames (see
+  // ui/primitives.test.tsx), so this asserts the panel keeps rendering correctly across the
+  // transitions rather than asserting on color.
+  it("keeps rendering correctly across the list appearing, changing, and disappearing", () => {
+    const view = render(<TodoPanel todos={[]} collapsed={false} theme={theme} />);
+    expect(view.lastFrame()).toBe("");
+    view.rerender(<TodoPanel todos={todos} collapsed={false} theme={theme} />);
+    expect(view.lastFrame() ?? "").toContain("Writing tests");
+    const changed = [{ content: "Write tests", activeForm: "Writing tests", status: "completed" as const }, ...todos.slice(1)];
+    view.rerender(<TodoPanel todos={changed} collapsed={false} theme={theme} />);
+    expect(view.lastFrame() ?? "").toContain("2/3 done");
+    view.rerender(<TodoPanel todos={[]} collapsed={false} theme={theme} />);
+    expect(view.lastFrame()).toBe("");
+  });
 });
