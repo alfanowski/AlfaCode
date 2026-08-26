@@ -84,6 +84,24 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return configStore.read();
   };
 
+  /**
+   * A brand-new install has no config file at all yet — distinct from a config file that exists
+   * but currently has zero providers, which means a user deliberately removed every provider and
+   * must never be silently repopulated. `configStore.exists()` is what carries that distinction:
+   * unlike `read()`, which falls back to an in-memory empty config either way, `exists()` is false
+   * only when the file is genuinely absent. In that case only, seed the exact anonymous Zen
+   * provider record `saveTuiProvider` writes for "Free public models" (no API key, no account),
+   * so a fresh install is immediately usable without the blocking setup wizard.
+   */
+  const bootstrapDefaultProvider = async (config: AlfaCodeConfig): Promise<AlfaCodeConfig> => {
+    if (config.providers.length > 0 || await configStore.exists()) return config;
+    const zen = defaultZenProvider(descriptors);
+    if (zen === undefined) return config;
+    const seeded: AlfaCodeConfig = { version: 1, providers: [zen], defaultProviderId: zen.id };
+    await configStore.write(seeded);
+    return seeded;
+  };
+
   const selectedProvider = async (config: AlfaCodeConfig, id?: string): Promise<ProviderRecord> => {
     const provider = config.providers.find((item) => item.id === (id ?? config.defaultProviderId));
     if (provider === undefined) throw new Error("No provider is selected. Run: alfacode connect google");
@@ -224,7 +242,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
   };
 
   const classicLaunch = async (args: readonly string[]): Promise<void> => {
-    let config = await loadConfig();
+    let config = await bootstrapDefaultProvider(await loadConfig());
     const unavailable = await selectedCredentialUnavailable(config, keychain);
     if (config.providers.length === 0 || unavailable !== undefined) {
       requireInteractive(ui.interactive);
@@ -294,7 +312,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const resolvedResume = resumeFlag === undefined ? undefined : await resolveResumeFlag(resumeFlag);
     let nextAction: ChatAction = { type: "connect" };
     while (nextAction.type !== "exit") {
-      let config = await loadConfig();
+      let config = await bootstrapDefaultProvider(await loadConfig());
       const unavailable = await selectedCredentialUnavailable(config, keychain);
       if (config.providers.length === 0 || unavailable !== undefined) {
         requireInteractive(ui.interactive);
@@ -444,7 +462,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     for (const session of sessions) ui.write(`${session.sessionId}\t${describeSessionPickerEntry(session)}`);
   });
   program.command("doctor").option("--json", "Emit JSON").action(async (flags: { json?: boolean }) => {
-    const config = await loadConfig();
+    const config = await bootstrapDefaultProvider(await loadConfig());
     const report = { configPath: configStore.path, providers: config.providers.map((provider) => ({ id: provider.id, type: provider.type, credential: provider.apiKey?.kind ?? "missing" })), defaultProviderId: config.defaultProviderId ?? null, isolatedClaudeConfig: `${configStore.homeDirectory}/.alfacode/claude`, status: config.providers.length > 0 ? "ready" : "setup-required" };
     if (flags.json) return ui.write(JSON.stringify(report));
     ui.write(`Config: ${report.configPath}`); ui.write(`Providers: ${report.providers.length}`); ui.write(`Default provider: ${report.defaultProviderId ?? "not set"}`); ui.write(`Claude state: ${report.isolatedClaudeConfig}`); ui.write(`Status: ${report.status}`);
@@ -452,7 +470,10 @@ export function createCli(options: CreateCliOptions = {}): Command {
   program.command("config").command("path").action(() => ui.write(configStore.path));
   program.command("launch [args...]").description("Compatibility mode using Anthropic's original terminal UI").allowUnknownOption(true).action(classicLaunch);
   program.command("run [args...]").allowUnknownOption(true).option("--non-interactive", "Fail instead of prompting for setup").action(async (args: string[], flags: { nonInteractive?: boolean }) => {
-    if (flags.nonInteractive && !ui.interactive && (await loadConfig()).providers.length === 0) throw new Error("No provider configured. Use `alfacode connect google --api-key-env NAME` first.");
+    if (flags.nonInteractive && !ui.interactive) {
+      const config = await bootstrapDefaultProvider(await loadConfig());
+      if (config.providers.length === 0) throw new Error("No provider configured. Use `alfacode connect google --api-key-env NAME` first.");
+    }
     await classicLaunch(args);
   });
   return program;
@@ -563,6 +584,23 @@ function validateProviderId(value: string): void {
   if (/^(?:sk-|nvapi-|AIza)/i.test(value)) {
     throw new Error("Provider id looks like an API key. Pass a local label with --id; AlfaCode collects the credential separately");
   }
+}
+
+/**
+ * The same anonymous, no-credential Zen provider record `saveTuiProvider` writes when a user
+ * picks "Free public models" — free, tool-capable OpenCode Zen models with no API key or account.
+ * Looked up by `allowsAnonymous` rather than a hardcoded id so it tracks whichever descriptor
+ * actually offers that path; returns undefined if this catalog offers none (never true for the
+ * bundled descriptors, only possible with a restricted catalog injected for tests).
+ */
+function defaultZenProvider(descriptors: readonly ProviderDescriptor[]): ProviderRecord | undefined {
+  const descriptor = descriptors.find((item) => item.allowsAnonymous === true);
+  if (descriptor === undefined) return undefined;
+  return {
+    id: localProviderId(descriptor.id),
+    type: descriptor.configType,
+    ...(descriptor.configurationOptions === undefined ? {} : { options: { ...descriptor.configurationOptions } }),
+  };
 }
 
 function localProviderId(descriptorId: string): string {
