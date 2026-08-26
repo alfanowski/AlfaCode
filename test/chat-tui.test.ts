@@ -7,9 +7,12 @@ import {
   contextFullWarning,
   createTranscriptItemId,
   describePermissionDecision,
+  EFFORT_LEVELS,
   formatCostUsd,
   historySearchMatches,
   maxScrollOffsetRows,
+  modelSupportsEffort,
+  nextEffortLevel,
   reduceSdkMessage,
   resolveInitialVimMode,
   resolveLineEditorOperation,
@@ -235,6 +238,36 @@ describe("permission mode resync after identity resolves", () => {
 
   it("leaves an untouched, already-'default' mode as 'default' (idempotent)", () => {
     expect(resolvePermissionModeAfterIdentity("default", true, false)).toBe("default");
+  });
+});
+
+describe("model picker effort control", () => {
+  it("only forwards effort for models routed over the Anthropic Messages wire protocol", () => {
+    expect(modelSupportsEffort({ wireProtocol: "anthropic-messages" })).toBe(true);
+    expect(modelSupportsEffort({ wireProtocol: "openai-chat" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "openai-responses" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "gemini-generate-content" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "ollama-native" })).toBe(false);
+    expect(modelSupportsEffort({ wireProtocol: "unsupported" })).toBe(false);
+  });
+
+  it("steps right from 'default' (undefined) through low, medium, high, xhigh, to max, then clamps", () => {
+    let level: (typeof EFFORT_LEVELS)[number] | undefined;
+    for (const expected of EFFORT_LEVELS) {
+      level = nextEffortLevel(level, 1);
+      expect(level).toBe(expected);
+    }
+    expect(nextEffortLevel(level, 1)).toBe("max");
+  });
+
+  it("steps left from max back down to 'default' (undefined), then clamps", () => {
+    let level: (typeof EFFORT_LEVELS)[number] | undefined = "max";
+    for (const expected of [...EFFORT_LEVELS].reverse().slice(1)) {
+      level = nextEffortLevel(level, -1);
+      expect(level).toBe(expected);
+    }
+    expect(nextEffortLevel(level, -1)).toBeUndefined();
+    expect(nextEffortLevel(undefined, -1)).toBeUndefined();
   });
 });
 

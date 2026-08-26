@@ -3,7 +3,7 @@ import { relative as relativePath } from "node:path";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
-import type { McpServerStatus, PermissionMode, SDKAssistantMessage, SDKMessage, SDKResultMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { EffortLevel, McpServerStatus, PermissionMode, SDKAssistantMessage, SDKMessage, SDKResultMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
@@ -100,6 +100,10 @@ interface Checkpoint { readonly uuid: string; readonly text: string; readonly tr
 interface ImageAttachment { readonly id: number; readonly mediaType: PromptImageAttachment["mediaType"]; readonly base64: string }
 
 const modes: readonly PermissionMode[] = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
+/** Ordered low→max, matching the SDK's own `EffortLevel` union; `undefined` (not a member here) stands for "engine default, no explicit override". */
+export const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+/** EFFORT_LEVELS prefixed with the explicit "no override" position, for rendering the picker's segmented effort control. */
+const EFFORT_PIPS: readonly ("default" | EffortLevel)[] = ["default", ...EFFORT_LEVELS];
 const compactNumberFormatter = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 /** How long a running tool call may run before screen-reader mode rings the bell about it. */
 const TOOL_BELL_THRESHOLD_MS = 3_000;
@@ -182,6 +186,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     setPermissionModeState(mode);
   };
   const [activeModel, setActiveModel] = useState(identity.model);
+  // `undefined` means "engine default, no explicit override" (collapsing the SDK's own `null` —
+  // "no effort parameter will be sent" — with "the handshake hasn't reported one yet"; both render
+  // identically in the picker and both mean AlfaCode isn't currently asking for a specific level).
+  const [effortLevel, setEffortLevelState] = useState<EffortLevel | undefined>(undefined);
   const [commandCursor, setCommandCursor] = useState(0);
   const [history, setHistory] = useState<string[]>([]);
   const [historyCursor, setHistoryCursor] = useState(-1);
@@ -302,6 +310,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     void session.identity().then((resolved) => {
       if (!active) return;
       setActiveModel(resolved.model);
+      setEffortLevelState(resolved.effort ?? undefined);
       setLiveCompatibility(resolved.compatibility);
       setPermissionModeState((current) => resolvePermissionModeAfterIdentity(current, resolved.compatibility.compatible, permissionModeTouchedByUserRef.current));
       if (!resolved.compatibility.compatible) appendSystem(setMessages, resolved.compatibility.reason ?? "Unsupported Claude Code engine version.");
@@ -588,9 +597,18 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     const route = encodeModelId(model.providerId, model.id);
     reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${model.providerId}] ${model.displayName}`); });
   }
+  /** Left/right in the model picker: live, no transcript noise on every keystroke (only a failure is worth reporting) — mirrors selectModel's "await success before updating local state" convention. No-ops silently when the highlighted row can't carry an effort parameter; ModelPicker shows why. */
+  function adjustEffortLevel(model: ModelDescriptor | undefined, direction: -1 | 1): void {
+    if (model === undefined || !modelSupportsEffort(model)) return;
+    const next = nextEffortLevel(effortLevel, direction);
+    if (next === effortLevel) return;
+    reportFailure("Effort level", session.setEffortLevel(next ?? null), () => setEffortLevelState(next));
+  }
   function handleModelInput(text: string, key: Key): void {
     if (key.upArrow) setModelCursor((current) => Math.max(0, current - 1));
     else if (key.downArrow) setModelCursor((current) => Math.min(Math.max(0, filteredModels.length - 1), current + 1));
+    else if (key.leftArrow) adjustEffortLevel(filteredModels[modelCursor], -1);
+    else if (key.rightArrow) adjustEffortLevel(filteredModels[modelCursor], 1);
     else if (key.backspace || key.delete) { setModelFilter((current) => current.slice(0, -1)); setModelCursor(0); }
     else if (key.return) {
       const selected = filteredModels[modelCursor];
@@ -881,7 +899,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
         live, redrawn region with blank lines. */}
     <Box flexDirection="column" {...(screenReader ? {} : { minHeight: transcriptRows })} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
       {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
-      {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} /> : null}
+      {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} width={transcriptWidth} activeRoute={activeModel} effortLevel={effortLevel} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={transcriptWidth} /> : null}
       {screen === "permissions" ? <PermissionPicker selected={permissionMode} theme={theme} /> : null}
@@ -1168,13 +1186,80 @@ function MentionPalette({ entries, cursor, theme, width }: { readonly entries: r
   return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath} width={innerWidth}><Text color={active ? theme.accent : theme.muted} wrap="truncate-end">{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
 }
 
-function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {
+export function ModelPicker({ models, cursor, filter, theme, height, width, activeRoute, effortLevel }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number; readonly width: number; readonly activeRoute: string; readonly effortLevel: EffortLevel | undefined }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   // -6 (not -4) accounts for the picker's own outer panelBorder (2 rows) on top of the section
-  // title and search box already reserved for.
+  // title and search box already reserved for. Provider group headers add further rows on top of
+  // this budget, same "content-dependent, soft" tradeoff the cursor row's own extra detail line
+  // already made before this redesign.
   const visibleRows = Math.max(5, height - 6);
   const start = Math.max(0, Math.min(cursor - Math.floor(visibleRows / 2), Math.max(0, models.length - visibleRows)));
-  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1}><SectionTitle title="Models" detail={`${models.length} live, tool-capable matches`} theme={theme} /><Box {...panelBorder(theme, "active")} paddingX={1} marginBottom={1}><Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>{filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}</Box>{models.slice(start, start + visibleRows).map((model, index) => { const active = models[cursor] === model; const capabilities = [model.capabilities.reasoningState !== "none" ? "reasoning" : undefined, model.capabilities.vision ? "vision" : undefined, model.support === "contract-tested" ? "verified" : "best effort"].filter(Boolean).join(" · "); return <Box key={`${model.providerId}/${model.id}`} flexDirection="column" paddingLeft={active ? 0 : 2}><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : ""}<Text bold={active}>{numbered ? numberedLabel(start + index, model.displayName) : model.displayName}</Text><Text color={theme.faint}>  [{model.providerId}]</Text></Text>{active ? <Text color={theme.faint}>  {formatCompact(model.contextWindow)} context · {capabilities}</Text> : null}</Box>; })}{models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}<HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · enter switch · esc back</HintBar></Box>;
+  const slice = models.slice(start, start + visibleRows);
+  const innerWidth = Math.max(20, width - 4);
+  const providerCount = new Set(models.map((model) => model.providerId)).size;
+  return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1}>
+    <SectionTitle title="Models" detail={`${models.length} live, tool-capable match${models.length === 1 ? "" : "es"} across ${providerCount} provider${providerCount === 1 ? "" : "s"}`} theme={theme} />
+    <Box {...panelBorder(theme, "active")} paddingX={1} marginBottom={1}>
+      <Text color={theme.accent}>⌕ </Text><Text>{filter}</Text><Text inverse> </Text>
+      {filter.length === 0 ? <Text color={theme.faint}> type to search provider, model or id{numbered ? ", or a number to switch" : ""}</Text> : null}
+    </Box>
+    {slice.map((model, index) => {
+      const absoluteIndex = start + index;
+      const previousProviderId = index === 0 ? models[start - 1]?.providerId : slice[index - 1]?.providerId;
+      const groupSize = previousProviderId === model.providerId ? 0 : models.filter((candidate) => candidate.providerId === model.providerId).length;
+      const isCursor = absoluteIndex === cursor;
+      const isRouted = encodeModelId(model.providerId, model.id) === activeRoute;
+      const supportsEffort = modelSupportsEffort(model);
+      const capabilityTags = [
+        model.capabilities.vision ? "vision" : undefined,
+        model.capabilities.reasoningState !== "none" ? "reasoning" : undefined,
+      ].filter((tag): tag is string => tag !== undefined);
+      // Yoga's box model adds padding on top of an explicit width (content-box sizing), so an
+      // indented row needs its declared width reduced by exactly that padding or it overflows the
+      // panel by 2 columns — invisible at a wide terminal, but enough to visibly wrap a badge onto
+      // its own line at a narrow one. The name gets its own further-reserved, truncating sub-box
+      // (mirroring Header's modelWidth) so a long display name can never crowd the badge off the
+      // row instead of just truncating.
+      const rowIndent = isCursor ? 0 : 2;
+      const rowWidth = Math.max(10, innerWidth - rowIndent);
+      const badgeReserve = 14; // widest badge, "● best-effort", plus a spare column.
+      const nameWidth = Math.max(10, rowWidth - badgeReserve);
+      return <React.Fragment key={`${model.providerId}/${model.id}`}>
+        {groupSize > 0 ? <Box marginTop={index === 0 ? 0 : 1}>
+          <Text bold color={theme.secondary}>{model.providerId}</Text>
+          <Text color={theme.faint}> · {groupSize} model{groupSize === 1 ? "" : "s"}</Text>
+        </Box> : null}
+        <Box flexDirection="column" width={rowWidth} paddingLeft={rowIndent}>
+          {/* height=1 on both this row and the name sub-box pins a single terminal row: an
+              explicit-width Box with auto height, next to a StatusBadge sibling under
+              justifyContent="space-between", otherwise leaves Yoga to reserve a second, blank
+              row here at some terminal widths. */}
+          <Box justifyContent="space-between" height={1}>
+            <Box width={nameWidth} height={1}>
+              <Text color={isCursor ? theme.accent : theme.muted} wrap="truncate-end">
+                {isCursor ? "❯ " : ""}
+                <Text bold={isCursor}>{numbered ? numberedLabel(absoluteIndex, model.displayName) : model.displayName}</Text>
+                {isRouted ? <Text color={theme.success}> ● current</Text> : null}
+              </Text>
+            </Box>
+            <StatusBadge label={model.support === "contract-tested" ? "verified" : "best-effort"} tone={model.support === "contract-tested" ? "success" : "warning"} theme={theme} />
+          </Box>
+          {isCursor ? <Box flexDirection="column">
+            <Text color={theme.faint}>  {model.id} · {formatCompact(model.contextWindow)} context{capabilityTags.length > 0 ? ` · ${capabilityTags.join(" · ")}` : ""}</Text>
+            <Text color={theme.faint}>  Effort  {supportsEffort
+              ? EFFORT_PIPS.map((pip) => {
+                const isActive = pip === "default" ? effortLevel === undefined : effortLevel === pip;
+                return <Text key={pip} color={isActive ? theme.accent : theme.faint} bold={isActive}>{isActive ? `[${pip}]` : pip} </Text>;
+              })
+              : <Text color={theme.faint}>not available for this model (Anthropic-routed models only)</Text>}
+            </Text>
+          </Box> : null}
+        </Box>
+      </React.Fragment>;
+    })}
+    {models.length === 0 ? <Text color={theme.muted}>No verified tool-capable model matches this filter.</Text> : null}
+    <HintBar theme={theme}>{numbered ? "type a number to switch · " : ""}↑↓ navigate · ←→ effort (Anthropic models) · enter switch · esc back</HintBar>
+  </Box>;
 }
 
 function ProviderManager({ providers, models, cursor, defaultId, theme }: { readonly providers: readonly ProviderRecord[]; readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly defaultId?: string; readonly theme: Theme }): React.JSX.Element {
@@ -1407,6 +1492,25 @@ export function contextFullWarning(context: ContextUsage, alreadyWarned: boolean
  */
 export function resolvePermissionModeAfterIdentity(current: PermissionMode, resolvedCompatible: boolean, userTouched: boolean): PermissionMode {
   return resolvedCompatible && !userTouched ? "default" : current;
+}
+/**
+ * Whether AlfaCode's own gateway will actually forward an effort/thinking parameter for this
+ * model. The engine attaches `effort` to every outgoing request regardless of which model is
+ * routed — but `AnthropicMessagesAdapter` is the only adapter that passes the request body through
+ * verbatim to a real Anthropic-compatible endpoint (see src/providers/anthropic/messages.ts); the
+ * OpenAI-compatible and Gemini adapters rebuild the request from known fields and never read
+ * `effort`, so it would silently do nothing there. Gate any effort UI on this, not on the model's
+ * own advertised capabilities, since AlfaCode's synthetic model ids never match the engine's own
+ * per-model effort-support table anyway.
+ */
+export function modelSupportsEffort(model: Pick<ModelDescriptor, "wireProtocol">): boolean {
+  return model.wireProtocol === "anthropic-messages";
+}
+/** Steps one position through `undefined` ("engine default") followed by EFFORT_LEVELS low→max, clamped at both ends (no wraparound). */
+export function nextEffortLevel(current: EffortLevel | undefined, direction: -1 | 1): EffortLevel | undefined {
+  const index = current === undefined ? -1 : EFFORT_LEVELS.indexOf(current);
+  const nextIndex = Math.max(-1, Math.min(EFFORT_LEVELS.length - 1, index + direction));
+  return nextIndex === -1 ? undefined : EFFORT_LEVELS[nextIndex];
 }
 /** This turn's estimated cost (USD), derived from the engine's cumulative session total. Undefined when the engine didn't report a cost. */
 export function turnCostFromResult(message: SDKResultMessage, previousCumulativeUsd: number): { readonly turnCostUsd: number; readonly cumulativeCostUsd: number } | undefined {
