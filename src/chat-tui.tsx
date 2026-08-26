@@ -15,10 +15,11 @@ import { formatRelativeTime } from "./session-history.js";
 import { exportTranscript } from "./transcript-export.js";
 import type { UsageSummary } from "./usage-ledger.js";
 import { BackgroundTasksPanel, parseBackgroundTasksChanged, type BackgroundTask } from "./ui/background-tasks-panel.js";
+import { writeClipboardText } from "./ui/clipboard-copy.js";
 import { mediaTypeForExtension, readClipboardImage } from "./ui/clipboard-image.js";
 import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } from "./ui/dropped-paths.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
-import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
+import { Markdown, markdownToPlainText, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
 import { useAnimationFrame, useFlash, usePulse, useSpinner } from "./ui/motion.js";
 import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
@@ -126,6 +127,7 @@ const commands: readonly Command[] = [
   { name: "/export", description: "Export this transcript to a file" },
   { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
   { name: "/notifications", description: "Toggle the turn-complete bell", shortcut: "on|off" },
+  { name: "/copy", description: "Copy the last N assistant responses to the clipboard", shortcut: "[n]|on|off" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -193,6 +195,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
   const theme = useMemo(() => getTheme(themeName), [themeName]);
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => resolveNotificationSettings());
+  // Unlike /notifications (background bell, defaults off after being too intrusive) or /spellcheck
+  // (needs an external dependency, defaults off), /copy only ever does something when the user
+  // explicitly types it — no ambient behavior to be surprised by — so it defaults on.
+  const [copyEnabled, setCopyEnabled] = useState(true);
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
@@ -892,6 +898,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     }
     if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
     if (name === "/notifications") { handleNotificationsCommand(command); return; }
+    if (name === "/copy") { handleCopyCommand(command); return; }
     sendPrompt(command);
   }
   function handleNotificationsCommand(command: string): void {
@@ -900,6 +907,22 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
     setNotificationSettings((current) => ({ ...current, bell }));
     appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
+  }
+  function handleCopyCommand(command: string): void {
+    const parsed = parseCopyCommand(command);
+    if (parsed === undefined) { appendSystem(setMessages, "Usage: /copy [n] or /copy [on|off]"); return; }
+    if (parsed.kind === "toggle") {
+      setCopyEnabled(parsed.enabled);
+      appendSystem(setMessages, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
+      return;
+    }
+    if (!copyEnabled) { appendSystem(setMessages, "Copy to clipboard is off. Enable it with /copy on."); return; }
+    const responses = lastAssistantResponses(messages, parsed.count);
+    if (responses.length === 0) { appendSystem(setMessages, "No assistant responses to copy yet."); return; }
+    const text = responses.map(markdownToPlainText).join("\n\n");
+    const { truncated } = writeClipboardText(text);
+    const label = responses.length === 1 ? "Copied last response to clipboard." : `Copied last ${responses.length} responses to clipboard.`;
+    appendSystem(setMessages, truncated ? `${label} (truncated to fit terminal limits)` : label);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -1426,6 +1449,20 @@ function RewindMenu({ checkpoints: entries, cursor, busy, theme }: { readonly ch
 }
 
 export function commandSuggestions(value: string, available: readonly Command[] = commands): readonly Command[] { if (!value.startsWith("/") || value.includes(" ") || value.includes("\n")) return []; const needle = value.toLowerCase(); return available.filter((command) => command.name.startsWith(needle)); }
+/** Parses `/copy`'s optional argument: bare (`/copy`) or a count (`/copy 3`) requests a copy, `on`/`off` requests the toggle. `undefined` means the argument was malformed and the caller should show usage. */
+export function parseCopyCommand(command: string): { readonly kind: "toggle"; readonly enabled: boolean } | { readonly kind: "copy"; readonly count: number } | undefined {
+  const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
+  if (sub === undefined) return { kind: "copy", count: 1 };
+  if (sub === "on" || sub === "off") return { kind: "toggle", enabled: sub === "on" };
+  const count = Number.parseInt(sub, 10);
+  if (!Number.isInteger(count) || count < 1 || String(count) !== sub) return undefined;
+  return { kind: "copy", count };
+}
+/** The last `count` assistant transcript rows' raw (markdown-source) text, oldest first — `/copy` renders each through `markdownToPlainText` before writing it to the clipboard. */
+export function lastAssistantResponses(items: readonly TranscriptItem[], count: number): readonly string[] {
+  const assistantTexts = items.filter((item) => item.role === "assistant").map((item) => item.text);
+  return assistantTexts.slice(Math.max(0, assistantTexts.length - count));
+}
 /** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
 export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
   if (key.leftArrow) return { type: "left" };

@@ -305,6 +305,100 @@ export function plainText(tokens: readonly Token[]): string {
   }).join(""));
 }
 
+/**
+ * Converts markdown source into plain, readable prose — the same block/inline structure the
+ * terminal renderer above understands (headings, lists, code blocks, tables, links, ...) but
+ * without markdown syntax markers (`**`, backticks, `#`; table cells stay pipe-separated, which
+ * reads fine as plain text). Used by chat-tui.tsx's `/copy` command so pasting an assistant
+ * response elsewhere produces readable text instead of raw markdown source. Sanitizes the source
+ * the same way `lexMarkdown` does before parsing — an assistant transcript row is stored raw and
+ * only sanitized at render time, so this must sanitize on its own path too. Does not call or
+ * modify `sanitizeTerminalText` itself beyond that reuse, and — unlike `plainText` above, which is
+ * built for flattening short inline runs (e.g. table cells) — walks inline tokens with its own
+ * `inlineToPlainText` so a link keeps its URL and inline code isn't run through `stripHtml`
+ * (which would otherwise eat `<`/`>` out of things like `Array<string>`).
+ */
+export function markdownToPlainText(source: string): string {
+  const tokens = marked.lexer(sanitizeTerminalText(source), { gfm: true, breaks: true });
+  return blocksToPlainText(tokens).trim();
+}
+
+function blocksToPlainText(tokens: readonly Token[]): string {
+  return tokens.map((token) => blockToPlainText(token)).filter((block) => block.length > 0).join("\n\n");
+}
+
+function blockToPlainText(token: Token): string {
+  switch (token.type) {
+    case "space": return "";
+    case "heading": return inlineToPlainText((token as Tokens.Heading).tokens);
+    case "paragraph": return inlineToPlainText((token as Tokens.Paragraph).tokens);
+    case "text": return token.tokens === undefined ? sanitizeTerminalText(token.text) : inlineToPlainText(token.tokens);
+    case "code": return sanitizeTerminalText((token as Tokens.Code).text);
+    case "hr": return "---";
+    case "html": return sanitizeTerminalText(stripHtml(token.text)).trim();
+    case "blockquote": {
+      const inner = blocksToPlainText((token as Tokens.Blockquote).tokens);
+      return inner.split("\n").map((line) => (line.length === 0 ? ">" : `> ${line}`)).join("\n");
+    }
+    case "list": return listToPlainText(token as Tokens.List);
+    case "table": return tableToPlainText(token as Tokens.Table);
+    default: {
+      const generic = token as Tokens.Generic;
+      return generic.tokens === undefined ? "" : blocksToPlainText(generic.tokens);
+    }
+  }
+}
+
+/** Inline-token flattening for prose (paragraphs/headings/list items/table cells): drops formatting markers, keeps a link's URL, and — unlike `plainText` — never runs `stripHtml` over plain text/codespan content. */
+function inlineToPlainText(tokens: readonly Token[]): string {
+  return sanitizeTerminalText(tokens.map((token) => inlineTokenToPlainText(token)).join(""));
+}
+
+function inlineTokenToPlainText(token: Token): string {
+  switch (token.type) {
+    case "text": return token.tokens === undefined ? token.text : inlineToPlainText(token.tokens);
+    case "escape": return token.text;
+    case "strong": return inlineToPlainText((token as Tokens.Strong).tokens);
+    case "em": return inlineToPlainText((token as Tokens.Em).tokens);
+    case "del": return inlineToPlainText((token as Tokens.Del).tokens);
+    case "codespan": return token.text;
+    case "link": {
+      const link = token as Tokens.Link;
+      const label = inlineToPlainText(link.tokens);
+      return label === link.href ? label : `${label} (${link.href})`;
+    }
+    case "image": return `[image: ${token.text || token.href}]`;
+    case "br": return "\n";
+    case "html": return stripHtml(token.text);
+    default: return "text" in token && typeof token.text === "string" ? token.text : "";
+  }
+}
+
+function listItemBodyToPlainText(tokens: readonly Token[]): string {
+  return tokens.map((token) => {
+    if (token.type === "text" || token.type === "paragraph") {
+      const inline = token.type === "paragraph" ? (token as Tokens.Paragraph).tokens : token.tokens ?? [token];
+      return inlineToPlainText(inline);
+    }
+    return blockToPlainText(token);
+  }).filter((line) => line.length > 0).join("\n");
+}
+
+function listToPlainText(token: Tokens.List): string {
+  const start = typeof token.start === "number" ? token.start : 1;
+  return token.items.map((item, index) => {
+    const marker = item.task ? (item.checked ? "[x] " : "[ ] ") : token.ordered ? `${start + index}. ` : "- ";
+    const body = listItemBodyToPlainText(item.tokens);
+    const [firstLine = "", ...rest] = body.split("\n");
+    return [`${marker}${firstLine}`, ...rest.map((line) => (line.length === 0 ? "" : `  ${line}`))].join("\n");
+  }).join("\n");
+}
+
+function tableToPlainText(token: Tokens.Table): string {
+  const rows = [token.header, ...token.rows].map((row) => row.map((cell) => inlineToPlainText(cell.tokens)));
+  return rows.map((row) => row.join(" | ")).join("\n");
+}
+
 function ListItemTokens({ tokens, theme, width }: { readonly tokens: readonly Token[]; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   return <>{tokens.map((token, index) => {
     if (token.type === "text" || token.type === "paragraph") {
