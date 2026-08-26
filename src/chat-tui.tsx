@@ -171,6 +171,15 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [questionOtherMode, setQuestionOtherMode] = useState(false);
   const [questionOtherEditor, setQuestionOtherEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [permissionMode, setPermissionModeState] = useState<PermissionMode>(identity.compatibility.compatible ? "default" : "dontAsk");
+  // The `identity` prop is a placeholder (always incompatible) until the real engine handshake
+  // resolves via session.identity() below; this mirrors that resolved compatibility so the Header
+  // badge and permission mode reflect reality instead of staying frozen at the placeholder.
+  const [liveCompatibility, setLiveCompatibility] = useState(identity.compatibility);
+  const permissionModeTouchedByUserRef = useRef(false);
+  const setPermissionModeByUser = (mode: PermissionMode): void => {
+    permissionModeTouchedByUserRef.current = true;
+    setPermissionModeState(mode);
+  };
   const [activeModel, setActiveModel] = useState(identity.model);
   const [commandCursor, setCommandCursor] = useState(0);
   const [history, setHistory] = useState<string[]>([]);
@@ -291,6 +300,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     void session.identity().then((resolved) => {
       if (!active) return;
       setActiveModel(resolved.model);
+      setLiveCompatibility(resolved.compatibility);
+      setPermissionModeState((current) => resolvePermissionModeAfterIdentity(current, resolved.compatibility.compatible, permissionModeTouchedByUserRef.current));
       if (!resolved.compatibility.compatible) appendSystem(setMessages, resolved.compatibility.reason ?? "Unsupported Claude Code engine version.");
       void refreshTelemetry(session, loadUsage, setContextUsage, setUsage);
       void session.supportedCommands().then((supported) => setEngineCommands(toCommands(supported))).catch(() => undefined);
@@ -435,7 +446,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (key.tab && key.shift) {
       const index = modes.indexOf(permissionMode);
       const next = modes[(index + 1) % modes.length] ?? "default";
-      setPermissionModeState(next);
+      setPermissionModeByUser(next);
       reportFailure("Permission mode", session.setPermissionMode(next));
       return;
     }
@@ -602,9 +613,9 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   function handlePermissionModeInput(text: string, key: Key): void {
     const index = modes.indexOf(permissionMode);
     const numbered = isScreenReaderMode() ? parseNumberedSelection(text, modes.length) : undefined;
-    if (numbered !== undefined) { setPermissionModeState(modes[numbered] ?? "default"); return; }
-    if (key.upArrow) setPermissionModeState(modes[Math.max(0, index - 1)] ?? "default");
-    else if (key.downArrow) setPermissionModeState(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
+    if (numbered !== undefined) { setPermissionModeByUser(modes[numbered] ?? "default"); return; }
+    if (key.upArrow) setPermissionModeByUser(modes[Math.max(0, index - 1)] ?? "default");
+    else if (key.downArrow) setPermissionModeByUser(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
     else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
   }
   function handleHistorySearchInput(text: string, key: Key): void {
@@ -835,7 +846,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const screenReader = isScreenReaderMode();
   const scrollIndicatorVisible = fullscreen && screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && !scrollWindow.atTail;
   return <Box flexDirection="column" paddingX={1} width={width} {...(fullscreen ? { height } : {})}>
-    <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={identity.compatibility.compatible} busy={busy} theme={theme} width={width} />
+    <Header model={activeModel} mode={permissionMode} providers={config.providers.length} compatible={liveCompatibility.compatible} busy={busy} theme={theme} width={width} />
     {screen === "chat" ? <BackgroundTasksPanel tasks={backgroundTasks} theme={theme} /> : null}
     {screen === "chat" ? <TodoPanel todos={todos} collapsed={todoPanelCollapsed} theme={theme} /> : null}
     {/* Screen-reader mode doesn't reserve a fixed-height scrolling viewport: the transcript
@@ -1249,6 +1260,16 @@ export function contextFullWarning(context: ContextUsage, alreadyWarned: boolean
   if (alreadyWarned || context.percentage < contextFullThreshold(context)) return undefined;
   const auto = context.isAutoCompactEnabled === true ? " before the engine compacts it for you" : "";
   return `Context is ${Math.round(context.percentage)}% full. Run /compact [instructions] to summarize and free up space${auto}.`;
+}
+/**
+ * AgentSession auto-upgrades the live engine's permission mode from the restrictive startup
+ * default to "default" once compatibility is confirmed (nativeLaunch never requests an explicit
+ * mode). This mirrors that same condition to resync local UI state after `session.identity()`
+ * resolves — but only when the user hasn't explicitly picked a mode themselves yet, so an
+ * explicit user choice always wins over this background resync.
+ */
+export function resolvePermissionModeAfterIdentity(current: PermissionMode, resolvedCompatible: boolean, userTouched: boolean): PermissionMode {
+  return resolvedCompatible && !userTouched ? "default" : current;
 }
 /** This turn's estimated cost (USD), derived from the engine's cumulative session total. Undefined when the engine didn't report a cost. */
 export function turnCostFromResult(message: SDKResultMessage, previousCumulativeUsd: number): { readonly turnCostUsd: number; readonly cumulativeCostUsd: number } | undefined {

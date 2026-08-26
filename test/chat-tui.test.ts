@@ -13,6 +13,7 @@ import {
   reduceSdkMessage,
   resolveInitialVimMode,
   resolveLineEditorOperation,
+  resolvePermissionModeAfterIdentity,
   tailItemsByRows,
   truncateCheckpointsAt,
   truncateOneLine,
@@ -211,6 +212,24 @@ describe("context-full warning", () => {
 
   it("does not repeat the warning once already shown", () => {
     expect(contextFullWarning({ ...baseContext, percentage: 90 }, true)).toBeUndefined();
+  });
+});
+
+describe("permission mode resync after identity resolves", () => {
+  it("upgrades the stale startup default to 'default' once the engine is confirmed compatible", () => {
+    expect(resolvePermissionModeAfterIdentity("dontAsk", true, false)).toBe("default");
+  });
+
+  it("leaves the mode alone once the user has explicitly picked one, even if compatible", () => {
+    expect(resolvePermissionModeAfterIdentity("plan", true, true)).toBe("plan");
+  });
+
+  it("leaves the mode alone while the engine is still confirmed incompatible", () => {
+    expect(resolvePermissionModeAfterIdentity("dontAsk", false, false)).toBe("dontAsk");
+  });
+
+  it("leaves an untouched, already-'default' mode as 'default' (idempotent)", () => {
+    expect(resolvePermissionModeAfterIdentity("default", true, false)).toBe("default");
   });
 });
 
