@@ -41,6 +41,32 @@ describe("Header", () => {
     expect(frame).toContain("AlfaCode");
     expect(frame).toContain("working");
   });
+
+  it("has no background fill on the panel (the old violet tint is gone)", () => {
+    // Structural stand-in for "no backgroundColor prop": the rendered frame is plain text/border
+    // glyphs on the terminal's own background, not a filled block — there is nothing else this
+    // render environment lets us inspect for a removed background color (see the mixHex/ProgressBar
+    // tests elsewhere in this suite for why ANSI color isn't asserted directly).
+    const frame = render(<Header {...base} busy={false} />).lastFrame() ?? "";
+    expect(frame).not.toContain("╭"); // no enclosing rounded border box either
+    expect(frame).not.toContain("╮");
+  });
+
+  it("signals busy/ready with a flat color+glyph swap, never a cycling animation frame", () => {
+    // The ready/busy dot used to cycle through usePulse's glyphs continuously for the whole busy
+    // duration — exactly the kind of sustained repaint this component's history warns against. The
+    // glyph immediately before the "working"/"ready" label is a flat "●" in both states now, never
+    // one of usePulse's other frames (Brand's own separate "✦" icon sits earlier on the same row
+    // and is expected regardless of busy state, so the check is anchored to the label itself).
+    const busyFrame = render(<Header {...base} busy />).lastFrame() ?? "";
+    const readyFrame = render(<Header {...base} busy={false} />).lastFrame() ?? "";
+    expect(busyFrame).toContain("● working");
+    expect(readyFrame).toContain("● ready");
+    for (const otherPulseFrame of ["·", "✧", "✦"]) {
+      expect(busyFrame).not.toContain(`${otherPulseFrame} working`);
+      expect(readyFrame).not.toContain(`${otherPulseFrame} ready`);
+    }
+  });
 });
 
 describe("ThinkingLine", () => {
