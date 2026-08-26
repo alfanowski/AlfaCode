@@ -7,7 +7,7 @@ import type {
   ProviderRequestContext,
   TokenCount,
 } from "../../provider-contract.js";
-import { readSse, unknownError, upstreamError } from "../http.js";
+import { providerFetch, readSse, unknownError, upstreamError } from "../http.js";
 import type { ModelDescriptor, ProtocolStateStore } from "../foundation/types.js";
 
 export interface OpenAIChatAdapterOptions {
@@ -50,7 +50,7 @@ export class OpenAIChatAdapter implements Provider {
   public async *streamMessage(request: ProviderMessageRequest, context: ProviderRequestContext): AsyncGenerator<CanonicalStreamEvent> {
     let response: Response;
     try {
-      response = await this.requestFetch(`${this.endpoint}/chat/completions`, {
+      response = await providerFetch(this.requestFetch, `${this.endpoint}/chat/completions`, {
         method: "POST",
         signal: context.signal,
         headers: { "content-type": "application/json", accept: "text/event-stream", Authorization: `Bearer ${this.options.apiKey}` },

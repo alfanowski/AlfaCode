@@ -42,6 +42,23 @@ describe("AlfaCode outer configuration CLI", () => {
     expect(await configStore.read()).toMatchObject({ providers: [{ id: "ci", apiKey: { kind: "env", name: "GEMINI_API_KEY" } }] });
   });
 
+  it.each(["", "9SECRET", "AWS-SECRET", "AWS.SECRET"])("rejects an invalid API key environment variable name: %s", async (name) => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal, keychain: { store: async () => { throw new Error("must not store"); } } });
+
+    await expect(cli.parseAsync(["node", "alfacode", "connect", "google", "--api-key-env", name], { from: "node" }))
+      .rejects.toThrow("API key environment variable");
+    expect((await configStore.read()).providers).toEqual([]);
+  });
+
+  it("accepts lowercase environment variable names", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+
+    await cli.parseAsync(["node", "alfacode", "connect", "google", "--api-key-env", "gemini_api_key"], { from: "node" });
+    expect((await configStore.read()).providers[0]?.apiKey).toEqual({ kind: "env", name: "gemini_api_key" });
+  });
+
   it("rejects Keychain prompts without a TTY", async () => {
     const cli = createCli({ configStore: new ConfigStore({ homeDirectory: await home() }), ui: ui(false).terminal });
     await expect(cli.parseAsync(["node", "alfacode", "connect", "google"], { from: "node" })).rejects.toThrow("interactive terminal");
@@ -107,6 +124,40 @@ describe("AlfaCode outer configuration CLI", () => {
       { id: "anthropic", type: "anthropic" },
       { id: "local", type: "openai-compatible", options: { baseUrl: "http://127.0.0.1:4000/v1" } },
     ]);
+  });
+
+  it.each(["http://localhost:4000/v1", "http://127.0.0.1:4000/v1", "http://[::1]:4000/v1"])("allows HTTP only for an explicit loopback endpoint: %s", async (baseUrl) => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+
+    await cli.parseAsync(["node", "alfacode", "connect", "openai-compatible", "--base-url", baseUrl, "--api-key-env", "LOCAL_KEY"], { from: "node" });
+    expect((await configStore.read()).providers[0]?.options?.baseUrl).toBe(baseUrl);
+  });
+
+  it("rejects a remote plaintext endpoint for a provider that requires a base URL", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+
+    await expect(cli.parseAsync(["node", "alfacode", "connect", "openai-compatible", "--base-url", "http://attacker.example/v1", "--api-key-env", "COMPAT_KEY"], { from: "node" }))
+      .rejects.toThrow("absolute HTTPS URL");
+    expect((await configStore.read()).providers).toEqual([]);
+  });
+
+  it.each(["not-a-url", "file:///tmp/provider", "http://attacker.example/v1"])("validates a supplied base URL even when the provider does not require one: %s", async (baseUrl) => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+
+    await expect(cli.parseAsync(["node", "alfacode", "connect", "google", "--base-url", baseUrl, "--api-key-env", "GOOGLE_KEY"], { from: "node" }))
+      .rejects.toThrow("absolute HTTPS URL");
+    expect((await configStore.read()).providers).toEqual([]);
+  });
+
+  it("persists a valid optional HTTPS base URL", async () => {
+    const configStore = new ConfigStore({ homeDirectory: await home() });
+    const cli = createCli({ configStore, ui: ui(false).terminal });
+
+    await cli.parseAsync(["node", "alfacode", "connect", "anthropic", "--base-url", "https://anthropic-proxy.example/v1", "--api-key-env", "ANTHROPIC_KEY"], { from: "node" });
+    expect((await configStore.read()).providers[0]?.options?.baseUrl).toBe("https://anthropic-proxy.example/v1");
   });
 
   it("uses an injected provider catalog instead of a built-in CLI switch", async () => {

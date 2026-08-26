@@ -45,7 +45,7 @@ describe("ModelsDevCatalogClient", () => {
 
     const storedProvider = result.catalog.providers.get("compatible");
     expect(result).toMatchObject({ source: "network", stale: false });
-    expect(storedProvider).toMatchObject({ id: "compatible", npm: "@ai-sdk/openai-compatible", env: ["MODEL_API_KEY"] });
+    expect(storedProvider).toMatchObject({ id: "compatible", npm: "@ai-sdk/openai-compatible", env: ["MODEL_API_KEY"], api: "https://provider.invalid/v1" });
     expect(storedProvider?.models.get("opaque-model")).toMatchObject({ toolCall: true, reasoning: true, wireFamily: "openai-chat", limits: { context: 1000, output: 100 }, costs: { input: 1, output: 2, cacheRead: 0.1 } });
     expect(saved.mode & 0o077).toBe(0);
     expect((await stat(dirname(path))).mode & 0o077).toBe(0);
@@ -80,6 +80,24 @@ describe("ModelsDevCatalogClient", () => {
     const oversizedPath = await cachePath();
     const oversized = new ModelsDevCatalogClient({ cachePath: oversizedPath, maxPayloadBytes: 10, fetch: async () => response(catalog({ source: provider("source", "@ai-sdk/openai-compatible", { alpha: model("alpha") }) })) });
     await expect(oversized.load()).rejects.toBeInstanceOf(ModelsDevCatalogError);
+  });
+
+  it.each(["not-a-url", "http://provider.invalid/v1", "ftp://provider.invalid/v1"])("rejects an unsafe provider API endpoint: %s", async (api) => {
+    const path = await cachePath();
+    const unsafe = provider("unsafe", "@ai-sdk/openai-compatible", { alpha: model("alpha") });
+    unsafe.api = api;
+    const client = new ModelsDevCatalogClient({ cachePath: path, fetch: async () => response(catalog({ unsafe })) });
+
+    await expect(client.load()).rejects.toBeInstanceOf(ModelsDevCatalogError);
+  });
+
+  it("accepts catalog providers without an optional API endpoint", async () => {
+    const path = await cachePath();
+    const withoutApi = provider("metadata-only", "@ai-sdk/openai-compatible", { alpha: model("alpha") });
+    delete withoutApi.api;
+    const result = await new ModelsDevCatalogClient({ cachePath: path, fetch: async () => response(catalog({ "metadata-only": withoutApi })) }).load();
+
+    expect(result.catalog.providers.get("metadata-only")?.api).toBeUndefined();
   });
 
   it("falls back to a stale private cache when the live refresh is offline", async () => {

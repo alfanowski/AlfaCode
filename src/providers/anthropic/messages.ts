@@ -7,7 +7,7 @@ import type {
   ProviderRequestContext,
   TokenCount,
 } from "../../provider-contract.js";
-import { readSse, unknownError, upstreamError } from "../http.js";
+import { providerFetch, readSse, unknownError, upstreamError } from "../http.js";
 import type { ModelDescriptor, ProtocolStateStore } from "../foundation/types.js";
 
 export interface AnthropicMessagesAdapterOptions {
@@ -40,7 +40,7 @@ export class AnthropicMessagesAdapter implements Provider {
   public async *streamMessage(request: ProviderMessageRequest, context: ProviderRequestContext): AsyncGenerator<CanonicalStreamEvent> {
     let response: Response;
     try {
-      response = await this.requestFetch(`${this.endpoint}/messages`, {
+      response = await providerFetch(this.requestFetch, `${this.endpoint}/messages`, {
         method: "POST",
         signal: context.signal,
         headers: {
@@ -78,7 +78,7 @@ export class AnthropicMessagesAdapter implements Provider {
 
   public async countTokens(request: ProviderMessageRequest, context: ProviderRequestContext): Promise<TokenCount> {
     try {
-      const response = await this.requestFetch(`${this.endpoint}/messages/count_tokens`, {
+      const response = await providerFetch(this.requestFetch, `${this.endpoint}/messages/count_tokens`, {
         method: "POST",
         signal: context.signal,
         headers: { "content-type": "application/json", "x-api-key": this.options.apiKey, "anthropic-version": "2023-06-01" },

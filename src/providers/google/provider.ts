@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { GoogleGenAI } from '@google/genai';
+import { redactSecret } from '../http.js';
 import { FileGoogleStateStore, type GoogleStateStore, type ToolCallState } from './state-store.js';
 import type {
   AnthropicContentBlock,
@@ -29,8 +30,10 @@ export class GoogleProvider {
   public readonly id = 'google';
   private readonly client: GoogleSdkClient;
   private readonly stateStore: GoogleStateStore;
+  private readonly apiKey: string | undefined;
 
   public constructor(options: GoogleProviderOptions = {}) {
+    this.apiKey = options.apiKey;
     this.client = options.client ?? new GoogleGenAI({
       ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
       ...(options.baseUrl === undefined ? {} : { httpOptions: { baseUrl: options.baseUrl } }),
@@ -39,20 +42,24 @@ export class GoogleProvider {
   }
 
   public async listModels(): Promise<ProviderModel[]> {
-    const pager = await this.client.models.list({ config: { pageSize: 100 } });
-    const models: ProviderModel[] = [];
-    for await (const model of pager) {
-      if (!isClaudeCodeCompatibleModel(model)) continue;
-      const name = model.name;
-      if (!name) continue;
-      models.push({
-        id: name.replace(/^models\//, ''),
-        displayName: model.displayName ?? name,
-        ...(model.inputTokenLimit === undefined ? {} : { contextWindow: model.inputTokenLimit }),
-        ...(model.outputTokenLimit === undefined ? {} : { maxOutputTokens: model.outputTokenLimit }),
-      });
+    try {
+      const pager = await this.client.models.list({ config: { pageSize: 100 } });
+      const models: ProviderModel[] = [];
+      for await (const model of pager) {
+        if (!isClaudeCodeCompatibleModel(model)) continue;
+        const name = model.name;
+        if (!name) continue;
+        models.push({
+          id: name.replace(/^models\//, ''),
+          displayName: model.displayName ?? name,
+          ...(model.inputTokenLimit === undefined ? {} : { contextWindow: model.inputTokenLimit }),
+          ...(model.outputTokenLimit === undefined ? {} : { maxOutputTokens: model.outputTokenLimit }),
+        });
+      }
+      return models;
+    } catch (error: unknown) {
+      throw safeGoogleError(error, this.apiKey);
     }
-    return models;
   }
 
   public async *stream(request: AnthropicRequest, context: ProviderContext): AsyncGenerator<CanonicalStreamEvent> {
@@ -108,18 +115,22 @@ export class GoogleProvider {
     } catch (error: unknown) {
       const statusCode = errorStatus(error);
       const retryAfterMs = errorRetryAfter(error);
-      yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error), ...(statusCode === undefined ? {} : { statusCode }), ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
+      yield { type: 'error', error: { type: errorName(error), message: safeErrorMessage(error, this.apiKey), ...(statusCode === undefined ? {} : { statusCode }), ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
     }
   }
 
   public async countTokens(request: AnthropicRequest, model: string, context: ProviderContext): Promise<number> {
-    const mapped = await this.mapRequest({ ...request, model }, context);
-    const response = await this.client.models.countTokens({
-      model,
-      contents: mapped.params.contents,
-      ...(mapped.params.config === undefined ? {} : { config: mapped.params.config }),
-    });
-    return response.totalTokens ?? 0;
+    try {
+      const mapped = await this.mapRequest({ ...request, model }, context);
+      const response = await this.client.models.countTokens({
+        model,
+        contents: mapped.params.contents,
+        ...(mapped.params.config === undefined ? {} : { config: mapped.params.config }),
+      });
+      return response.totalTokens ?? 0;
+    } catch (error: unknown) {
+      throw safeGoogleError(error, this.apiKey);
+    }
   }
 
   public async close(): Promise<void> {
@@ -272,10 +283,18 @@ function errorName(error: unknown): string {
   return error instanceof Error ? error.name : 'GoogleProviderError';
 }
 
-function safeErrorMessage(error: unknown): string {
+function safeErrorMessage(error: unknown, secret?: string): string {
   const text = error instanceof Error ? error.message : String(error);
   // API keys are never sent in URLs by this adapter and must not escape through an SDK error either.
-  return text.replace(/(?:AIza|api[_-]?key[=:]\s*)[^\s'"&]+/gi, '[REDACTED]');
+  return redactSecret(text, secret);
+}
+
+function safeGoogleError(error: unknown, secret?: string): Error {
+  const safe = new Error(safeErrorMessage(error, secret));
+  safe.name = errorName(error);
+  const statusCode = errorStatus(error);
+  const retryAfterMs = errorRetryAfter(error);
+  return Object.assign(safe, statusCode === undefined ? {} : { statusCode }, retryAfterMs === undefined ? {} : { retryAfterMs });
 }
 
 function errorStatus(error: unknown): number | undefined {

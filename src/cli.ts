@@ -97,13 +97,13 @@ export function createCli(options: CreateCliOptions = {}): Command {
     const descriptor = descriptors.find((item) => item.id === type);
     if (descriptor === undefined) throw new Error(`Unsupported provider type: ${type}. Use: ${descriptors.map((item) => item.id).join(", ")}`);
     if (flags.apiKeyEnv !== undefined && flags.keychain) throw new Error("Use either --api-key-env or --keychain, not both");
+    if (flags.apiKeyEnv !== undefined) validateEnvironmentVariableName(flags.apiKeyEnv);
     const config = await loadConfig();
     const id = flags.id ?? availableProviderId(localProviderId(descriptor.id), config.providers);
     validateProviderId(id);
     const baseUrl = flags.baseUrl ?? (descriptor.requiresBaseUrl && ui.interactive ? await ui.ask(`${descriptor.displayName} base URL`, descriptor.suggestedBaseUrl) : undefined);
-    if (descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) {
-      throw new Error(`${descriptor.displayName} requires an absolute http(s) --base-url`);
-    }
+    if (descriptor.requiresBaseUrl && baseUrl === undefined) throw new Error(`${descriptor.displayName} requires a --base-url`);
+    if (baseUrl !== undefined && !isHttpUrl(baseUrl)) throw new Error("Base URL must be an absolute HTTPS URL (HTTP is allowed only for localhost, 127.0.0.1, or ::1)");
     const useKeychain = flags.keychain || flags.apiKeyEnv === undefined;
     if (useKeychain) requireInteractive(ui.interactive);
     const apiKey: SecretReference = flags.apiKeyEnv === undefined
@@ -130,7 +130,8 @@ export function createCli(options: CreateCliOptions = {}): Command {
       : config.providers.find((item) => item.id === replaceProviderId);
     const id = replaceable?.id ?? availableProviderId(localProviderId(result.descriptor.id), config.providers);
     const baseUrl = result.baseUrl;
-    if (result.descriptor.requiresBaseUrl && (baseUrl === undefined || !isHttpUrl(baseUrl))) throw new Error("Enter an absolute http(s) base URL");
+    if (result.descriptor.requiresBaseUrl && baseUrl === undefined) throw new Error("Enter a base URL");
+    if (baseUrl !== undefined && !isHttpUrl(baseUrl)) throw new Error("Base URL must be an absolute HTTPS URL (HTTP is allowed only for localhost, 127.0.0.1, or ::1)");
     const provider: ProviderRecord = {
       id,
       type: result.descriptor.configType,
@@ -465,9 +466,16 @@ function toChoice(descriptor: ProviderDescriptor): { value: string; label: strin
 function isHttpUrl(value: string): boolean {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:";
+    if (url.protocol === "https:") return true;
+    return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]");
   } catch {
     return false;
+  }
+}
+
+function validateEnvironmentVariableName(value: string): void {
+  if (!/^[A-Z_][A-Z0-9_]*$/i.test(value)) {
+    throw new Error("API key environment variable must contain only letters, numbers, and underscores, and must not start with a number");
   }
 }
 
