@@ -5,6 +5,7 @@ import { editInput, splitAtCursor, type EditorOperation, type EditorState } from
 import { sanitizeTerminalText } from "./ui/markdown.js";
 import { Brand, HintBar, LoadingLabel, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import { resolveTheme, type Theme } from "./ui/theme.js";
+import { isScreenReaderMode, numberedLabel, parseNumberedSelection } from "./ui/screen-reader-mode.js";
 
 export interface ProviderSetupResult {
   readonly descriptor: ProviderDescriptor;
@@ -22,11 +23,12 @@ type Stage = "provider" | "auth" | "base-url" | "api-key" | "connecting" | "erro
 
 export async function runProviderSetup(options: ProviderSetupOptions): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("Provider setup requires an interactive terminal");
-  const instance = render(<ProviderSetup {...options} />, { exitOnCtrlC: false, patchConsole: false });
+  const instance = render(<ProviderSetup {...options} />, { exitOnCtrlC: false, patchConsole: false, isScreenReaderEnabled: isScreenReaderMode() });
   await instance.waitUntilExit();
 }
 
-function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOptions): React.JSX.Element {
+/** Exported (in addition to `runProviderSetup`) so tests can drive it directly through ink-testing-library without a real TTY. */
+export function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOptions): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const theme = useMemo(() => resolveTheme(), []);
@@ -57,7 +59,7 @@ function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOptions): 
       return;
     }
     if (stage === "provider") { handleProviderSearch(input, key); return; }
-    if (stage === "auth") { handleAuthChoice(key); return; }
+    if (stage === "auth") { handleAuthChoice(input, key); return; }
     if (key.escape) { backToProviders(); return; }
     if (applyEditorKey(input, key, setEditor)) return;
     if (key.return) submitCredentialStage();
@@ -67,19 +69,34 @@ function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOptions): 
     if (key.upArrow) { setCursor((current) => Math.max(0, current - 1)); return; }
     if (key.downArrow) { setCursor((current) => Math.min(Math.max(0, filtered.length - 1), current + 1)); return; }
     if (key.escape && query.value.length > 0) { setQuery({ value: "", cursor: 0 }); setCursor(0); return; }
+    if (isScreenReaderMode() && !key.ctrl && !key.meta && !key.return) {
+      // Screen-reader mode: a single typed digit picks a numbered-list entry (see ProviderList)
+      // immediately, resolved against the *current* (pre-keystroke) filtered list. Resolving at
+      // Enter time instead would be wrong: the digit itself also feeds the search box below via
+      // applyEditorKey, narrowing/renumbering `filtered` before Enter is ever pressed, so the
+      // number would end up picked against a list that's no longer the one the user saw it in.
+      // Matches the (already-correct) CommandPalette pattern in chat-tui.tsx.
+      const numbered = parseNumberedSelection(input, filtered.length);
+      const descriptor = numbered === undefined ? undefined : filtered[numbered];
+      if (descriptor !== undefined) { selectProvider(descriptor); return; }
+    }
     if (key.return) {
       const descriptor = filtered[cursor];
-      if (descriptor === undefined) return;
-      setSelected(descriptor);
-      setBaseUrl(undefined);
-      setEditor({ value: descriptor.suggestedBaseUrl ?? "", cursor: descriptor.suggestedBaseUrl?.length ?? 0 });
-      setStage(descriptor.allowsAnonymous ? "auth" : descriptor.requiresBaseUrl ? "base-url" : "api-key");
+      if (descriptor !== undefined) selectProvider(descriptor);
       return;
     }
     if (applyEditorKey(input, key, setQuery)) setCursor(0);
   }
 
-  function handleAuthChoice(key: Key): void {
+  function selectProvider(descriptor: ProviderDescriptor): void {
+    setSelected(descriptor);
+    setBaseUrl(undefined);
+    setEditor({ value: descriptor.suggestedBaseUrl ?? "", cursor: descriptor.suggestedBaseUrl?.length ?? 0 });
+    setStage(descriptor.allowsAnonymous ? "auth" : descriptor.requiresBaseUrl ? "base-url" : "api-key");
+  }
+
+  function handleAuthChoice(input: string, key: Key): void {
+    if (isScreenReaderMode() && (input === "1" || input === "2")) { setAuthCursor(input === "1" ? 0 : 1); return; }
     if (key.upArrow || key.downArrow) { setAuthCursor((current) => current === 0 ? 1 : 0); return; }
     if (key.escape) { backToProviders(); return; }
     if (!key.return || selected === undefined) return;
@@ -137,22 +154,25 @@ function ProviderSetup({ descriptors, notice, connect }: ProviderSetupOptions): 
 }
 
 function ProviderList({ filtered, visible, cursor, query, theme }: { readonly filtered: readonly ProviderDescriptor[]; readonly visible: readonly ProviderDescriptor[]; readonly cursor: number; readonly query: EditorState; readonly theme: Theme }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
+  const start = filtered.length === 0 ? 0 : filtered.indexOf(visible[0]!);
   return <Box flexDirection="column">
     <SectionTitle title="Choose a provider" detail={`${filtered.length} connector${filtered.length === 1 ? "" : "s"} available`} theme={theme} />
     <SearchBox editor={query} placeholder="Search Google, Zen, Anthropic, OpenAI…" theme={theme} />
-    <Box flexDirection="column" marginTop={1}>{visible.map((item) => {
+    <Box flexDirection="column" marginTop={1}>{visible.map((item, index) => {
       const active = filtered[cursor]?.id === item.id;
       return <Box key={item.id} flexDirection="column" borderStyle="round" borderColor={active ? theme.accent : theme.border} paddingX={1} marginBottom={1}>
-        <Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{item.displayName}</Text>{item.allowsAnonymous ? <StatusBadge label="free option" tone="success" theme={theme} /> : null}</Box>
+        <Box justifyContent="space-between"><Text bold color={active ? theme.accent : theme.text}>{active ? "◆ " : "◇ "}{numbered ? numberedLabel(start + index, item.displayName) : item.displayName}</Text>{item.allowsAnonymous ? <StatusBadge label="free option" tone="success" theme={theme} /> : null}</Box>
         <Text color={theme.muted}>{item.description}</Text>
       </Box>;
     })}</Box>
     {filtered.length === 0 ? <Text color={theme.muted}>No provider matches “{query.value}”. Press Esc to clear the search.</Text> : null}
-    <HintBar theme={theme}>↑↓ navigate · enter select · ctrl+c cancel</HintBar>
+    <HintBar theme={theme}>{numbered ? "type a number to select · " : ""}↑↓ navigate · enter select · ctrl+c cancel</HintBar>
   </Box>;
 }
 
 function AuthChoice({ selected, cursor, theme }: { readonly selected: ProviderDescriptor | undefined; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+  const numbered = isScreenReaderMode();
   const options = [
     { title: "Free public models", description: "No account, API key or billing setup required", badge: "recommended" },
     { title: "Zen API key", description: "Use account models, limits and billing", badge: "advanced" },
@@ -160,10 +180,10 @@ function AuthChoice({ selected, cursor, theme }: { readonly selected: ProviderDe
   return <Box flexDirection="column">
     <SectionTitle title={`Connect ${selected?.displayName ?? "provider"}`} detail="choose how AlfaCode should authenticate" theme={theme} />
     {options.map((option, index) => <Box key={option.title} flexDirection="column" borderStyle="round" borderColor={cursor === index ? theme.accent : theme.border} paddingX={2} paddingY={1} marginBottom={1}>
-      <Box justifyContent="space-between"><Text bold color={cursor === index ? theme.accent : theme.text}>{cursor === index ? "◆ " : "◇ "}{option.title}</Text><Text color={index === 0 ? theme.success : theme.muted}>{option.badge}</Text></Box>
+      <Box justifyContent="space-between"><Text bold color={cursor === index ? theme.accent : theme.text}>{cursor === index ? "◆ " : "◇ "}{numbered ? numberedLabel(index, option.title) : option.title}</Text><Text color={index === 0 ? theme.success : theme.muted}>{option.badge}</Text></Box>
       <Text color={theme.muted}>{option.description}</Text>
     </Box>)}
-    <HintBar theme={theme}>↑↓ choose · enter continue · esc back</HintBar>
+    <HintBar theme={theme}>{numbered ? "type 1 or 2 · " : ""}↑↓ choose · enter continue · esc back</HintBar>
   </Box>;
 }
 

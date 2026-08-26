@@ -256,7 +256,11 @@ export function createCli(options: CreateCliOptions = {}): Command {
     });
   };
 
-  const nativeLaunch = async (args: readonly string[]): Promise<void> => {
+  const nativeLaunch = async (args: readonly string[], flags?: { screenReader?: boolean }): Promise<void> => {
+    // Minimal additive opt-in: --screen-reader is sugar for ALFACODE_SCREEN_READER=1, read
+    // directly by the UI modules (see ui/screen-reader-mode.ts), the same way ALFACODE_THEME and
+    // ALFACODE_REDUCED_MOTION already work.
+    if (flags?.screenReader) process.env.ALFACODE_SCREEN_READER = "1";
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     let nextAction: ChatAction = { type: "connect" };
     while (nextAction.type !== "exit") {
@@ -323,7 +327,9 @@ export function createCli(options: CreateCliOptions = {}): Command {
   };
 
   const program = new Command();
-  program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true).action(nativeLaunch);
+  program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true)
+    .option("--screen-reader", "Render a plain, linear, screen-reader-friendly UI (same as ALFACODE_SCREEN_READER=1)")
+    .action(nativeLaunch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
     .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely").option("--base-url <url>", "Base URL for an OpenAI-compatible provider")
     .action(async (type: string | undefined, flags: ConnectFlags) => {
