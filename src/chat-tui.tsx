@@ -19,8 +19,8 @@ import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } fr
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { useFlash, usePulse, useSpinner } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { useFlash, usePulse, useSpinner, useTwinkle } from "./ui/motion.js";
+import { Brand, EmptyState, HintBar, KeyHint, mixHex, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -966,17 +966,38 @@ function extractToolResultText(content: unknown): string {
   return "";
 }
 
-function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+/**
+ * The app's single always-on-screen signature element, so it earns more than a flat status line:
+ * a taller, tinted panel (two information rows instead of one) topped by the brand mark and
+ * capped with an `ActivityRule` — a full-width accent→secondary energy strip that sits idle
+ * (a quiet, still line) when ready and shimmers a traveling gradient when busy, in the same
+ * mixHex-gradient language `ProgressBar` already established elsewhere in the app.
+ */
+export function Header({ model, mode, providers, compatible, busy, theme, width }: { readonly model: string; readonly mode: PermissionMode; readonly providers: number; readonly compatible: boolean; readonly busy: boolean; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const pulse = usePulse(busy);
-  const modelWidth = Math.max(16, Math.min(34, width - 48));
-  return <Box justifyContent="space-between" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1}>
-    <Box width={12}><Brand theme={theme} compact /></Box>
-    <Box columnGap={2} justifyContent="flex-end" flexGrow={1}>
+  const modelWidth = Math.max(16, Math.min(34, width - 36));
+  const ruleWidth = Math.max(4, width - 8);
+  return <Box flexDirection="column" {...panelBorder(theme, busy ? "active" : "quiet")} paddingX={1} marginBottom={1} backgroundColor={theme.surfaceRaised}>
+    <Box justifyContent="space-between">
+      <Brand theme={theme} compact />
       <Text color={busy ? theme.secondary : theme.success}>{busy ? pulse : "●"} <Text bold>{busy ? "working" : "ready"}</Text></Text>
+    </Box>
+    <Box justifyContent="space-between">
       <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
       <Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text>
     </Box>
+    <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
   </Box>;
+}
+/** A quiet, still line when idle; a traveling accent→secondary shimmer (via `useTwinkle`'s staggered per-index phases) when busy — a richer, always-legible "actively working" cue than a single pulsing dot. */
+function ActivityRule({ busy, width, theme }: { readonly busy: boolean; readonly width: number; readonly theme: Theme }): React.JSX.Element {
+  const twinkle = useTwinkle(busy ? width : 0, { interval: 90 });
+  if (!busy) return <Text color={theme.border}>{"━".repeat(width)}</Text>;
+  return <Text>{Array.from({ length: width }, (_, index) => {
+    const level = (twinkle[index] ?? 2) / 2;
+    const hue = mixHex(theme.accent, theme.secondary, width <= 1 ? 0 : index / (width - 1));
+    return <Text key={index} color={mixHex(theme.surfaceRaised, hue, level)}>━</Text>;
+  })}</Text>;
 }
 
 function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
