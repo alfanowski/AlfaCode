@@ -158,6 +158,10 @@ describe("chat transcript reducer", () => {
     expect(commandSuggestions("/vim").map((command) => command.name)).toEqual(["/vim"]);
   });
 
+  it("registers /notifications in the default command list", () => {
+    expect(commandSuggestions("/notifications").map((command) => command.name)).toEqual(["/notifications"]);
+  });
+
   it("registers the discovery and export commands alongside the built-ins", () => {
     expect(commandSuggestions("/the").map((command) => command.name)).toEqual(["/theme"]);
     expect(commandSuggestions("/mcp").map((command) => command.name)).toEqual(["/mcp"]);

@@ -32,15 +32,15 @@ const truthyFlags = new Set(["1", "true", "yes", "on"]);
 const falsyFlags = new Set(["0", "false", "no", "off"]);
 
 /**
- * The terminal bell defaults to ON (matching Claude Code precedent and the
- * "universally supported baseline" framing) since it is inert unless the
- * user's terminal already opted into surfacing it. Desktop notifications
- * default to OFF since spawning a subprocess on every turn is a bigger
- * behavior change that a user should opt into explicitly.
+ * Both the terminal bell and desktop notifications default to OFF. A bell after every completed
+ * turn is intrusive for the common case of short, frequent back-and-forth exchanges — it's opt-in
+ * via `ALFACODE_NOTIFY_BELL=1`/`/notifications on`, useful for a long task you've stepped away
+ * from, not a constant companion sound. Desktop notifications stay opt-in too, since spawning a
+ * subprocess on every turn is a bigger behavior change a user should choose explicitly.
  */
 export function resolveNotificationSettings(environment: NodeJS.ProcessEnv = process.env): NotificationSettings {
   return {
-    bell: parseFlag(environment.ALFACODE_NOTIFY_BELL, true),
+    bell: parseFlag(environment.ALFACODE_NOTIFY_BELL, false),
     desktop: parseFlag(environment.ALFACODE_NOTIFY_DESKTOP, false),
   };
 }

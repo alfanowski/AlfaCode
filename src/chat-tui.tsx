@@ -8,7 +8,7 @@ import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
 import { decodeModelId, encodeModelId } from "./model-id.js";
 import type { AgentSession, AgentSessionIdentity, PromptImageAttachment } from "./agent-session.js";
-import { notifyTurnComplete, resolveNotificationSettings } from "./notifications.js";
+import { notifyTurnComplete, resolveNotificationSettings, type NotificationSettings } from "./notifications.js";
 import type { PermissionBroker, PermissionRequest, UserQuestionRequest } from "./permission-broker.js";
 import { formatRelativeTime } from "./session-history.js";
 import { exportTranscript } from "./transcript-export.js";
@@ -118,6 +118,7 @@ const commands: readonly Command[] = [
   { name: "/theme", description: "Switch the color theme" },
   { name: "/export", description: "Export this transcript to a file" },
   { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
+  { name: "/notifications", description: "Toggle the turn-complete bell", shortcut: "on|off" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -147,7 +148,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const { stdout } = useStdout();
   const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
   const theme = useMemo(() => getTheme(themeName), [themeName]);
-  const notificationSettings = useMemo(() => resolveNotificationSettings(), []);
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => resolveNotificationSettings());
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
@@ -809,7 +810,15 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       return;
     }
     if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
+    if (name === "/notifications") { handleNotificationsCommand(command); return; }
     sendPrompt(command);
+  }
+  function handleNotificationsCommand(command: string): void {
+    const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
+    if (sub !== undefined && sub !== "on" && sub !== "off") { appendSystem(setMessages, "Usage: /notifications [on|off]"); return; }
+    const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
+    setNotificationSettings((current) => ({ ...current, bell }));
+    appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -863,8 +872,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       {screen === "rewind" ? <RewindMenu checkpoints={visibleCheckpoints} cursor={rewindCursor} busy={rewindBusy} theme={theme} /> : null}
     </Box>
     {scrollIndicatorVisible ? <ScrollIndicator count={scrollWindow.newerItemCount} theme={theme} /> : null}
-    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} />
-      : screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && mentionQuery !== undefined && mentionMatches.length > 0 ? <MentionPalette entries={mentionMatches} cursor={mentionCursor} theme={theme} /> : null}
+    {screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && commandMatches.length > 0 ? <CommandPalette commands={commandMatches} cursor={commandCursor} theme={theme} width={width - 2} />
+      : screen === "chat" && pendingPermission === undefined && pendingQuestion === undefined && historySearch === undefined && mentionQuery !== undefined && mentionMatches.length > 0 ? <MentionPalette entries={mentionMatches} cursor={mentionCursor} theme={theme} width={width - 2} /> : null}
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
       : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} vim={vimEnabled ? vim : undefined} attachmentCount={attachments.length} theme={theme} width={width} misspelledRanges={misspelledRanges} underlineColor={spellCheckSettings.underlineColor ?? theme.danger} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} comment={permissionComment} commentMode={permissionCommentMode} commentEditor={permissionCommentEditor} theme={theme} />}
@@ -1033,16 +1042,25 @@ function Composer({ editor, busy, screen, context, lastTurnTokens, lastTurnCostU
   </Box>;
 }
 
-function CommandPalette({ commands: matches, cursor, theme }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+function CommandPalette({ commands: matches, cursor, theme, width }: { readonly commands: readonly Command[]; readonly cursor: number; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, matches.length - 6)));
-  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => { const active = start + index === cursor; return <Box key={command.name} justifyContent="space-between"><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}<Text bold={active}>{numbered ? numberedLabel(start + index, command.name) : command.name}</Text><Text color={theme.muted}>  {command.description}</Text></Text>{command.shortcut === undefined ? null : <Text color={theme.faint}>{command.shortcut}</Text>}</Box>; })}</Box>;
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>COMMANDS <Text color={theme.faint}>{numbered ? "type 1-9 to pick · " : ""}↑↓ navigate · tab complete · enter run</Text></Text>{matches.slice(start, start + 6).map((command, index) => {
+    const active = start + index === cursor;
+    const label = numbered ? numberedLabel(start + index, command.name) : command.name;
+    return <Box key={command.name} width={innerWidth} justifyContent="space-between">
+      <Text color={active ? theme.accent : theme.muted} wrap="truncate-end">{active ? "❯ " : "  "}<Text bold={active}>{label}</Text><Text color={theme.muted}>  {command.description}</Text></Text>
+      {command.shortcut === undefined ? null : <Text color={theme.faint} wrap="truncate-start"> {command.shortcut}</Text>}
+    </Box>;
+  })}</Box>;
 }
 
 /** Mirrors CommandPalette's navigate/tab/accept interaction on purpose — see mentions.ts. */
-function MentionPalette({ entries, cursor, theme }: { readonly entries: readonly MentionEntry[]; readonly cursor: number; readonly theme: Theme }): React.JSX.Element {
+function MentionPalette({ entries, cursor, theme, width }: { readonly entries: readonly MentionEntry[]; readonly cursor: number; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const start = Math.max(0, Math.min(cursor - 2, Math.max(0, entries.length - 6)));
-  return <Box flexDirection="column" {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath}><Text color={active ? theme.accent : theme.muted}>{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" width={width} {...panelBorder(theme, "quiet")} paddingX={1} marginX={1}><Text bold color={theme.muted}>FILES <Text color={theme.faint}>↑↓ navigate · tab insert</Text></Text>{entries.slice(start, start + 6).map((entry, index) => { const active = start + index === cursor; return <Box key={entry.relativePath} width={innerWidth}><Text color={active ? theme.accent : theme.muted} wrap="truncate-end">{active ? "❯ " : "  "}<Text bold={active}>{entry.relativePath}{entry.isDirectory ? "/" : ""}</Text></Text></Box>; })}{entries.length === 0 ? <Text color={theme.muted}>No matching files.</Text> : null}</Box>;
 }
 
 function ModelPicker({ models, cursor, filter, theme, height }: { readonly models: readonly ModelDescriptor[]; readonly cursor: number; readonly filter: string; readonly theme: Theme; readonly height: number }): React.JSX.Element {

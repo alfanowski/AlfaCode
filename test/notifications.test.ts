@@ -3,19 +3,21 @@ import { describe, expect, it, vi } from "vitest";
 import { notifyDesktop, notifyTurnComplete, resolveNotificationSettings, ringBell, type SpawnLike } from "../src/notifications.js";
 
 describe("notification settings", () => {
-  it("defaults the bell on and desktop notifications off", () => {
-    expect(resolveNotificationSettings({})).toEqual({ bell: true, desktop: false });
+  it("defaults both the bell and desktop notifications off", () => {
+    expect(resolveNotificationSettings({})).toEqual({ bell: false, desktop: false });
   });
 
-  it("honors explicit opt-out and opt-in flags", () => {
-    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "0" }).bell).toBe(false);
+  it("honors explicit opt-in and opt-out flags", () => {
+    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "1" }).bell).toBe(true);
     expect(resolveNotificationSettings({ ALFACODE_NOTIFY_DESKTOP: "1" }).desktop).toBe(true);
-    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "false" }).bell).toBe(false);
+    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "true" }).bell).toBe(true);
     expect(resolveNotificationSettings({ ALFACODE_NOTIFY_DESKTOP: "true" }).desktop).toBe(true);
+    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "1", ALFACODE_NOTIFY_DESKTOP: "0" }).bell).toBe(true);
+    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "1", ALFACODE_NOTIFY_DESKTOP: "0" }).desktop).toBe(false);
   });
 
   it("falls back to the default for an unrecognized value", () => {
-    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "sometimes" }).bell).toBe(true);
+    expect(resolveNotificationSettings({ ALFACODE_NOTIFY_BELL: "sometimes" }).bell).toBe(false);
   });
 });
 
