@@ -47,6 +47,7 @@ import {
   type TranscriptLogState,
 } from "./ui/screen-reader-mode.js";
 import { ScreenReaderTranscript } from "./ui/screen-reader-transcript.js";
+import { StatusBar } from "./ui/status-bar.js";
 import { getTheme, resolveThemeName, themeCatalog, type Theme, type ThemeName } from "./ui/theme.js";
 import { parseTodoWriteTodos, TodoPanel, type TodoItem } from "./ui/todo-panel.js";
 import { stringifyToolPayload, truncateForDisplay } from "./ui/tool-output.js";
@@ -202,6 +203,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
+  // Ephemeral UI feedback (a keyboard hint, a settings-toggle confirmation) — rendered by
+  // StatusBar near the composer, entirely separate from `messages`/Transcript so it never pollutes
+  // the conversation record. See `showStatus` (parallel to `appendSystem`) below.
+  const [statusMessage, setStatusMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [modelCursor, setModelCursor] = useState(0);
   const [modelFilter, setModelFilter] = useState("");
@@ -455,6 +460,11 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   useEffect(() => { spellCheckController.current?.setText(editor.value); }, [editor.value]);
 
   useInput((text, key) => {
+    // A status-bar notice reads as "still relevant" only until the user does something else —
+    // clear it unconditionally up front; any branch below that wants to show a fresh one calls
+    // showStatus() later in this same handler, which simply overrides this with the new text (no
+    // flicker: React batches both setStatusMessage calls from one keystroke into a single render).
+    setStatusMessage(undefined);
     if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
     if (pendingPermission !== undefined) { handlePermissionInput(text, key, pendingPermission); return; }
     if (confirmDeleteId !== undefined) {
@@ -471,7 +481,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       const now = Date.now();
       if (now - lastCtrlCAtRef.current < 900) { finish({ type: "exit" }); return; }
       lastCtrlCAtRef.current = now;
-      appendSystem(setMessages, "Press Ctrl+C again to exit.");
+      showStatus(setStatusMessage, "Press Ctrl+C again to exit.");
       return;
     }
     if (key.escape && screen !== "chat") { setScreen("chat"); clearEditor(); return; }
@@ -617,7 +627,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     imageSequence.current += 1;
     const id = imageSequence.current;
     void readClipboardImage().then((image) => {
-      if (image === undefined) { appendSystem(setMessages, "Clipboard doesn't contain an image."); return; }
+      if (image === undefined) { showStatus(setStatusMessage, "Clipboard doesn't contain an image."); return; }
       setAttachments((current) => [...current, { id, mediaType: image.mediaType, base64: image.base64 }]);
       applyEdit({ type: "insert", text: `[Image #${id}] ` });
     });
@@ -645,7 +655,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   }
   function selectModel(model: ModelDescriptor): void {
     const route = encodeModelId(model.providerId, model.id);
-    reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${model.providerId}] ${model.displayName}`); });
+    reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); showStatus(setStatusMessage, `Model switched to [${model.providerId}] ${model.displayName}`); });
   }
   /** Left/right in the model picker: live, no transcript noise on every keystroke (only a failure is worth reporting) — mirrors selectModel's "await success before updating local state" convention. No-ops silently when the highlighted row can't carry an effort parameter; ModelPicker shows why. */
   function adjustEffortLevel(model: ModelDescriptor | undefined, direction: -1 | 1): void {
@@ -693,7 +703,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (numbered !== undefined) { setPermissionModeByUser(modes[numbered] ?? "default"); return; }
     if (key.upArrow) setPermissionModeByUser(modes[Math.max(0, index - 1)] ?? "default");
     else if (key.downArrow) setPermissionModeByUser(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
-    else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
+    else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); showStatus(setStatusMessage, `Permission mode: ${permissionMode}`); });
   }
   function handleHistorySearchInput(text: string, key: Key): void {
     if (key.escape) { setHistorySearch(undefined); return; }
@@ -736,7 +746,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     // TUI, including this picker); enter just confirms and returns to chat.
     if (key.upArrow) setThemeName(themeCatalog[Math.max(0, index - 1)]?.name ?? themeName);
     else if (key.downArrow) setThemeName(themeCatalog[Math.min(themeCatalog.length - 1, index + 1)]?.name ?? themeName);
-    else if (key.return) { setScreen("chat"); appendSystem(setMessages, `Theme: ${themeCatalog.find((entry) => entry.name === themeName)?.label ?? themeName}`); }
+    else if (key.return) { setScreen("chat"); showStatus(setStatusMessage, `Theme: ${themeCatalog.find((entry) => entry.name === themeName)?.label ?? themeName}`); }
   }
   function handlePermissionInput(text: string, key: Key, request: PermissionRequest): void {
     if (permissionCommentMode) {
@@ -857,7 +867,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       const next = !vimEnabled;
       setVimEnabled(next);
       setVim(createVimState());
-      appendSystem(setMessages, `Vim mode ${next ? "enabled (starting in NORMAL — press i to insert)" : "disabled"}.`);
+      showStatus(setStatusMessage, `Vim mode ${next ? "enabled (starting in NORMAL — press i to insert)" : "disabled"}.`);
       return;
     }
     if (name === "/help") { setScreen("help"); return; }
@@ -903,26 +913,26 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   }
   function handleNotificationsCommand(command: string): void {
     const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
-    if (sub !== undefined && sub !== "on" && sub !== "off") { appendSystem(setMessages, "Usage: /notifications [on|off]"); return; }
+    if (sub !== undefined && sub !== "on" && sub !== "off") { showStatus(setStatusMessage, "Usage: /notifications [on|off]"); return; }
     const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
     setNotificationSettings((current) => ({ ...current, bell }));
-    appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
+    showStatus(setStatusMessage, `Turn-complete bell: ${bell ? "on" : "off"}`);
   }
   function handleCopyCommand(command: string): void {
     const parsed = parseCopyCommand(command);
-    if (parsed === undefined) { appendSystem(setMessages, "Usage: /copy [n] or /copy [on|off]"); return; }
+    if (parsed === undefined) { showStatus(setStatusMessage, "Usage: /copy [n] or /copy [on|off]"); return; }
     if (parsed.kind === "toggle") {
       setCopyEnabled(parsed.enabled);
-      appendSystem(setMessages, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
+      showStatus(setStatusMessage, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
       return;
     }
-    if (!copyEnabled) { appendSystem(setMessages, "Copy to clipboard is off. Enable it with /copy on."); return; }
+    if (!copyEnabled) { showStatus(setStatusMessage, "Copy to clipboard is off. Enable it with /copy on."); return; }
     const responses = lastAssistantResponses(messages, parsed.count);
-    if (responses.length === 0) { appendSystem(setMessages, "No assistant responses to copy yet."); return; }
+    if (responses.length === 0) { showStatus(setStatusMessage, "No assistant responses to copy yet."); return; }
     const text = responses.map(markdownToPlainText).join("\n\n");
     const { truncated } = writeClipboardText(text);
     const label = responses.length === 1 ? "Copied last response to clipboard." : `Copied last ${responses.length} responses to clipboard.`;
-    appendSystem(setMessages, truncated ? `${label} (truncated to fit terminal limits)` : label);
+    showStatus(setStatusMessage, truncated ? `${label} (truncated to fit terminal limits)` : label);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -933,26 +943,30 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     else if (sub === "off") next = { ...spellCheckSettings, enabled: false };
     else if (sub === "checker") {
       const matched = rest[0] === undefined ? undefined : spellCheckerNames.find((candidate) => candidate === rest[0]);
-      if (matched === undefined) { appendSystem(setMessages, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
+      if (matched === undefined) { showStatus(setStatusMessage, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
       next = { ...spellCheckSettings, checker: matched };
     } else if (sub === "dictionary") {
       const dictionary = rest.join(" ");
-      if (dictionary.length === 0) { appendSystem(setMessages, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
+      if (dictionary.length === 0) { showStatus(setStatusMessage, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
       next = { ...spellCheckSettings, dictionary };
     } else if (sub === "color") {
       const underlineColor = rest[0];
-      if (underlineColor === undefined) { appendSystem(setMessages, "Usage: /spellcheck color <name>, e.g. red"); return; }
+      if (underlineColor === undefined) { showStatus(setStatusMessage, "Usage: /spellcheck color <name>, e.g. red"); return; }
       next = { ...spellCheckSettings, underlineColor };
     } else {
-      appendSystem(setMessages, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
+      showStatus(setStatusMessage, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
       return;
     }
     setSpellCheckSettings(next);
     try { await spellCheckStore.save(next); } catch { /* best-effort local persistence */ }
-    appendSystem(setMessages, describeSpellCheckSettings(next, spellChecker));
+    showStatus(setStatusMessage, describeSpellCheckSettings(next, spellChecker));
   }
+  // Failures of a UI/session-config action (interrupt, permission-mode/model/effort-level change —
+  // never an in-conversation tool or send failure, those stay real transcript entries elsewhere in
+  // this file) — the status-bar channel, matching where these same actions' success confirmations
+  // already render (see selectModel/handlePermissionModeInput above).
   function reportFailure(label: string, promise: Promise<unknown>, onSuccess?: () => void): void {
-    void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
+    void promise.then(onSuccess).catch((error: unknown) => showStatus(setStatusMessage, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
   const screenReader = isScreenReaderMode();
@@ -981,6 +995,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
       : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} vim={vimEnabled ? vim : undefined} attachmentCount={attachments.length} theme={theme} width={width} misspelledRanges={misspelledRanges} underlineColor={spellCheckSettings.underlineColor ?? theme.danger} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} comment={permissionComment} commentMode={permissionCommentMode} commentEditor={permissionCommentEditor} theme={theme} />}
+    <StatusBar message={statusMessage} theme={theme} />
   </Box>;
 }
 
@@ -1613,6 +1628,8 @@ function truncatePreview(value: string): string { const lines = value.split("\n"
 function safeCommandName(value: string): string | undefined { const sanitized = sanitizeTerminalText(value).trim().replace(/^\/+/, ""); return sanitized.length === 0 || /\s/u.test(sanitized) ? undefined : `/${sanitized.slice(0, 100)}`; }
 export function createTranscriptItemId(prefix: "user" | "assistant" | "system"): string { transcriptItemSequence += 1; return `${prefix}-${transcriptItemSequence}`; }
 function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: createTranscriptItemId("system"), role: "system", text: sanitizeTerminalText(text) }]); }
+/** appendSystem's counterpart for the StatusBar channel: an ephemeral UI notice, never appended to `messages`/Transcript. See StatusBar's doc comment for the split. */
+function showStatus(setter: React.Dispatch<React.SetStateAction<string | undefined>>, text: string): void { setter(sanitizeTerminalText(text)); }
 function shortModel(model: string): string { return decodeModelId(model)?.upstreamModel ?? model.split("/").at(-1) ?? model; }
 function toMentionPath(absolutePath: string): string { const relative = relativePath(process.cwd(), absolutePath); return relative.startsWith("..") ? absolutePath : relative; }
 function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return compactNumberFormatter.format(value); }
