@@ -181,7 +181,7 @@ describe("createCli", () => {
     expect(runtimeClosed).toBe(true);
   });
 
-  it("only enables fullscreen mode when --fullscreen is passed, leaving the default chat UI unaffected", async () => {
+  it("defaults fullscreen mode on, honors --no-fullscreen to opt out, and keeps --fullscreen working as a no-op", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-cli-fullscreen-"));
     directories.push(home);
     const configStore = new ConfigStore({ homeDirectory: home });
@@ -200,7 +200,8 @@ describe("createCli", () => {
 
     await cli.parseAsync(["node", "alfacode"], { from: "node" });
     await cli.parseAsync(["node", "alfacode", "--fullscreen"], { from: "node" });
-    expect(seenFullscreen).toEqual([undefined, true]);
+    await cli.parseAsync(["node", "alfacode", "--no-fullscreen"], { from: "node" });
+    expect(seenFullscreen).toEqual([true, true, false]);
   });
 
   it("restores the previous Keychain secret when reconnect validation fails", async () => {
