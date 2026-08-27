@@ -785,46 +785,21 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       applyQuestionEditorKey(text, key);
       return;
     }
-    const otherIndex = question.options.length;
-    if (key.escape) { permissions.cancelQuestions(); return; }
-    // Screen-reader mode: type a number instead of arrowing to an option (0 is "Other"). Single
-    // choice answers and advances immediately, like Enter; multiple choice toggles, like Space.
-    if (isScreenReaderMode() && !key.ctrl && !key.meta && /^[0-9]$/.test(text)) {
-      if (text === "0") { setQuestionCursor(otherIndex); setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
-      const digitIndex = Number(text) - 1;
-      const label = question.options[digitIndex]?.label;
-      if (label !== undefined) {
-        setQuestionCursor(digitIndex);
-        if (!question.multiSelect) { completeQuestion(request, [label]); return; }
-        setQuestionSelections((current) => {
-          const selected = current[questionIndex] ?? [];
-          return { ...current, [questionIndex]: selected.includes(label) ? selected.filter((item) => item !== label) : [...selected, label] };
-        });
-        return;
-      }
-    }
-    if (key.upArrow) { setQuestionCursor((current) => Math.max(0, current - 1)); return; }
-    if (key.downArrow) { setQuestionCursor((current) => Math.min(otherIndex, current + 1)); return; }
-    if (key.tab) { setQuestionCursor((current) => (current + 1) % (otherIndex + 1)); return; }
-    if (text === " " && questionCursor < question.options.length) {
-      const label = question.options[questionCursor]?.label;
-      if (label === undefined) return;
-      if (!question.multiSelect) setQuestionSelections((current) => ({ ...current, [questionIndex]: [label] }));
-      else setQuestionSelections((current) => {
-        const selected = current[questionIndex] ?? [];
-        return { ...current, [questionIndex]: selected.includes(label) ? selected.filter((item) => item !== label) : [...selected, label] };
+    const selected = questionSelections[questionIndex] ?? [];
+    const action = resolveQuestionChoiceAction(text, key, question, questionCursor, selected, isScreenReaderMode());
+    if (action.type === "cancel") { permissions.cancelQuestions(); return; }
+    if (action.type === "navigate") { setQuestionCursor(action.cursor); return; }
+    if (action.type === "toggle") {
+      const { cursor, label } = action;
+      setQuestionCursor(cursor);
+      setQuestionSelections((current) => {
+        const currentSelected = current[questionIndex] ?? [];
+        return { ...current, [questionIndex]: currentSelected.includes(label) ? currentSelected.filter((item) => item !== label) : [...currentSelected, label] };
       });
       return;
     }
-    if (!key.return) return;
-    if (questionCursor === otherIndex) { setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
-    const focused = question.options[questionCursor]?.label;
-    if (focused === undefined) return;
-    if (question.multiSelect) {
-      const selected = questionSelections[questionIndex] ?? [];
-      if (selected.length === 0) completeQuestion(request, [focused]);
-      else completeQuestion(request, selected);
-    } else completeQuestion(request, [focused]);
+    if (action.type === "openOther") { setQuestionCursor(action.cursor); setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
+    if (action.type === "complete") completeQuestion(request, action.values);
   }
   function applyQuestionEditorKey(text: string, key: Key): void {
     const operation = resolveLineEditorOperation(text, key);
@@ -1383,7 +1358,7 @@ function McpPanel({ servers, theme }: { readonly servers: readonly McpServerStat
   })}<HintBar theme={theme}>esc back</HintBar></Box>;
 }
 
-function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+export function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const question = request.questions[questionIndex];
   if (question === undefined) return <></>;
@@ -1396,7 +1371,10 @@ function QuestionCard({ request, questionIndex, cursor, selections, otherMode, o
     <Box marginTop={1}><Text bold color={theme.text}>{question.question}</Text></Box>
     <Box flexDirection="column" marginTop={1}>{question.options.map((option, index) => {
       const active = cursor === index && !otherMode;
-      const checked = selected.includes(option.label);
+      // Multi-select has a real notion of "checked" independent of the cursor (toggled via Space,
+      // tracked in `selections`). Single-select doesn't — the highlighted option *is* the
+      // candidate Enter would submit, so the radio glyph just follows the cursor.
+      const checked = question.multiSelect ? selected.includes(option.label) : active;
       return <Box key={option.label} flexDirection="column" paddingLeft={active ? 0 : 2}>
         <Text color={active ? theme.accent : checked ? theme.success : theme.text}>{active ? "❯ " : ""}{question.multiSelect ? checked ? "[✓] " : "[ ] " : checked ? "◉ " : "○ "}<Text bold={active || checked}>{numbered ? numberedLabel(index, option.label) : option.label}</Text></Text>
         {active ? <Text color={theme.muted}>    {option.description}</Text> : null}
@@ -1476,6 +1454,55 @@ export function resolveLineEditorOperation(text: string, key: Key): Parameters<t
   if (key.delete) return { type: "delete" };
   if (!key.ctrl && !key.meta && text.length > 0) return { type: "insert", text: sanitizeTerminalText(text).replace(/\r?\n/gu, " ") };
   return undefined;
+}
+export type QuestionChoiceAction =
+  | { readonly type: "cancel" }
+  | { readonly type: "navigate"; readonly cursor: number }
+  | { readonly type: "toggle"; readonly cursor: number; readonly label: string }
+  | { readonly type: "openOther"; readonly cursor: number }
+  | { readonly type: "complete"; readonly values: readonly string[] }
+  | { readonly type: "none" };
+/**
+ * Pure keybinding resolution for QuestionCard's option list (the free-text "Other" editor reuses
+ * `resolveLineEditorOperation` instead — see handleQuestionInput). Mirrors Claude Code's
+ * documented confirmation-context bindings: Up/Down navigate, Tab moves to the next field
+ * (wrapping through "Other"), Escape declines, Space toggles the highlighted option, Enter
+ * confirms.
+ *
+ * Two behaviors below are AlfaCode's own reasoned defaults for gaps Claude Code's docs leave
+ * open, not confirmed upstream behavior:
+ *  - Single-select Space is a no-op: there is nothing to toggle independently of the cursor, so
+ *    the highlighted option *is* the candidate and Enter both selects and submits it in one
+ *    press.
+ *  - Digit quick-jump only applies in screen-reader mode (AlfaCode's own accessibility feature,
+ *    pre-existing). Claude Code's docs don't describe digit navigation at all, so it's left out
+ *    of the default sighted flow rather than guessed at.
+ */
+export function resolveQuestionChoiceAction(text: string, key: Pick<Key, "upArrow" | "downArrow" | "tab" | "escape" | "return" | "ctrl" | "meta">, question: Pick<UserQuestionRequest["questions"][number], "options" | "multiSelect">, cursor: number, selected: readonly string[], screenReaderMode: boolean): QuestionChoiceAction {
+  const otherIndex = question.options.length;
+  if (key.escape) return { type: "cancel" };
+  // Screen-reader mode: type a number instead of arrowing to an option (0 is "Other"). Single
+  // choice answers and advances immediately, like Enter; multiple choice toggles, like Space.
+  if (screenReaderMode && !key.ctrl && !key.meta && /^[0-9]$/.test(text)) {
+    if (text === "0") return { type: "openOther", cursor: otherIndex };
+    const digitIndex = Number(text) - 1;
+    const label = question.options[digitIndex]?.label;
+    if (label !== undefined) return question.multiSelect ? { type: "toggle", cursor: digitIndex, label } : { type: "complete", values: [label] };
+  }
+  if (key.upArrow) return { type: "navigate", cursor: Math.max(0, cursor - 1) };
+  if (key.downArrow) return { type: "navigate", cursor: Math.min(otherIndex, cursor + 1) };
+  if (key.tab) return { type: "navigate", cursor: (cursor + 1) % (otherIndex + 1) };
+  if (text === " " && cursor < question.options.length) {
+    if (!question.multiSelect) return { type: "none" };
+    const label = question.options[cursor]?.label;
+    return label === undefined ? { type: "none" } : { type: "toggle", cursor, label };
+  }
+  if (!key.return) return { type: "none" };
+  if (cursor === otherIndex) return { type: "openOther", cursor };
+  const focused = question.options[cursor]?.label;
+  if (focused === undefined) return { type: "none" };
+  if (!question.multiSelect) return { type: "complete", values: [focused] };
+  return { type: "complete", values: selected.length === 0 ? [focused] : selected };
 }
 /** Builds the audit-trail transcript line for a resolved permission prompt; `appendSystem` sanitizes the composed text on the way in. */
 export function describePermissionDecision(toolName: string, label: string, comment: string | undefined): string {
