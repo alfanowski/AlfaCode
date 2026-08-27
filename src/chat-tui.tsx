@@ -271,6 +271,14 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [mentionCursor, setMentionCursor] = useState(0);
   const [attachments, setAttachments] = useState<readonly ImageAttachment[]>([]);
   const [toolDetail, setToolDetail] = useState(false);
+  // Focus mode (see resolveTaskPickerAction / selectableTaskEntries / subagentTranscript): which
+  // running Task entry the Up/Down picker is currently highlighting in the main transcript
+  // (`taskCursor`, an index into that candidate list — clamped at each use site rather than via an
+  // effect, matching how ModelPicker/ProviderManager already clamp their own cursors), and which
+  // one — if any — the user has committed to with Enter (`focusedTaskItemId`, that row's own
+  // transcript id; `screen === "subagent"` is what actually switches the middle panel over).
+  const [taskCursor, setTaskCursor] = useState(0);
+  const [focusedTaskItemId, setFocusedTaskItemId] = useState<string>();
   const [todos, setTodos] = useState<readonly TodoItem[]>([]);
   const [todoPanelCollapsed, setTodoPanelCollapsed] = useState(false);
   const [backgroundTasks, setBackgroundTasks] = useState<readonly BackgroundTask[]>([]);
@@ -317,6 +325,16 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const maxScrollOffset = useMemo(() => maxScrollOffsetRows(messages, transcriptWidth), [messages, transcriptWidth]);
   const scrollWindow = useMemo(() => windowItemsByRows(messages, transcriptRows, transcriptWidth, scrollOffset), [messages, transcriptRows, transcriptWidth, scrollOffset]);
   const visibleMessages = scrollWindow.items;
+  // Focus mode's candidate list and current picker highlight (see resolveTaskPickerAction's doc
+  // comment for why Up/Down/Enter only ever engage here): `taskCursor` is clamped inline rather
+  // than reset via an effect, so a subagent completing mid-navigation just shifts the highlight
+  // rather than needing to be reconciled separately.
+  const runningTaskEntries = useMemo(() => selectableTaskEntries(messages), [messages]);
+  const highlightedTaskId = screen === "chat" && editor.value.length === 0 && runningTaskEntries.length > 0
+    ? runningTaskEntries[Math.min(taskCursor, runningTaskEntries.length - 1)]?.id
+    : undefined;
+  const focusedTaskItem = useMemo(() => focusedTaskItemId === undefined ? undefined : messages.find((item) => item.id === focusedTaskItemId), [focusedTaskItemId, messages]);
+  const focusedSubagentItems = useMemo(() => focusedTaskItem?.parentToolUseId === undefined ? [] : subagentTranscript(messages, focusedTaskItem.parentToolUseId), [focusedTaskItem, messages]);
   const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
   // Reusable scroll-offset API (rows scrolled up from the tail): keyboard binds to it below, and a future
   // mouse-wheel handler can drive the same three entry points without touching the windowing math.
@@ -500,7 +518,9 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (screen === "permissions") { handlePermissionModeInput(text, key); return; }
     if (screen === "rewind") { handleRewindInput(key); return; }
     if (screen === "theme") { handleThemeInput(key); return; }
-    if (screen === "help" || screen === "usage" || screen === "mcp") return;
+    // Focus mode has no keymap of its own beyond the shared Esc-to-chat handling right above —
+    // it's a read-only view of one subagent's activity (see SubagentFocus's own doc comment).
+    if (screen === "help" || screen === "usage" || screen === "mcp" || screen === "subagent") return;
 
     // Image paste (Ctrl+V always reaches the terminal; Cmd+V only surfaces as key.super under the
     // kitty keyboard protocol — see clipboard-image.ts for why this can't just read stdin) and
@@ -564,6 +584,17 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       setEditor({ value: promptSuggestion, cursor: promptSuggestion.length });
       setPromptSuggestion(undefined);
       return;
+    }
+    // Subagent focus-mode picker (resolveTaskPickerAction): checked ahead of vim mode for the same
+    // reason command/mention-palette navigation above is — vim's own NORMAL-mode motions would
+    // otherwise claim Up/Down as j/k cursor moves before this ever ran. Only ever active with an
+    // empty composer and at least one Task running (see the resolver's own doc comment), so this
+    // never shadows ordinary Up/Down history recall or Enter-to-submit in any other moment.
+    const taskPick = resolveTaskPickerAction(key, { composerEmpty: editor.value.length === 0, runningCount: runningTaskEntries.length });
+    if (taskPick?.type === "move") { setTaskCursor((current) => Math.max(0, Math.min(runningTaskEntries.length - 1, current + taskPick.direction))); return; }
+    if (taskPick?.type === "focus") {
+      const target = runningTaskEntries[Math.min(taskCursor, runningTaskEntries.length - 1)];
+      if (target !== undefined) { setFocusedTaskItemId(target.id); setScreen("subagent"); return; }
     }
     if (vimEnabled) {
       const step = stepVim(editor, vim, text, key);
@@ -985,7 +1016,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
         lives in <Static> above this frame instead, so a fixed minHeight would only pad the
         live, redrawn region with blank lines. */}
     <Box flexDirection="column" {...(screenReader ? {} : { minHeight: transcriptRows })} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
-      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
+      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} {...(highlightedTaskId === undefined ? {} : { selectedTaskId: highlightedTaskId })} />) : null}
+      {screen === "subagent" ? <SubagentFocus task={focusedTaskItem} items={focusedSubagentItems} theme={theme} width={transcriptWidth} detailed={toolDetail} /> : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} width={transcriptWidth} activeRoute={activeModel} effortLevel={effortLevel} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={transcriptWidth} /> : null}
@@ -1155,7 +1187,7 @@ export function transcriptStage(items: readonly TranscriptItem[], busy: boolean)
   return last?.role === "assistant" ? "writing" : "thinking";
 }
 
-export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
+export function Transcript({ items, theme, width, busy, detailed, selectedTaskId }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean; readonly selectedTaskId?: string }): React.JSX.Element {
   // A single shared trigger for the whole transcript — keyed on the newest item's identity — so a
   // burst of several items landing in quick succession (e.g. parallel tool calls) still drives just
   // one flash/timeout, not one per row. Whichever row is currently newest picks it up below; a row
@@ -1168,11 +1200,11 @@ export function Transcript({ items, theme, width, busy, detailed }: { readonly i
     const highlight = index === items.length - 1 && arrived ? { backgroundColor: theme.surfaceRaised } : {};
     if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1} {...highlight}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
     if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1} {...highlight}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} justArrived={index === items.length - 1 && arrived} />;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} justArrived={index === items.length - 1 && arrived} selected={item.id === selectedTaskId} />;
     return <Box key={item.id} marginTop={1} {...highlight}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
   })}{stage === "thinking" || stage === "writing" ? <ThinkingLine theme={theme} writing={stage === "writing"} /> : null}</>;
 }
-function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly justArrived?: boolean }): React.JSX.Element {
+function ToolActivity({ item, theme, detailed, justArrived = false, selected = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly justArrived?: boolean; readonly selected?: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
   // A brief highlight pulse whenever this row's status changes (most visibly running → completed/failed
   // — the moment a tool call actually lands something worth noticing) — never on the row's own first
@@ -1188,9 +1220,14 @@ function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly
   // "Bash" once it lands (the ✓/× icon already carries the outcome), "Bash" prefixed with a failure
   // callout when it doesn't.
   const prefix = item.status === "running" ? "Running " : item.status === "failed" ? "Failed — " : "";
-  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}`;
-  const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
-  const highlight = statusFlash || justArrived ? { backgroundColor: theme.surfaceRaised } : {};
+  // `selected` marks the row focus mode's Up/Down picker is currently highlighting (see
+  // resolveTaskPickerAction) — always a running Task row (taskId set) when true, per the caller's
+  // own selectableTaskEntries-derived candidate list, but re-checked here too so this component
+  // stays correct even if ever handed a stray id by mistake.
+  const isPickerTarget = selected && item.taskId !== undefined;
+  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}${isPickerTarget ? " · enter to focus" : ""}`;
+  const summary = <Box>{isPickerTarget ? <Text bold color={theme.accent}>{"❯ "}</Text> : null}<Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
+  const highlight = statusFlash || justArrived || isPickerTarget ? { backgroundColor: theme.surfaceRaised } : {};
   if (!detailed) return <Box paddingLeft={2} {...highlight}>{summary}</Box>;
   const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
   const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
@@ -1198,6 +1235,41 @@ function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly
     {summary}
     {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>INPUT</Text><Text color={theme.muted}>{input}</Text></Box>}
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
+  </Box>;
+}
+/**
+ * Focus mode: a filtered view of exactly one subagent's own message stream (`items`, already
+ * built by `subagentTranscript` at the call site), rendered through `Transcript` itself rather
+ * than a parallel renderer — the same assistant/tool row components a subagent's activity already
+ * knows how to draw in the main transcript, just scoped down. `task` is the Task's own
+ * summary/progress row (`taskId` set); its text, subagent type and status become this header's
+ * title line and live indicator. `panelBorder(theme, "active")` matches how every other focused
+ * panel in this app (QuestionCard, PermissionCard) signals "you're inside a distinct mode, not
+ * the ordinary transcript." Deliberately has no interaction of its own beyond what `Transcript`
+ * already renders — Esc is the only way out, handled by the shared screen-navigation keymap in
+ * `ChatTui`, not by this component. Stays mounted showing the subagent's final state once it
+ * completes: nothing here force-ejects the viewer back to chat.
+ */
+export function SubagentFocus({ task, items, theme, width, detailed }: { readonly task: TranscriptItem | undefined; readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly detailed: boolean }): React.JSX.Element {
+  const running = task?.status === "running";
+  const spinner = useSpinner(running);
+  const icon = running ? spinner : task?.status === "failed" ? "×" : "✓";
+  const color = running ? theme.accent : task?.status === "failed" ? theme.danger : theme.success;
+  const label = task?.subagentType ?? "subagent";
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" flexGrow={1} {...panelBorder(theme, "active")} paddingX={1}>
+    <Box justifyContent="space-between">
+      <Text><Text color={color}>{icon}</Text><Text bold color={theme.text}> Viewing subagent: {label}</Text></Text>
+      <Text color={theme.faint}>esc to return</Text>
+    </Box>
+    {task === undefined
+      ? <Text color={theme.muted}>This subagent is no longer part of the transcript.</Text>
+      : <Text color={theme.muted} wrap="truncate-end">{task.text}</Text>}
+    <Box flexDirection="column" marginTop={1} flexGrow={1}>
+      {items.length === 0
+        ? <Text color={theme.faint}>{running ? "Waiting for this subagent's first activity…" : "This subagent produced no visible activity."}</Text>
+        : <Transcript items={items} theme={theme} width={innerWidth} busy={running} detailed={detailed} />}
+    </Box>
   </Box>;
 }
 /** Slowly cycled through while nothing has been written yet, so a long pre-token wait doesn't sit
