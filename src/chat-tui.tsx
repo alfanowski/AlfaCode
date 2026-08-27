@@ -21,8 +21,8 @@ import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } fr
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, markdownToPlainText, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { useAnimationFrame, useFlash, usePulse, useSpinner } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { useAnimationFrame, usePulse, useSpinner } from "./ui/motion.js";
+import { CompactWordmark, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -1095,11 +1095,11 @@ export function Header({ model, mode, providers, compatible, busy, theme, width 
   const metaWidth = Math.max(14, width - modelWidth - 6);
   return <Box flexDirection="column" paddingX={1} marginBottom={1}>
     <Box justifyContent="space-between">
-      <Brand theme={theme} compact />
+      <CompactWordmark theme={theme} />
       <Text color={busy ? theme.accent : theme.success}>● <Text bold>{busy ? "working" : "ready"}</Text></Text>
     </Box>
     <Box justifyContent="space-between" columnGap={1}>
-      <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
+      <Box width={modelWidth}><Text color={theme.secondarySoft} wrap="truncate-middle">{shortModel(model)}</Text></Box>
       <Box width={metaWidth} justifyContent="flex-end"><Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text></Box>
     </Box>
     <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
@@ -1136,31 +1136,17 @@ export function transcriptStage(items: readonly TranscriptItem[], busy: boolean)
 }
 
 export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
-  // A single shared trigger for the whole transcript — keyed on the newest item's identity — so a
-  // burst of several items landing in quick succession (e.g. parallel tool calls) still drives just
-  // one flash/timeout, not one per row. Whichever row is currently newest picks it up below; a row
-  // that stops being the newest simply stops rendering the highlight, it never keeps its own timer.
-  const last = items.at(-1);
-  const arrived = useFlash(last?.id);
   if (items.length === 0) return <EmptyState theme={theme} width={width} />;
   const stage = transcriptStage(items, busy);
-  return <>{items.map((item, index) => {
-    const highlight = index === items.length - 1 && arrived ? { backgroundColor: theme.surfaceRaised } : {};
-    if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1} {...highlight}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
-    if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1} {...highlight}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} justArrived={index === items.length - 1 && arrived} />;
-    return <Box key={item.id} marginTop={1} {...highlight}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
+  return <>{items.map((item) => {
+    if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
+    if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} />;
+    return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
   })}{stage === "thinking" || stage === "writing" ? <ThinkingLine theme={theme} writing={stage === "writing"} /> : null}</>;
 }
-function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly justArrived?: boolean }): React.JSX.Element {
+function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
-  // A brief highlight pulse whenever this row's status changes (most visibly running → completed/failed
-  // — the moment a tool call actually lands something worth noticing) — never on the row's own first
-  // mount, per useFlash's contract, so a burst of freshly-started tool calls doesn't flash all at once.
-  // `justArrived` (the transcript-level "something new landed" pulse — see Transcript) covers that
-  // first-mount moment instead, as one shared, already-time-boxed trigger rather than a second timer
-  // per row.
-  const statusFlash = useFlash(item.status);
   const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
   const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
   // Status-aware phrasing instead of one static "tool · Bash" label regardless of what's actually
@@ -1170,11 +1156,10 @@ function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly
   const prefix = item.status === "running" ? "Running " : item.status === "failed" ? "Failed — " : "";
   const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}`;
   const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
-  const highlight = statusFlash || justArrived ? { backgroundColor: theme.surfaceRaised } : {};
-  if (!detailed) return <Box paddingLeft={2} {...highlight}>{summary}</Box>;
+  if (!detailed) return <Box paddingLeft={2}>{summary}</Box>;
   const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
   const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
-  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1} {...highlight}>
+  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1}>
     {summary}
     {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>INPUT</Text><Text color={theme.muted}>{input}</Text></Box>}
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
@@ -1629,7 +1614,6 @@ function safeCommandName(value: string): string | undefined { const sanitized = 
 export function createTranscriptItemId(prefix: "user" | "assistant" | "system"): string { transcriptItemSequence += 1; return `${prefix}-${transcriptItemSequence}`; }
 function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: createTranscriptItemId("system"), role: "system", text: sanitizeTerminalText(text) }]); }
 function shortModel(model: string): string { return decodeModelId(model)?.upstreamModel ?? model.split("/").at(-1) ?? model; }
-function providerFromRoute(model: string): string { return decodeModelId(model)?.providerId ?? model.split("/")[0] ?? "auto"; }
 function toMentionPath(absolutePath: string): string { const relative = relativePath(process.cwd(), absolutePath); return relative.startsWith("..") ? absolutePath : relative; }
 function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return compactNumberFormatter.format(value); }
 function estimateTokens(value: string): number { return value.length === 0 ? 0 : Math.max(1, Math.ceil(value.length / 4)); }
