@@ -913,26 +913,26 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   }
   function handleNotificationsCommand(command: string): void {
     const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
-    if (sub !== undefined && sub !== "on" && sub !== "off") { appendSystem(setMessages, "Usage: /notifications [on|off]"); return; }
+    if (sub !== undefined && sub !== "on" && sub !== "off") { showStatus(setStatusMessage, "Usage: /notifications [on|off]"); return; }
     const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
     setNotificationSettings((current) => ({ ...current, bell }));
-    appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
+    showStatus(setStatusMessage, `Turn-complete bell: ${bell ? "on" : "off"}`);
   }
   function handleCopyCommand(command: string): void {
     const parsed = parseCopyCommand(command);
-    if (parsed === undefined) { appendSystem(setMessages, "Usage: /copy [n] or /copy [on|off]"); return; }
+    if (parsed === undefined) { showStatus(setStatusMessage, "Usage: /copy [n] or /copy [on|off]"); return; }
     if (parsed.kind === "toggle") {
       setCopyEnabled(parsed.enabled);
-      appendSystem(setMessages, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
+      showStatus(setStatusMessage, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
       return;
     }
-    if (!copyEnabled) { appendSystem(setMessages, "Copy to clipboard is off. Enable it with /copy on."); return; }
+    if (!copyEnabled) { showStatus(setStatusMessage, "Copy to clipboard is off. Enable it with /copy on."); return; }
     const responses = lastAssistantResponses(messages, parsed.count);
-    if (responses.length === 0) { appendSystem(setMessages, "No assistant responses to copy yet."); return; }
+    if (responses.length === 0) { showStatus(setStatusMessage, "No assistant responses to copy yet."); return; }
     const text = responses.map(markdownToPlainText).join("\n\n");
     const { truncated } = writeClipboardText(text);
     const label = responses.length === 1 ? "Copied last response to clipboard." : `Copied last ${responses.length} responses to clipboard.`;
-    appendSystem(setMessages, truncated ? `${label} (truncated to fit terminal limits)` : label);
+    showStatus(setStatusMessage, truncated ? `${label} (truncated to fit terminal limits)` : label);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -943,26 +943,30 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     else if (sub === "off") next = { ...spellCheckSettings, enabled: false };
     else if (sub === "checker") {
       const matched = rest[0] === undefined ? undefined : spellCheckerNames.find((candidate) => candidate === rest[0]);
-      if (matched === undefined) { appendSystem(setMessages, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
+      if (matched === undefined) { showStatus(setStatusMessage, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
       next = { ...spellCheckSettings, checker: matched };
     } else if (sub === "dictionary") {
       const dictionary = rest.join(" ");
-      if (dictionary.length === 0) { appendSystem(setMessages, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
+      if (dictionary.length === 0) { showStatus(setStatusMessage, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
       next = { ...spellCheckSettings, dictionary };
     } else if (sub === "color") {
       const underlineColor = rest[0];
-      if (underlineColor === undefined) { appendSystem(setMessages, "Usage: /spellcheck color <name>, e.g. red"); return; }
+      if (underlineColor === undefined) { showStatus(setStatusMessage, "Usage: /spellcheck color <name>, e.g. red"); return; }
       next = { ...spellCheckSettings, underlineColor };
     } else {
-      appendSystem(setMessages, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
+      showStatus(setStatusMessage, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
       return;
     }
     setSpellCheckSettings(next);
     try { await spellCheckStore.save(next); } catch { /* best-effort local persistence */ }
-    appendSystem(setMessages, describeSpellCheckSettings(next, spellChecker));
+    showStatus(setStatusMessage, describeSpellCheckSettings(next, spellChecker));
   }
+  // Failures of a UI/session-config action (interrupt, permission-mode/model/effort-level change —
+  // never an in-conversation tool or send failure, those stay real transcript entries elsewhere in
+  // this file) — the status-bar channel, matching where these same actions' success confirmations
+  // already render (see selectModel/handlePermissionModeInput above).
   function reportFailure(label: string, promise: Promise<unknown>, onSuccess?: () => void): void {
-    void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
+    void promise.then(onSuccess).catch((error: unknown) => showStatus(setStatusMessage, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
   const screenReader = isScreenReaderMode();
