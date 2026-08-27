@@ -83,9 +83,29 @@ export interface TranscriptItem {
   readonly toolInput?: unknown;
   /** Sanitized tool_result text, captured once the matching tool_use resolves. */
   readonly toolOutput?: string;
+  /**
+   * Set only on the row representing a Task/subagent launch itself (built from `task_started` /
+   * `task_progress` / `task_notification`, keyed by that engine `task_id`) — never on a tool call
+   * merely *made by* a subagent. This is what tells `selectableTaskEntries` and `subagentTranscript`
+   * apart: a row with `taskId` is a focus-mode target, a row without one but with `parentToolUseId`
+   * is content produced *inside* one.
+   */
+  readonly taskId?: string;
+  /**
+   * The `tool_use` id of the Task call this activity belongs to. Set on the task row itself (from
+   * `task_started`'s `tool_use_id`, mirroring the Task tool_use block that spawned it) and on every
+   * assistant/tool row a subagent produced (from that message's own `parent_tool_use_id`) — the
+   * correlation key `subagentTranscript` filters by to build one subagent's isolated stream.
+   * Assistant rows carry the identical value under `streamId` already (kept separately since that
+   * field also drives delta-accumulation); this field exists so tool rows — which have no such
+   * field — can be filtered the same way.
+   */
+  readonly parentToolUseId?: string;
+  /** Subagent type reported by `task_started`/`task_progress` (e.g. "code-reviewer"), when the engine provides one. Labels the focus-mode header; falls back to a generic "subagent" when absent. */
+  readonly subagentType?: string;
 }
 
-type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp";
+type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp" | "subagent";
 type ContextUsage = {
   readonly totalTokens: number;
   readonly maxTokens: number;
@@ -994,15 +1014,15 @@ export function reduceSdkMessage(current: readonly TranscriptItem[], message: SD
     if (event.type === "content_block_start" && isRecord(event.content_block) && event.content_block.type === "tool_use") {
       const name = typeof event.content_block.name === "string" ? event.content_block.name : "tool";
       const toolUseId = typeof event.content_block.id === "string" ? event.content_block.id : undefined;
-      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
+      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent", parentToolUseId: message.parent_tool_use_id }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
     }
   }
   if (message.type === "assistant") return applyAssistantToolUse(items, message);
   if (message.type === "user") return applyToolResults(items, message);
   if (message.type === "system" && message.subtype === "notification") return [...items, { id: message.uuid, role: "system", text: sanitizeTerminalText(message.text) }];
-  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running" }];
-  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent");
-  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent");
+  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running", taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }), ...(message.subagent_type === undefined ? {} : { subagentType: sanitizeTerminalText(message.subagent_type) }) }];
+  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent", { taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }), ...(message.subagent_type === undefined ? {} : { subagentType: sanitizeTerminalText(message.subagent_type) }) });
+  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent", { taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }) });
   if (message.type === "result") {
     items = items.map((item) => item.role === "tool" && item.status === "running" ? { ...item, status: message.is_error ? "failed" as const : "completed" as const } : item);
     if (message.is_error) {
@@ -1019,10 +1039,10 @@ function appendAssistantDelta(items: TranscriptItem[], text: string, parent: str
   if (last?.role === "assistant" && last.streamId === streamId) return [...items.slice(0, -1), { ...last, text: last.text + text }];
   return [...items, { id: createTranscriptItemId("assistant"), role: "assistant", text, streamId }];
 }
-function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string): TranscriptItem[] {
+function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string, extra?: Pick<TranscriptItem, "taskId" | "parentToolUseId" | "subagentType">): TranscriptItem[] {
   const index = items.findIndex((item) => item.id === id);
-  if (index < 0) return [...items, { id, role: "tool", text, status, detail }];
-  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail } : item);
+  if (index < 0) return [...items, { id, role: "tool", text, status, detail, ...extra }];
+  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail, ...extra } : item);
 }
 /**
  * The CLI emits one `assistant` message per completed content block, so a tool_use block arrives
@@ -1041,7 +1061,7 @@ function applyAssistantToolUse(items: TranscriptItem[], message: SDKAssistantMes
     const name = typeof block.name === "string" ? block.name : "tool";
     const index = next.findIndex((item) => item.toolUseId === toolUseId);
     if (index < 0) {
-      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }) }];
+      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent", parentToolUseId: message.parent_tool_use_id }) }];
     } else {
       next = next.map((item, itemIndex) => itemIndex === index ? { ...item, text: name, ...(block.input === undefined ? {} : { toolInput: block.input }) } : item);
     }
@@ -1462,6 +1482,52 @@ export function parseCopyCommand(command: string): { readonly kind: "toggle"; re
 export function lastAssistantResponses(items: readonly TranscriptItem[], count: number): readonly string[] {
   const assistantTexts = items.filter((item) => item.role === "assistant").map((item) => item.text);
   return assistantTexts.slice(Math.max(0, assistantTexts.length - count));
+}
+/**
+ * Task/subagent entries currently running, in transcript order — the candidate set focus mode's
+ * picker cycles through and commits to. Always the task's own summary/progress row (`taskId`
+ * set), never a tool call the subagent itself made while running (those carry `parentToolUseId`
+ * instead — see `subagentTranscript`). Deliberately scoped to `status === "running"`: once a task
+ * settles it drops out of the picker's candidate set (arrow keys revert to plain composer history
+ * navigation the moment nothing is in flight), though a subagent already focused stays focused
+ * through completion — see `resolveTaskPickerAction` and the `screen === "subagent"` handling in
+ * `ChatTui`.
+ */
+export function selectableTaskEntries(items: readonly TranscriptItem[]): readonly TranscriptItem[] {
+  return items.filter((item) => item.taskId !== undefined && item.status === "running");
+}
+/**
+ * One subagent's isolated message stream: every assistant text block and tool call whose
+ * `parent_tool_use_id` traces back to `taskToolUseId` (the `tool_use` id of the Task call that
+ * spawned it) — captured as `streamId` on assistant rows (already used there to keep separate
+ * streams from merging into one accumulating bubble) and as `parentToolUseId` on tool rows. This
+ * is what focus mode renders in place of the full transcript, via `Transcript` itself — no
+ * separate renderer. Excludes the task's own summary row (`taskId` set): the focus view's header
+ * shows that separately instead of duplicating it inside the stream.
+ */
+export function subagentTranscript(items: readonly TranscriptItem[], taskToolUseId: string): readonly TranscriptItem[] {
+  return items.filter((item) =>
+    (item.role === "assistant" && item.streamId === taskToolUseId) ||
+    (item.role === "tool" && item.taskId === undefined && item.parentToolUseId === taskToolUseId));
+}
+export type TaskPickerAction = { readonly type: "move"; readonly direction: -1 | 1 } | { readonly type: "focus" };
+/**
+ * Resolves Up/Down/Enter against the subagent-picker keymap layered underneath the ordinary
+ * composer keymap: active only while the composer is empty and at least one Task entry is
+ * running (`runningCount`), which is exactly when plain Up/Down/Enter would otherwise be inert or
+ * merely recall prompt history — see the call site in `ChatTui`'s `useInput`, which checks this
+ * *before* history-navigation and vim-mode's own normal-mode motions so neither shadows it. Enter
+ * only resolves to `"focus"` un-shifted — Shift+Enter still inserts a newline everywhere else in
+ * the composer, focus mode doesn't change that. Returns `undefined` for every other key, and for
+ * these same keys the moment either gating condition stops holding, so the caller's existing
+ * handling (history recall, prompt submission) always applies unchanged in every other moment.
+ */
+export function resolveTaskPickerAction(key: Key, context: { readonly composerEmpty: boolean; readonly runningCount: number }): TaskPickerAction | undefined {
+  if (!context.composerEmpty || context.runningCount === 0) return undefined;
+  if (key.upArrow) return { type: "move", direction: -1 };
+  if (key.downArrow) return { type: "move", direction: 1 };
+  if (key.return && !key.shift) return { type: "focus" };
+  return undefined;
 }
 /** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
 export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
