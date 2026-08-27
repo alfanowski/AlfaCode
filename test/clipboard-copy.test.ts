@@ -1,5 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { createClipboardWriter, encodeOsc52Copy, wrapForTmuxPassthrough, type ClipboardWriteDeps } from "../src/ui/clipboard-copy.js";
+import {
+  createClipboardWriter,
+  createSystemClipboardWriter,
+  encodeOsc52Copy,
+  isLikelySshSession,
+  shouldUsePbcopy,
+  wrapForTmuxPassthrough,
+  type ClipboardWriteDeps,
+  type SystemClipboardWriteDeps,
+} from "../src/ui/clipboard-copy.js";
 
 function deps(overrides: Partial<ClipboardWriteDeps>): ClipboardWriteDeps {
   return { write: vi.fn(), insideTmux: () => false, ...overrides };
@@ -66,5 +75,98 @@ describe("clipboard writer", () => {
     writer("hi");
 
     expect(write).toHaveBeenCalledWith(wrapForTmuxPassthrough("\x1b]52;c;aGk=\x07"));
+  });
+});
+
+describe("SSH session detection", () => {
+  it("is true when SSH_TTY or SSH_CONNECTION is set", () => {
+    expect(isLikelySshSession({ SSH_TTY: "/dev/ttys000" })).toBe(true);
+    expect(isLikelySshSession({ SSH_CONNECTION: "1.2.3.4 1 5.6.7.8 22" })).toBe(true);
+  });
+
+  it("is false on a plain local environment", () => {
+    expect(isLikelySshSession({})).toBe(false);
+  });
+});
+
+describe("shouldUsePbcopy", () => {
+  it("is true only for local (non-SSH) macOS", () => {
+    expect(shouldUsePbcopy("darwin", {})).toBe(true);
+  });
+
+  it("is false on non-macOS platforms regardless of SSH state", () => {
+    expect(shouldUsePbcopy("linux", {})).toBe(false);
+    expect(shouldUsePbcopy("win32", {})).toBe(false);
+  });
+
+  it("is false on macOS over SSH — pbcopy there would hit the remote host's clipboard, not the user's", () => {
+    expect(shouldUsePbcopy("darwin", { SSH_TTY: "/dev/ttys000" })).toBe(false);
+    expect(shouldUsePbcopy("darwin", { SSH_CONNECTION: "1.2.3.4 1 5.6.7.8 22" })).toBe(false);
+  });
+});
+
+function systemDeps(overrides: Partial<SystemClipboardWriteDeps>): SystemClipboardWriteDeps {
+  return {
+    platform: "darwin",
+    environment: {},
+    runPbcopy: vi.fn(async () => true),
+    writeOsc52: vi.fn(() => ({ sequence: "osc52-sequence", truncated: false })),
+    ...overrides,
+  };
+}
+
+describe("system clipboard writer (pbcopy primary, OSC 52 fallback)", () => {
+  it("uses pbcopy on local macOS and never touches the OSC 52 fallback", async () => {
+    const runPbcopy = vi.fn(async () => true);
+    const writeOsc52 = vi.fn(() => ({ sequence: "osc52-sequence", truncated: false }));
+    const writer = createSystemClipboardWriter(systemDeps({ runPbcopy, writeOsc52 }));
+
+    const result = await writer("hello");
+
+    expect(runPbcopy).toHaveBeenCalledWith("hello");
+    expect(writeOsc52).not.toHaveBeenCalled();
+    expect(result).toEqual({ method: "pbcopy", truncated: false });
+  });
+
+  it("falls back to OSC 52 when pbcopy isn't the applicable path (non-macOS)", async () => {
+    const runPbcopy = vi.fn(async () => true);
+    const writeOsc52 = vi.fn(() => ({ sequence: "osc52-sequence", truncated: false }));
+    const writer = createSystemClipboardWriter(systemDeps({ platform: "linux", runPbcopy, writeOsc52 }));
+
+    const result = await writer("hello");
+
+    expect(runPbcopy).not.toHaveBeenCalled();
+    expect(writeOsc52).toHaveBeenCalledWith("hello");
+    expect(result).toEqual({ method: "osc52", truncated: false });
+  });
+
+  it("falls back to OSC 52 when running over SSH, even on macOS", async () => {
+    const runPbcopy = vi.fn(async () => true);
+    const writer = createSystemClipboardWriter(systemDeps({ environment: { SSH_TTY: "/dev/ttys000" }, runPbcopy }));
+
+    const result = await writer("hello");
+
+    expect(runPbcopy).not.toHaveBeenCalled();
+    expect(result.method).toBe("osc52");
+  });
+
+  it("falls back to OSC 52 when pbcopy itself fails", async () => {
+    const runPbcopy = vi.fn(async () => false);
+    const writeOsc52 = vi.fn(() => ({ sequence: "osc52-sequence", truncated: false }));
+    const writer = createSystemClipboardWriter(systemDeps({ runPbcopy, writeOsc52 }));
+
+    const result = await writer("hello");
+
+    expect(writeOsc52).toHaveBeenCalledWith("hello");
+    expect(result).toEqual({ method: "osc52", truncated: false });
+  });
+
+  it("surfaces OSC 52's own truncation flag on fallback", async () => {
+    const writeOsc52 = vi.fn(() => ({ sequence: "osc52-sequence", truncated: true }));
+    const writer = createSystemClipboardWriter(systemDeps({ platform: "linux", writeOsc52 }));
+
+    const result = await writer("hello");
+
+    expect(result).toEqual({ method: "osc52", truncated: true });
   });
 });

@@ -15,14 +15,15 @@ import { formatRelativeTime } from "./session-history.js";
 import { exportTranscript } from "./transcript-export.js";
 import type { UsageSummary } from "./usage-ledger.js";
 import { BackgroundTasksPanel, parseBackgroundTasksChanged, type BackgroundTask } from "./ui/background-tasks-panel.js";
-import { writeClipboardText } from "./ui/clipboard-copy.js";
+import { writeClipboardText, writeSystemClipboardText } from "./ui/clipboard-copy.js";
 import { mediaTypeForExtension, readClipboardImage } from "./ui/clipboard-image.js";
 import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } from "./ui/dropped-paths.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, markdownToPlainText, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
-import { useAnimationFrame, useFlash, usePulse, useSpinner } from "./ui/motion.js";
-import { Brand, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
+import { mouseSelectionRowSpan, parseSgrMouseSequence, reduceMouseSelection, resolveMouseSelectionItems, useMouseTrackingMode, type MouseSelectionSpan, type MouseSelectionTrackerState } from "./ui/mouse-select.js";
+import { useAnimationFrame, usePulse, useSpinner } from "./ui/motion.js";
+import { CompactWordmark, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
   checkComposerText,
   defaultSpellCheckSettings,
@@ -47,6 +48,7 @@ import {
   type TranscriptLogState,
 } from "./ui/screen-reader-mode.js";
 import { ScreenReaderTranscript } from "./ui/screen-reader-transcript.js";
+import { StatusBar } from "./ui/status-bar.js";
 import { getTheme, resolveThemeName, themeCatalog, type Theme, type ThemeName } from "./ui/theme.js";
 import { parseTodoWriteTodos, TodoPanel, type TodoItem } from "./ui/todo-panel.js";
 import { stringifyToolPayload, truncateForDisplay } from "./ui/tool-output.js";
@@ -66,7 +68,7 @@ export interface ChatTuiOptions {
   readonly models: readonly ModelDescriptor[];
   readonly permissions: PermissionBroker;
   readonly loadUsage: () => Promise<UsageSummary>;
-  /** Render on the terminal's alternate screen buffer with a fixed-bottom composer, instead of the default scrolling layout. */
+  /** Render on the terminal's alternate screen buffer with a fixed-bottom composer, instead of the native-scrollback layout. Defaults to true; pass false (or --no-fullscreen on the CLI) to opt out. */
   readonly fullscreen?: boolean;
 }
 
@@ -83,9 +85,29 @@ export interface TranscriptItem {
   readonly toolInput?: unknown;
   /** Sanitized tool_result text, captured once the matching tool_use resolves. */
   readonly toolOutput?: string;
+  /**
+   * Set only on the row representing a Task/subagent launch itself (built from `task_started` /
+   * `task_progress` / `task_notification`, keyed by that engine `task_id`) — never on a tool call
+   * merely *made by* a subagent. This is what tells `selectableTaskEntries` and `subagentTranscript`
+   * apart: a row with `taskId` is a focus-mode target, a row without one but with `parentToolUseId`
+   * is content produced *inside* one.
+   */
+  readonly taskId?: string;
+  /**
+   * The `tool_use` id of the Task call this activity belongs to. Set on the task row itself (from
+   * `task_started`'s `tool_use_id`, mirroring the Task tool_use block that spawned it) and on every
+   * assistant/tool row a subagent produced (from that message's own `parent_tool_use_id`) — the
+   * correlation key `subagentTranscript` filters by to build one subagent's isolated stream.
+   * Assistant rows carry the identical value under `streamId` already (kept separately since that
+   * field also drives delta-accumulation); this field exists so tool rows — which have no such
+   * field — can be filtered the same way.
+   */
+  readonly parentToolUseId?: string;
+  /** Subagent type reported by `task_started`/`task_progress` (e.g. "code-reviewer"), when the engine provides one. Labels the focus-mode header; falls back to a generic "subagent" when absent. */
+  readonly subagentType?: string;
 }
 
-type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp";
+type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp" | "subagent";
 type ContextUsage = {
   readonly totalTokens: number;
   readonly maxTokens: number;
@@ -128,6 +150,7 @@ const commands: readonly Command[] = [
   { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
   { name: "/notifications", description: "Toggle the turn-complete bell", shortcut: "on|off" },
   { name: "/copy", description: "Copy the last N assistant responses to the clipboard", shortcut: "[n]|on|off" },
+  { name: "/mousecopy", description: "Toggle copy-to-clipboard on mouse-drag select", shortcut: "on|off" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -139,6 +162,21 @@ const defaultContextWarningThreshold = 80;
 export function resolveInitialVimMode(environment: NodeJS.ProcessEnv = process.env): boolean {
   const requested = environment.ALFACODE_VIM_MODE?.trim().toLowerCase();
   return requested === "1" || requested === "true" || requested === "yes" || requested === "on";
+}
+
+/**
+ * Same "no persisted config, env var + in-session `/command` toggle" pattern as
+ * `resolveInitialVimMode` above and `/notifications`' `ALFACODE_NOTIFY_BELL` — a plain boolean
+ * doesn't need its own settings file the way `/spellcheck` does (checker/dictionary/color are
+ * worth remembering together; this is one flag). Unlike vim mode and notifications, this defaults
+ * to *enabled*: copy-on-select is the entire point of the feature, so doing nothing out of the box
+ * would defeat it — the same reasoning `/copy` itself already uses for defaulting on (see the
+ * comment above `copyEnabled`'s `useState` below).
+ */
+export function resolveInitialMouseCopyEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const requested = environment.ALFACODE_MOUSE_COPY?.trim().toLowerCase();
+  if (requested === undefined) return true;
+  return requested !== "0" && requested !== "false" && requested !== "no" && requested !== "off";
 }
 
 /**
@@ -183,13 +221,13 @@ export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let settled = false;
   const action = new Promise<ChatAction>((resolve) => { resolveAction = resolve; });
   const settle = (value: ChatAction): void => { if (!settled) { settled = true; resolveAction(value); } };
-  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, isScreenReaderEnabled: isScreenReaderMode(), ...(options.fullscreen ? { alternateScreen: true } : {}) });
+  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, isScreenReaderEnabled: isScreenReaderMode(), ...(options.fullscreen !== false ? { alternateScreen: true } : {}) });
   await instance.waitUntilExit();
   settle({ type: "exit" });
   return action;
 }
 
-function ChatTui({ session, identity, config, models, permissions, loadUsage, fullscreen = false, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
+function ChatTui({ session, identity, config, models, permissions, loadUsage, fullscreen = true, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
@@ -202,6 +240,10 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [screen, setScreen] = useState<Screen>("chat");
   const [editor, setEditor] = useState<EditorState>({ value: "", cursor: 0 });
   const [messages, setMessages] = useState<TranscriptItem[]>([]);
+  // Ephemeral UI feedback (a keyboard hint, a settings-toggle confirmation) — rendered by
+  // StatusBar near the composer, entirely separate from `messages`/Transcript so it never pollutes
+  // the conversation record. See `showStatus` (parallel to `appendSystem`) below.
+  const [statusMessage, setStatusMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [modelCursor, setModelCursor] = useState(0);
   const [modelFilter, setModelFilter] = useState("");
@@ -247,10 +289,19 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [historySearch, setHistorySearch] = useState<{ readonly query: string; readonly index: number }>();
   const [vimEnabled, setVimEnabled] = useState(resolveInitialVimMode);
   const [vim, setVim] = useState<VimState>(createVimState);
+  const [mouseCopyEnabled, setMouseCopyEnabled] = useState(resolveInitialMouseCopyEnabled);
   const [mentionEntries, setMentionEntries] = useState<readonly MentionEntry[]>([]);
   const [mentionCursor, setMentionCursor] = useState(0);
   const [attachments, setAttachments] = useState<readonly ImageAttachment[]>([]);
   const [toolDetail, setToolDetail] = useState(false);
+  // Focus mode (see resolveTaskPickerAction / selectableTaskEntries / subagentTranscript): which
+  // running Task entry the Up/Down picker is currently highlighting in the main transcript
+  // (`taskCursor`, an index into that candidate list — clamped at each use site rather than via an
+  // effect, matching how ModelPicker/ProviderManager already clamp their own cursors), and which
+  // one — if any — the user has committed to with Enter (`focusedTaskItemId`, that row's own
+  // transcript id; `screen === "subagent"` is what actually switches the middle panel over).
+  const [taskCursor, setTaskCursor] = useState(0);
+  const [focusedTaskItemId, setFocusedTaskItemId] = useState<string>();
   const [todos, setTodos] = useState<readonly TodoItem[]>([]);
   const [todoPanelCollapsed, setTodoPanelCollapsed] = useState(false);
   const [backgroundTasks, setBackgroundTasks] = useState<readonly BackgroundTask[]>([]);
@@ -271,10 +322,20 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const toolBellTimers = useRef(new Map<string, NodeJS.Timeout>());
   const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
   const spellCheckController = useRef<SpellCheckController | undefined>(undefined);
+  // In-flight mouse-drag selection (press seen, release not yet). A ref, not state: intermediate
+  // drag events happen far more often than anything that should trigger a re-render, and nothing
+  // renders differently while a drag is in progress — only a *completed* selection (via
+  // handleMouseSelectionComplete below) ever touches state, by appending a system message.
+  const mouseSelectionState = useRef<MouseSelectionTrackerState | undefined>(undefined);
   // Keeps width/height (and everything derived from them below) live across a terminal resize —
   // see useTerminalResize's doc comment. The generation counter itself is unused here; calling the
   // hook is what matters.
   useTerminalResize(stdout);
+  // Mouse SGR tracking-mode escape sequences: enabled on mount (and whenever /mousecopy flips this
+  // on), disabled on every teardown path — see useMouseTrackingMode's doc comment. The actual SGR
+  // reports are read via the existing useInput callback below, not here (see that module's doc for
+  // why a second, independent stdin listener would fight Ink's own input handling).
+  useMouseTrackingMode({ enabled: mouseCopyEnabled });
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
@@ -297,6 +358,16 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const maxScrollOffset = useMemo(() => maxScrollOffsetRows(messages, transcriptWidth), [messages, transcriptWidth]);
   const scrollWindow = useMemo(() => windowItemsByRows(messages, transcriptRows, transcriptWidth, scrollOffset), [messages, transcriptRows, transcriptWidth, scrollOffset]);
   const visibleMessages = scrollWindow.items;
+  // Focus mode's candidate list and current picker highlight (see resolveTaskPickerAction's doc
+  // comment for why Up/Down/Enter only ever engage here): `taskCursor` is clamped inline rather
+  // than reset via an effect, so a subagent completing mid-navigation just shifts the highlight
+  // rather than needing to be reconciled separately.
+  const runningTaskEntries = useMemo(() => selectableTaskEntries(messages), [messages]);
+  const highlightedTaskId = screen === "chat" && editor.value.length === 0 && runningTaskEntries.length > 0
+    ? runningTaskEntries[Math.min(taskCursor, runningTaskEntries.length - 1)]?.id
+    : undefined;
+  const focusedTaskItem = useMemo(() => focusedTaskItemId === undefined ? undefined : messages.find((item) => item.id === focusedTaskItemId), [focusedTaskItemId, messages]);
+  const focusedSubagentItems = useMemo(() => focusedTaskItem?.parentToolUseId === undefined ? [] : subagentTranscript(messages, focusedTaskItem.parentToolUseId), [focusedTaskItem, messages]);
   const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
   // Reusable scroll-offset API (rows scrolled up from the tail): keyboard binds to it below, and a future
   // mouse-wheel handler can drive the same three entry points without touching the windowing math.
@@ -455,6 +526,27 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   useEffect(() => { spellCheckController.current?.setText(editor.value); }, [editor.value]);
 
   useInput((text, key) => {
+    // Mouse SGR reports (enabled only while mouseCopyEnabled — see useMouseTrackingMode above)
+    // arrive here as an ordinary, unrecognized-key `text` event: Ink's own key parser doesn't know
+    // about them, strips their leading ESC byte the same as any sequence it can't classify as a
+    // named key, and hands the rest through untouched (see parseSgrMouseSequence's doc comment for
+    // exactly how that was confirmed against Ink's source). Handling it here, first — before even
+    // the status-bar clear below — is the only way to keep a drag's coordinate bytes from otherwise
+    // falling through to the composer-insertion branch far below and being typed in as literal
+    // garbage — every other useInput listener would still fire independently since Ink fans this
+    // event out to all of them.
+    const mouseEvent = parseSgrMouseSequence(text);
+    if (mouseEvent !== undefined) {
+      const reduced = reduceMouseSelection(mouseSelectionState.current, mouseEvent);
+      mouseSelectionState.current = reduced.state;
+      if (reduced.completed !== undefined) handleMouseSelectionComplete(reduced.completed);
+      return;
+    }
+    // A status-bar notice reads as "still relevant" only until the user does something else —
+    // clear it unconditionally up front; any branch below that wants to show a fresh one calls
+    // showStatus() later in this same handler, which simply overrides this with the new text (no
+    // flicker: React batches both setStatusMessage calls from one keystroke into a single render).
+    setStatusMessage(undefined);
     if (pendingQuestion !== undefined) { handleQuestionInput(text, key, pendingQuestion); return; }
     if (pendingPermission !== undefined) { handlePermissionInput(text, key, pendingPermission); return; }
     if (confirmDeleteId !== undefined) {
@@ -471,7 +563,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       const now = Date.now();
       if (now - lastCtrlCAtRef.current < 900) { finish({ type: "exit" }); return; }
       lastCtrlCAtRef.current = now;
-      appendSystem(setMessages, "Press Ctrl+C again to exit.");
+      showStatus(setStatusMessage, "Press Ctrl+C again to exit.");
       return;
     }
     if (key.escape && screen !== "chat") { setScreen("chat"); clearEditor(); return; }
@@ -480,7 +572,9 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (screen === "permissions") { handlePermissionModeInput(text, key); return; }
     if (screen === "rewind") { handleRewindInput(key); return; }
     if (screen === "theme") { handleThemeInput(key); return; }
-    if (screen === "help" || screen === "usage" || screen === "mcp") return;
+    // Focus mode has no keymap of its own beyond the shared Esc-to-chat handling right above —
+    // it's a read-only view of one subagent's activity (see SubagentFocus's own doc comment).
+    if (screen === "help" || screen === "usage" || screen === "mcp" || screen === "subagent") return;
 
     // Image paste (Ctrl+V always reaches the terminal; Cmd+V only surfaces as key.super under the
     // kitty keyboard protocol — see clipboard-image.ts for why this can't just read stdin) and
@@ -544,6 +638,17 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       setEditor({ value: promptSuggestion, cursor: promptSuggestion.length });
       setPromptSuggestion(undefined);
       return;
+    }
+    // Subagent focus-mode picker (resolveTaskPickerAction): checked ahead of vim mode for the same
+    // reason command/mention-palette navigation above is — vim's own NORMAL-mode motions would
+    // otherwise claim Up/Down as j/k cursor moves before this ever ran. Only ever active with an
+    // empty composer and at least one Task running (see the resolver's own doc comment), so this
+    // never shadows ordinary Up/Down history recall or Enter-to-submit in any other moment.
+    const taskPick = resolveTaskPickerAction(key, { composerEmpty: editor.value.length === 0, runningCount: runningTaskEntries.length });
+    if (taskPick?.type === "move") { setTaskCursor((current) => Math.max(0, Math.min(runningTaskEntries.length - 1, current + taskPick.direction))); return; }
+    if (taskPick?.type === "focus") {
+      const target = runningTaskEntries[Math.min(taskCursor, runningTaskEntries.length - 1)];
+      if (target !== undefined) { setFocusedTaskItemId(target.id); setScreen("subagent"); return; }
     }
     if (vimEnabled) {
       const step = stepVim(editor, vim, text, key);
@@ -617,7 +722,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     imageSequence.current += 1;
     const id = imageSequence.current;
     void readClipboardImage().then((image) => {
-      if (image === undefined) { appendSystem(setMessages, "Clipboard doesn't contain an image."); return; }
+      if (image === undefined) { showStatus(setStatusMessage, "Clipboard doesn't contain an image."); return; }
       setAttachments((current) => [...current, { id, mediaType: image.mediaType, base64: image.base64 }]);
       applyEdit({ type: "insert", text: `[Image #${id}] ` });
     });
@@ -645,7 +750,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   }
   function selectModel(model: ModelDescriptor): void {
     const route = encodeModelId(model.providerId, model.id);
-    reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); appendSystem(setMessages, `Model switched to [${model.providerId}] ${model.displayName}`); });
+    reportFailure("Model switch", session.setModel(route), () => { setActiveModel(route); setScreen("chat"); showStatus(setStatusMessage, `Model switched to [${model.providerId}] ${model.displayName}`); });
   }
   /** Left/right in the model picker: live, no transcript noise on every keystroke (only a failure is worth reporting) — mirrors selectModel's "await success before updating local state" convention. No-ops silently when the highlighted row can't carry an effort parameter; ModelPicker shows why. */
   function adjustEffortLevel(model: ModelDescriptor | undefined, direction: -1 | 1): void {
@@ -693,7 +798,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (numbered !== undefined) { setPermissionModeByUser(modes[numbered] ?? "default"); return; }
     if (key.upArrow) setPermissionModeByUser(modes[Math.max(0, index - 1)] ?? "default");
     else if (key.downArrow) setPermissionModeByUser(modes[Math.min(modes.length - 1, index + 1)] ?? "default");
-    else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); appendSystem(setMessages, `Permission mode: ${permissionMode}`); });
+    else if (key.return) reportFailure("Permission mode", session.setPermissionMode(permissionMode), () => { setScreen("chat"); showStatus(setStatusMessage, `Permission mode: ${permissionMode}`); });
   }
   function handleHistorySearchInput(text: string, key: Key): void {
     if (key.escape) { setHistorySearch(undefined); return; }
@@ -736,7 +841,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     // TUI, including this picker); enter just confirms and returns to chat.
     if (key.upArrow) setThemeName(themeCatalog[Math.max(0, index - 1)]?.name ?? themeName);
     else if (key.downArrow) setThemeName(themeCatalog[Math.min(themeCatalog.length - 1, index + 1)]?.name ?? themeName);
-    else if (key.return) { setScreen("chat"); appendSystem(setMessages, `Theme: ${themeCatalog.find((entry) => entry.name === themeName)?.label ?? themeName}`); }
+    else if (key.return) { setScreen("chat"); showStatus(setStatusMessage, `Theme: ${themeCatalog.find((entry) => entry.name === themeName)?.label ?? themeName}`); }
   }
   function handlePermissionInput(text: string, key: Key, request: PermissionRequest): void {
     if (permissionCommentMode) {
@@ -785,46 +890,21 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       applyQuestionEditorKey(text, key);
       return;
     }
-    const otherIndex = question.options.length;
-    if (key.escape) { permissions.cancelQuestions(); return; }
-    // Screen-reader mode: type a number instead of arrowing to an option (0 is "Other"). Single
-    // choice answers and advances immediately, like Enter; multiple choice toggles, like Space.
-    if (isScreenReaderMode() && !key.ctrl && !key.meta && /^[0-9]$/.test(text)) {
-      if (text === "0") { setQuestionCursor(otherIndex); setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
-      const digitIndex = Number(text) - 1;
-      const label = question.options[digitIndex]?.label;
-      if (label !== undefined) {
-        setQuestionCursor(digitIndex);
-        if (!question.multiSelect) { completeQuestion(request, [label]); return; }
-        setQuestionSelections((current) => {
-          const selected = current[questionIndex] ?? [];
-          return { ...current, [questionIndex]: selected.includes(label) ? selected.filter((item) => item !== label) : [...selected, label] };
-        });
-        return;
-      }
-    }
-    if (key.upArrow) { setQuestionCursor((current) => Math.max(0, current - 1)); return; }
-    if (key.downArrow) { setQuestionCursor((current) => Math.min(otherIndex, current + 1)); return; }
-    if (key.tab) { setQuestionCursor((current) => (current + 1) % (otherIndex + 1)); return; }
-    if (text === " " && questionCursor < question.options.length) {
-      const label = question.options[questionCursor]?.label;
-      if (label === undefined) return;
-      if (!question.multiSelect) setQuestionSelections((current) => ({ ...current, [questionIndex]: [label] }));
-      else setQuestionSelections((current) => {
-        const selected = current[questionIndex] ?? [];
-        return { ...current, [questionIndex]: selected.includes(label) ? selected.filter((item) => item !== label) : [...selected, label] };
+    const selected = questionSelections[questionIndex] ?? [];
+    const action = resolveQuestionChoiceAction(text, key, question, questionCursor, selected, isScreenReaderMode());
+    if (action.type === "cancel") { permissions.cancelQuestions(); return; }
+    if (action.type === "navigate") { setQuestionCursor(action.cursor); return; }
+    if (action.type === "toggle") {
+      const { cursor, label } = action;
+      setQuestionCursor(cursor);
+      setQuestionSelections((current) => {
+        const currentSelected = current[questionIndex] ?? [];
+        return { ...current, [questionIndex]: currentSelected.includes(label) ? currentSelected.filter((item) => item !== label) : [...currentSelected, label] };
       });
       return;
     }
-    if (!key.return) return;
-    if (questionCursor === otherIndex) { setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
-    const focused = question.options[questionCursor]?.label;
-    if (focused === undefined) return;
-    if (question.multiSelect) {
-      const selected = questionSelections[questionIndex] ?? [];
-      if (selected.length === 0) completeQuestion(request, [focused]);
-      else completeQuestion(request, selected);
-    } else completeQuestion(request, [focused]);
+    if (action.type === "openOther") { setQuestionCursor(action.cursor); setQuestionOtherMode(true); setQuestionOtherEditor({ value: "", cursor: 0 }); return; }
+    if (action.type === "complete") completeQuestion(request, action.values);
   }
   function applyQuestionEditorKey(text: string, key: Key): void {
     const operation = resolveLineEditorOperation(text, key);
@@ -857,7 +937,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       const next = !vimEnabled;
       setVimEnabled(next);
       setVim(createVimState());
-      appendSystem(setMessages, `Vim mode ${next ? "enabled (starting in NORMAL — press i to insert)" : "disabled"}.`);
+      showStatus(setStatusMessage, `Vim mode ${next ? "enabled (starting in NORMAL — press i to insert)" : "disabled"}.`);
       return;
     }
     if (name === "/help") { setScreen("help"); return; }
@@ -899,30 +979,63 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
     if (name === "/notifications") { handleNotificationsCommand(command); return; }
     if (name === "/copy") { handleCopyCommand(command); return; }
+    if (name === "/mousecopy") { handleMouseCopyCommand(command); return; }
     sendPrompt(command);
   }
   function handleNotificationsCommand(command: string): void {
     const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
-    if (sub !== undefined && sub !== "on" && sub !== "off") { appendSystem(setMessages, "Usage: /notifications [on|off]"); return; }
+    if (sub !== undefined && sub !== "on" && sub !== "off") { showStatus(setStatusMessage, "Usage: /notifications [on|off]"); return; }
     const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
     setNotificationSettings((current) => ({ ...current, bell }));
-    appendSystem(setMessages, `Turn-complete bell: ${bell ? "on" : "off"}`);
+    showStatus(setStatusMessage, `Turn-complete bell: ${bell ? "on" : "off"}`);
+  }
+  function handleMouseCopyCommand(command: string): void {
+    const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
+    if (sub !== undefined && sub !== "on" && sub !== "off") { showStatus(setStatusMessage, "Usage: /mousecopy [on|off]"); return; }
+    const enabled = sub === "on" || (sub === undefined && !mouseCopyEnabled);
+    setMouseCopyEnabled(enabled);
+    // A toggle mid-drag would otherwise leave a stale press cell behind for whatever comes next.
+    mouseSelectionState.current = undefined;
+    showStatus(setStatusMessage, `Copy on mouse-select: ${enabled ? "on" : "off"}`);
+  }
+  /**
+   * Resolves a completed mouse-drag span to whole rendered transcript items and writes them to the
+   * system clipboard — see mouse-select.ts's `resolveMouseSelectionItems` doc comment for exactly
+   * what granularity this gives you (message-level, not exact (row, col) → character mapping).
+   * Only meaningful on the chat screen: every other screen (models, providers, theme, ...) renders
+   * its own picker/list instead of the transcript, which this has no text mapping for at all — a
+   * drag there is deliberately a no-op rather than copying stale/unrelated transcript content.
+   */
+  function handleMouseSelectionComplete(span: MouseSelectionSpan): void {
+    if (!mouseCopyEnabled || screen !== "chat") return;
+    const rowSpan = mouseSelectionRowSpan(span);
+    const items = resolveMouseSelectionItems(visibleMessages, rowSpan, (item) => estimateItemRows(item, transcriptWidth));
+    const text = mouseSelectionCopyText(items);
+    if (text.trim().length === 0) return;
+    void writeSystemClipboardText(text)
+      .then((result) => {
+        const label = items.length === 1 ? "Copied selection to clipboard." : `Copied selection (${items.length} messages) to clipboard.`;
+        showStatus(setStatusMessage, result.truncated ? `${label} (truncated to fit terminal limits)` : label);
+      })
+      .catch((error: unknown) => {
+        showStatus(setStatusMessage, `Mouse-select copy failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
   }
   function handleCopyCommand(command: string): void {
     const parsed = parseCopyCommand(command);
-    if (parsed === undefined) { appendSystem(setMessages, "Usage: /copy [n] or /copy [on|off]"); return; }
+    if (parsed === undefined) { showStatus(setStatusMessage, "Usage: /copy [n] or /copy [on|off]"); return; }
     if (parsed.kind === "toggle") {
       setCopyEnabled(parsed.enabled);
-      appendSystem(setMessages, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
+      showStatus(setStatusMessage, `Copy to clipboard: ${parsed.enabled ? "on" : "off"}`);
       return;
     }
-    if (!copyEnabled) { appendSystem(setMessages, "Copy to clipboard is off. Enable it with /copy on."); return; }
+    if (!copyEnabled) { showStatus(setStatusMessage, "Copy to clipboard is off. Enable it with /copy on."); return; }
     const responses = lastAssistantResponses(messages, parsed.count);
-    if (responses.length === 0) { appendSystem(setMessages, "No assistant responses to copy yet."); return; }
+    if (responses.length === 0) { showStatus(setStatusMessage, "No assistant responses to copy yet."); return; }
     const text = responses.map(markdownToPlainText).join("\n\n");
     const { truncated } = writeClipboardText(text);
     const label = responses.length === 1 ? "Copied last response to clipboard." : `Copied last ${responses.length} responses to clipboard.`;
-    appendSystem(setMessages, truncated ? `${label} (truncated to fit terminal limits)` : label);
+    showStatus(setStatusMessage, truncated ? `${label} (truncated to fit terminal limits)` : label);
   }
   async function handleSpellCheckCommand(command: string): Promise<void> {
     const [, ...args] = command.split(/\s+/u).filter((token) => token.length > 0);
@@ -933,26 +1046,30 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     else if (sub === "off") next = { ...spellCheckSettings, enabled: false };
     else if (sub === "checker") {
       const matched = rest[0] === undefined ? undefined : spellCheckerNames.find((candidate) => candidate === rest[0]);
-      if (matched === undefined) { appendSystem(setMessages, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
+      if (matched === undefined) { showStatus(setStatusMessage, `Usage: /spellcheck checker <${spellCheckerNames.join("|")}>`); return; }
       next = { ...spellCheckSettings, checker: matched };
     } else if (sub === "dictionary") {
       const dictionary = rest.join(" ");
-      if (dictionary.length === 0) { appendSystem(setMessages, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
+      if (dictionary.length === 0) { showStatus(setStatusMessage, "Usage: /spellcheck dictionary <code>, e.g. en_US"); return; }
       next = { ...spellCheckSettings, dictionary };
     } else if (sub === "color") {
       const underlineColor = rest[0];
-      if (underlineColor === undefined) { appendSystem(setMessages, "Usage: /spellcheck color <name>, e.g. red"); return; }
+      if (underlineColor === undefined) { showStatus(setStatusMessage, "Usage: /spellcheck color <name>, e.g. red"); return; }
       next = { ...spellCheckSettings, underlineColor };
     } else {
-      appendSystem(setMessages, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
+      showStatus(setStatusMessage, "Usage: /spellcheck [on|off|checker <name>|dictionary <code>|color <name>]");
       return;
     }
     setSpellCheckSettings(next);
     try { await spellCheckStore.save(next); } catch { /* best-effort local persistence */ }
-    appendSystem(setMessages, describeSpellCheckSettings(next, spellChecker));
+    showStatus(setStatusMessage, describeSpellCheckSettings(next, spellChecker));
   }
+  // Failures of a UI/session-config action (interrupt, permission-mode/model/effort-level change —
+  // never an in-conversation tool or send failure, those stay real transcript entries elsewhere in
+  // this file) — the status-bar channel, matching where these same actions' success confirmations
+  // already render (see selectModel/handlePermissionModeInput above).
   function reportFailure(label: string, promise: Promise<unknown>, onSuccess?: () => void): void {
-    void promise.then(onSuccess).catch((error: unknown) => appendSystem(setMessages, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
+    void promise.then(onSuccess).catch((error: unknown) => showStatus(setStatusMessage, `${label} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 
   const screenReader = isScreenReaderMode();
@@ -965,7 +1082,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
         lives in <Static> above this frame instead, so a fixed minHeight would only pad the
         live, redrawn region with blank lines. */}
     <Box flexDirection="column" {...(screenReader ? {} : { minHeight: transcriptRows })} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
-      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
+      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} {...(highlightedTaskId === undefined ? {} : { selectedTaskId: highlightedTaskId })} />) : null}
+      {screen === "subagent" ? <SubagentFocus task={focusedTaskItem} items={focusedSubagentItems} theme={theme} width={transcriptWidth} detailed={toolDetail} /> : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} width={transcriptWidth} activeRoute={activeModel} effortLevel={effortLevel} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={transcriptWidth} /> : null}
@@ -981,6 +1099,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     {pendingQuestion !== undefined
       ? <QuestionCard request={pendingQuestion} questionIndex={questionIndex} cursor={questionCursor} selections={questionSelections} otherMode={questionOtherMode} otherEditor={questionOtherEditor} theme={theme} width={width - 4} />
       : pendingPermission === undefined ? <Composer editor={editor} busy={busy} screen={screen} context={contextUsage} lastTurnTokens={lastTurnTokens} lastTurnCostUsd={lastTurnCostUsd} checkpointCount={checkpoints.length} historySearch={historySearch} historyMatches={historyMatches} messages={messages} suggestion={promptSuggestion} vim={vimEnabled ? vim : undefined} attachmentCount={attachments.length} theme={theme} width={width} misspelledRanges={misspelledRanges} underlineColor={spellCheckSettings.underlineColor ?? theme.danger} /> : <PermissionCard request={pendingPermission} cursor={permissionCursor} comment={permissionComment} commentMode={permissionCommentMode} commentEditor={permissionCommentEditor} theme={theme} />}
+    <StatusBar message={statusMessage} theme={theme} />
   </Box>;
 }
 
@@ -994,15 +1113,15 @@ export function reduceSdkMessage(current: readonly TranscriptItem[], message: SD
     if (event.type === "content_block_start" && isRecord(event.content_block) && event.content_block.type === "tool_use") {
       const name = typeof event.content_block.name === "string" ? event.content_block.name : "tool";
       const toolUseId = typeof event.content_block.id === "string" ? event.content_block.id : undefined;
-      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
+      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent", parentToolUseId: message.parent_tool_use_id }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
     }
   }
   if (message.type === "assistant") return applyAssistantToolUse(items, message);
   if (message.type === "user") return applyToolResults(items, message);
   if (message.type === "system" && message.subtype === "notification") return [...items, { id: message.uuid, role: "system", text: sanitizeTerminalText(message.text) }];
-  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running" }];
-  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent");
-  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent");
+  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running", taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }), ...(message.subagent_type === undefined ? {} : { subagentType: sanitizeTerminalText(message.subagent_type) }) }];
+  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent", { taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }), ...(message.subagent_type === undefined ? {} : { subagentType: sanitizeTerminalText(message.subagent_type) }) });
+  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent", { taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }) });
   if (message.type === "result") {
     items = items.map((item) => item.role === "tool" && item.status === "running" ? { ...item, status: message.is_error ? "failed" as const : "completed" as const } : item);
     if (message.is_error) {
@@ -1019,10 +1138,10 @@ function appendAssistantDelta(items: TranscriptItem[], text: string, parent: str
   if (last?.role === "assistant" && last.streamId === streamId) return [...items.slice(0, -1), { ...last, text: last.text + text }];
   return [...items, { id: createTranscriptItemId("assistant"), role: "assistant", text, streamId }];
 }
-function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string): TranscriptItem[] {
+function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string, extra?: Pick<TranscriptItem, "taskId" | "parentToolUseId" | "subagentType">): TranscriptItem[] {
   const index = items.findIndex((item) => item.id === id);
-  if (index < 0) return [...items, { id, role: "tool", text, status, detail }];
-  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail } : item);
+  if (index < 0) return [...items, { id, role: "tool", text, status, detail, ...extra }];
+  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail, ...extra } : item);
 }
 /**
  * The CLI emits one `assistant` message per completed content block, so a tool_use block arrives
@@ -1041,7 +1160,7 @@ function applyAssistantToolUse(items: TranscriptItem[], message: SDKAssistantMes
     const name = typeof block.name === "string" ? block.name : "tool";
     const index = next.findIndex((item) => item.toolUseId === toolUseId);
     if (index < 0) {
-      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }) }];
+      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent", parentToolUseId: message.parent_tool_use_id }) }];
     } else {
       next = next.map((item, itemIndex) => itemIndex === index ? { ...item, text: name, ...(block.input === undefined ? {} : { toolInput: block.input }) } : item);
     }
@@ -1095,11 +1214,11 @@ export function Header({ model, mode, providers, compatible, busy, theme, width 
   const metaWidth = Math.max(14, width - modelWidth - 6);
   return <Box flexDirection="column" paddingX={1} marginBottom={1}>
     <Box justifyContent="space-between">
-      <Brand theme={theme} compact />
+      <CompactWordmark theme={theme} />
       <Text color={busy ? theme.accent : theme.success}>● <Text bold>{busy ? "working" : "ready"}</Text></Text>
     </Box>
     <Box justifyContent="space-between" columnGap={1}>
-      <Box width={modelWidth}><Text color={theme.muted} wrap="truncate-middle">{providerFromRoute(model)} / <Text color={theme.secondarySoft}>{shortModel(model)}</Text></Text></Box>
+      <Box width={modelWidth}><Text color={theme.secondarySoft} wrap="truncate-middle">{shortModel(model)}</Text></Box>
       <Box width={metaWidth} justifyContent="flex-end"><Text color={theme.faint} wrap="truncate-end">{providers}P · <Text bold color={theme.accent}>{mode}</Text>{compatible ? null : <Text color={theme.danger}> · mismatch</Text>}</Text></Box>
     </Box>
     <ActivityRule busy={busy} width={ruleWidth} theme={theme} />
@@ -1135,32 +1254,18 @@ export function transcriptStage(items: readonly TranscriptItem[], busy: boolean)
   return last?.role === "assistant" ? "writing" : "thinking";
 }
 
-export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
-  // A single shared trigger for the whole transcript — keyed on the newest item's identity — so a
-  // burst of several items landing in quick succession (e.g. parallel tool calls) still drives just
-  // one flash/timeout, not one per row. Whichever row is currently newest picks it up below; a row
-  // that stops being the newest simply stops rendering the highlight, it never keeps its own timer.
-  const last = items.at(-1);
-  const arrived = useFlash(last?.id);
+export function Transcript({ items, theme, width, busy, detailed, selectedTaskId }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean; readonly selectedTaskId?: string }): React.JSX.Element {
   if (items.length === 0) return <EmptyState theme={theme} width={width} />;
   const stage = transcriptStage(items, busy);
-  return <>{items.map((item, index) => {
-    const highlight = index === items.length - 1 && arrived ? { backgroundColor: theme.surfaceRaised } : {};
-    if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1} {...highlight}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
-    if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1} {...highlight}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} justArrived={index === items.length - 1 && arrived} />;
-    return <Box key={item.id} marginTop={1} {...highlight}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
+  return <>{items.map((item) => {
+    if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
+    if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} selected={item.id === selectedTaskId} />;
+    return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
   })}{stage === "thinking" || stage === "writing" ? <ThinkingLine theme={theme} writing={stage === "writing"} /> : null}</>;
 }
-function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly justArrived?: boolean }): React.JSX.Element {
+function ToolActivity({ item, theme, detailed, selected = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly selected?: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
-  // A brief highlight pulse whenever this row's status changes (most visibly running → completed/failed
-  // — the moment a tool call actually lands something worth noticing) — never on the row's own first
-  // mount, per useFlash's contract, so a burst of freshly-started tool calls doesn't flash all at once.
-  // `justArrived` (the transcript-level "something new landed" pulse — see Transcript) covers that
-  // first-mount moment instead, as one shared, already-time-boxed trigger rather than a second timer
-  // per row.
-  const statusFlash = useFlash(item.status);
   const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
   const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
   // Status-aware phrasing instead of one static "tool · Bash" label regardless of what's actually
@@ -1168,16 +1273,59 @@ function ToolActivity({ item, theme, detailed, justArrived = false }: { readonly
   // "Bash" once it lands (the ✓/× icon already carries the outcome), "Bash" prefixed with a failure
   // callout when it doesn't.
   const prefix = item.status === "running" ? "Running " : item.status === "failed" ? "Failed — " : "";
-  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}`;
-  const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
-  const highlight = statusFlash || justArrived ? { backgroundColor: theme.surfaceRaised } : {};
-  if (!detailed) return <Box paddingLeft={2} {...highlight}>{summary}</Box>;
+  // `selected` marks the row focus mode's Up/Down picker is currently highlighting (see
+  // resolveTaskPickerAction) — always a running Task row (taskId set) when true, per the caller's
+  // own selectableTaskEntries-derived candidate list, but re-checked here too so this component
+  // stays correct even if ever handed a stray id by mistake. No background fill for the picker
+  // highlight — matches the cursor-glyph-only convention QuestionCard already uses for "this is
+  // what Enter would act on" (see QuestionCard's `active` styling), and keeps Nova's red/gold
+  // palette out of the transcript entirely rather than reaching for the violet `surfaceRaised`
+  // token this session deliberately removed from live transcript rendering.
+  const isPickerTarget = selected && item.taskId !== undefined;
+  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}${isPickerTarget ? " · enter to focus" : ""}`;
+  const summary = <Box>{isPickerTarget ? <Text bold color={theme.accent}>{"❯ "}</Text> : null}<Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={isPickerTarget ? theme.accent : theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
+  if (!detailed) return <Box paddingLeft={2}>{summary}</Box>;
   const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
   const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
-  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1} {...highlight}>
+  return <Box flexDirection="column" paddingLeft={2} marginBottom={input.length === 0 && output.length === 0 ? 0 : 1}>
     {summary}
     {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>INPUT</Text><Text color={theme.muted}>{input}</Text></Box>}
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
+  </Box>;
+}
+/**
+ * Focus mode: a filtered view of exactly one subagent's own message stream (`items`, already
+ * built by `subagentTranscript` at the call site), rendered through `Transcript` itself rather
+ * than a parallel renderer — the same assistant/tool row components a subagent's activity already
+ * knows how to draw in the main transcript, just scoped down. `task` is the Task's own
+ * summary/progress row (`taskId` set); its text, subagent type and status become this header's
+ * title line and live indicator. `panelBorder(theme, "active")` matches how every other focused
+ * panel in this app (QuestionCard, PermissionCard) signals "you're inside a distinct mode, not
+ * the ordinary transcript." Deliberately has no interaction of its own beyond what `Transcript`
+ * already renders — Esc is the only way out, handled by the shared screen-navigation keymap in
+ * `ChatTui`, not by this component. Stays mounted showing the subagent's final state once it
+ * completes: nothing here force-ejects the viewer back to chat.
+ */
+export function SubagentFocus({ task, items, theme, width, detailed }: { readonly task: TranscriptItem | undefined; readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly detailed: boolean }): React.JSX.Element {
+  const running = task?.status === "running";
+  const spinner = useSpinner(running);
+  const icon = running ? spinner : task?.status === "failed" ? "×" : "✓";
+  const color = running ? theme.accent : task?.status === "failed" ? theme.danger : theme.success;
+  const label = task?.subagentType ?? "subagent";
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" flexGrow={1} {...panelBorder(theme, "active")} paddingX={1}>
+    <Box justifyContent="space-between">
+      <Text><Text color={color}>{icon}</Text><Text bold color={theme.text}> Viewing subagent: {label}</Text></Text>
+      <Text color={theme.faint}>esc to return</Text>
+    </Box>
+    {task === undefined
+      ? <Text color={theme.muted}>This subagent is no longer part of the transcript.</Text>
+      : <Text color={theme.muted} wrap="truncate-end">{task.text}</Text>}
+    <Box flexDirection="column" marginTop={1} flexGrow={1}>
+      {items.length === 0
+        ? <Text color={theme.faint}>{running ? "Waiting for this subagent's first activity…" : "This subagent produced no visible activity."}</Text>
+        : <Transcript items={items} theme={theme} width={innerWidth} busy={running} detailed={detailed} />}
+    </Box>
   </Box>;
 }
 /** Slowly cycled through while nothing has been written yet, so a long pre-token wait doesn't sit
@@ -1383,7 +1531,7 @@ function McpPanel({ servers, theme }: { readonly servers: readonly McpServerStat
   })}<HintBar theme={theme}>esc back</HintBar></Box>;
 }
 
-function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
+export function QuestionCard({ request, questionIndex, cursor, selections, otherMode, otherEditor, theme, width }: { readonly request: UserQuestionRequest; readonly questionIndex: number; readonly cursor: number; readonly selections: Readonly<Record<number, readonly string[]>>; readonly otherMode: boolean; readonly otherEditor: EditorState; readonly theme: Theme; readonly width: number }): React.JSX.Element {
   const numbered = isScreenReaderMode();
   const question = request.questions[questionIndex];
   if (question === undefined) return <></>;
@@ -1396,7 +1544,10 @@ function QuestionCard({ request, questionIndex, cursor, selections, otherMode, o
     <Box marginTop={1}><Text bold color={theme.text}>{question.question}</Text></Box>
     <Box flexDirection="column" marginTop={1}>{question.options.map((option, index) => {
       const active = cursor === index && !otherMode;
-      const checked = selected.includes(option.label);
+      // Multi-select has a real notion of "checked" independent of the cursor (toggled via Space,
+      // tracked in `selections`). Single-select doesn't — the highlighted option *is* the
+      // candidate Enter would submit, so the radio glyph just follows the cursor.
+      const checked = question.multiSelect ? selected.includes(option.label) : active;
       return <Box key={option.label} flexDirection="column" paddingLeft={active ? 0 : 2}>
         <Text color={active ? theme.accent : checked ? theme.success : theme.text}>{active ? "❯ " : ""}{question.multiSelect ? checked ? "[✓] " : "[ ] " : checked ? "◉ " : "○ "}<Text bold={active || checked}>{numbered ? numberedLabel(index, option.label) : option.label}</Text></Text>
         {active ? <Text color={theme.muted}>    {option.description}</Text> : null}
@@ -1463,6 +1614,63 @@ export function lastAssistantResponses(items: readonly TranscriptItem[], count: 
   const assistantTexts = items.filter((item) => item.role === "assistant").map((item) => item.text);
   return assistantTexts.slice(Math.max(0, assistantTexts.length - count));
 }
+/**
+ * Builds the mouse-copy-on-select clipboard payload from whole selected transcript items, oldest
+ * first. Assistant text is raw markdown source, so it goes through `markdownToPlainText` — the same
+ * treatment `/copy` already gives assistant responses (see `lastAssistantResponses` above), which
+ * also re-runs `sanitizeTerminalText` as a second pass. Every other role's `.text` is already plain,
+ * sanitized text by the time it lands in the transcript (see `appendSystem` and `reduceSdkMessage`),
+ * so it's used as-is.
+ */
+export function mouseSelectionCopyText(items: readonly TranscriptItem[]): string {
+  return items.map((item) => (item.role === "assistant" ? markdownToPlainText(item.text) : item.text)).join("\n\n");
+}
+/**
+ * Task/subagent entries currently running, in transcript order — the candidate set focus mode's
+ * picker cycles through and commits to. Always the task's own summary/progress row (`taskId`
+ * set), never a tool call the subagent itself made while running (those carry `parentToolUseId`
+ * instead — see `subagentTranscript`). Deliberately scoped to `status === "running"`: once a task
+ * settles it drops out of the picker's candidate set (arrow keys revert to plain composer history
+ * navigation the moment nothing is in flight), though a subagent already focused stays focused
+ * through completion — see `resolveTaskPickerAction` and the `screen === "subagent"` handling in
+ * `ChatTui`.
+ */
+export function selectableTaskEntries(items: readonly TranscriptItem[]): readonly TranscriptItem[] {
+  return items.filter((item) => item.taskId !== undefined && item.status === "running");
+}
+/**
+ * One subagent's isolated message stream: every assistant text block and tool call whose
+ * `parent_tool_use_id` traces back to `taskToolUseId` (the `tool_use` id of the Task call that
+ * spawned it) — captured as `streamId` on assistant rows (already used there to keep separate
+ * streams from merging into one accumulating bubble) and as `parentToolUseId` on tool rows. This
+ * is what focus mode renders in place of the full transcript, via `Transcript` itself — no
+ * separate renderer. Excludes the task's own summary row (`taskId` set): the focus view's header
+ * shows that separately instead of duplicating it inside the stream.
+ */
+export function subagentTranscript(items: readonly TranscriptItem[], taskToolUseId: string): readonly TranscriptItem[] {
+  return items.filter((item) =>
+    (item.role === "assistant" && item.streamId === taskToolUseId) ||
+    (item.role === "tool" && item.taskId === undefined && item.parentToolUseId === taskToolUseId));
+}
+export type TaskPickerAction = { readonly type: "move"; readonly direction: -1 | 1 } | { readonly type: "focus" };
+/**
+ * Resolves Up/Down/Enter against the subagent-picker keymap layered underneath the ordinary
+ * composer keymap: active only while the composer is empty and at least one Task entry is
+ * running (`runningCount`), which is exactly when plain Up/Down/Enter would otherwise be inert or
+ * merely recall prompt history — see the call site in `ChatTui`'s `useInput`, which checks this
+ * *before* history-navigation and vim-mode's own normal-mode motions so neither shadows it. Enter
+ * only resolves to `"focus"` un-shifted — Shift+Enter still inserts a newline everywhere else in
+ * the composer, focus mode doesn't change that. Returns `undefined` for every other key, and for
+ * these same keys the moment either gating condition stops holding, so the caller's existing
+ * handling (history recall, prompt submission) always applies unchanged in every other moment.
+ */
+export function resolveTaskPickerAction(key: Key, context: { readonly composerEmpty: boolean; readonly runningCount: number }): TaskPickerAction | undefined {
+  if (!context.composerEmpty || context.runningCount === 0) return undefined;
+  if (key.upArrow) return { type: "move", direction: -1 };
+  if (key.downArrow) return { type: "move", direction: 1 };
+  if (key.return && !key.shift) return { type: "focus" };
+  return undefined;
+}
 /** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
 export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
   if (key.leftArrow) return { type: "left" };
@@ -1476,6 +1684,55 @@ export function resolveLineEditorOperation(text: string, key: Key): Parameters<t
   if (key.delete) return { type: "delete" };
   if (!key.ctrl && !key.meta && text.length > 0) return { type: "insert", text: sanitizeTerminalText(text).replace(/\r?\n/gu, " ") };
   return undefined;
+}
+export type QuestionChoiceAction =
+  | { readonly type: "cancel" }
+  | { readonly type: "navigate"; readonly cursor: number }
+  | { readonly type: "toggle"; readonly cursor: number; readonly label: string }
+  | { readonly type: "openOther"; readonly cursor: number }
+  | { readonly type: "complete"; readonly values: readonly string[] }
+  | { readonly type: "none" };
+/**
+ * Pure keybinding resolution for QuestionCard's option list (the free-text "Other" editor reuses
+ * `resolveLineEditorOperation` instead — see handleQuestionInput). Mirrors Claude Code's
+ * documented confirmation-context bindings: Up/Down navigate, Tab moves to the next field
+ * (wrapping through "Other"), Escape declines, Space toggles the highlighted option, Enter
+ * confirms.
+ *
+ * Two behaviors below are AlfaCode's own reasoned defaults for gaps Claude Code's docs leave
+ * open, not confirmed upstream behavior:
+ *  - Single-select Space is a no-op: there is nothing to toggle independently of the cursor, so
+ *    the highlighted option *is* the candidate and Enter both selects and submits it in one
+ *    press.
+ *  - Digit quick-jump only applies in screen-reader mode (AlfaCode's own accessibility feature,
+ *    pre-existing). Claude Code's docs don't describe digit navigation at all, so it's left out
+ *    of the default sighted flow rather than guessed at.
+ */
+export function resolveQuestionChoiceAction(text: string, key: Pick<Key, "upArrow" | "downArrow" | "tab" | "escape" | "return" | "ctrl" | "meta">, question: Pick<UserQuestionRequest["questions"][number], "options" | "multiSelect">, cursor: number, selected: readonly string[], screenReaderMode: boolean): QuestionChoiceAction {
+  const otherIndex = question.options.length;
+  if (key.escape) return { type: "cancel" };
+  // Screen-reader mode: type a number instead of arrowing to an option (0 is "Other"). Single
+  // choice answers and advances immediately, like Enter; multiple choice toggles, like Space.
+  if (screenReaderMode && !key.ctrl && !key.meta && /^[0-9]$/.test(text)) {
+    if (text === "0") return { type: "openOther", cursor: otherIndex };
+    const digitIndex = Number(text) - 1;
+    const label = question.options[digitIndex]?.label;
+    if (label !== undefined) return question.multiSelect ? { type: "toggle", cursor: digitIndex, label } : { type: "complete", values: [label] };
+  }
+  if (key.upArrow) return { type: "navigate", cursor: Math.max(0, cursor - 1) };
+  if (key.downArrow) return { type: "navigate", cursor: Math.min(otherIndex, cursor + 1) };
+  if (key.tab) return { type: "navigate", cursor: (cursor + 1) % (otherIndex + 1) };
+  if (text === " " && cursor < question.options.length) {
+    if (!question.multiSelect) return { type: "none" };
+    const label = question.options[cursor]?.label;
+    return label === undefined ? { type: "none" } : { type: "toggle", cursor, label };
+  }
+  if (!key.return) return { type: "none" };
+  if (cursor === otherIndex) return { type: "openOther", cursor };
+  const focused = question.options[cursor]?.label;
+  if (focused === undefined) return { type: "none" };
+  if (!question.multiSelect) return { type: "complete", values: [focused] };
+  return { type: "complete", values: selected.length === 0 ? [focused] : selected };
 }
 /** Builds the audit-trail transcript line for a resolved permission prompt; `appendSystem` sanitizes the composed text on the way in. */
 export function describePermissionDecision(toolName: string, label: string, comment: string | undefined): string {
@@ -1628,8 +1885,9 @@ function truncatePreview(value: string): string { const lines = value.split("\n"
 function safeCommandName(value: string): string | undefined { const sanitized = sanitizeTerminalText(value).trim().replace(/^\/+/, ""); return sanitized.length === 0 || /\s/u.test(sanitized) ? undefined : `/${sanitized.slice(0, 100)}`; }
 export function createTranscriptItemId(prefix: "user" | "assistant" | "system"): string { transcriptItemSequence += 1; return `${prefix}-${transcriptItemSequence}`; }
 function appendSystem(setter: React.Dispatch<React.SetStateAction<TranscriptItem[]>>, text: string): void { setter((current) => [...current, { id: createTranscriptItemId("system"), role: "system", text: sanitizeTerminalText(text) }]); }
+/** appendSystem's counterpart for the StatusBar channel: an ephemeral UI notice, never appended to `messages`/Transcript. See StatusBar's doc comment for the split. */
+function showStatus(setter: React.Dispatch<React.SetStateAction<string | undefined>>, text: string): void { setter(sanitizeTerminalText(text)); }
 function shortModel(model: string): string { return decodeModelId(model)?.upstreamModel ?? model.split("/").at(-1) ?? model; }
-function providerFromRoute(model: string): string { return decodeModelId(model)?.providerId ?? model.split("/")[0] ?? "auto"; }
 function toMentionPath(absolutePath: string): string { const relative = relativePath(process.cwd(), absolutePath); return relative.startsWith("..") ? absolutePath : relative; }
 function formatCompact(value: number | undefined): string { if (value === undefined) return "—"; return compactNumberFormatter.format(value); }
 function estimateTokens(value: string): number { return value.length === 0 ? 0 : Math.max(1, Math.ceil(value.length / 4)); }

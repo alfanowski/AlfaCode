@@ -60,6 +60,35 @@ export function mixHex(from: string, to: string, ratio: number): string {
   return `#${[mix(fr, tr), mix(fg, tg), mix(fb, tb)].map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
 }
 
+/** Two diagonal rays bracketing the ✦ core — the exact glyphs Starburst uses for its own top ray
+ * pair (`╲` left of center, `╱` right), just the three cells at their center instead of the full
+ * radial field. */
+const compactMarkGlyphs = ["╲", "✦", "╱"] as const;
+
+/**
+ * The Header's always-on-screen brand mark: a single-row echo of the splash's Starburst + Wordmark,
+ * built for a compact top-left corner rather than the full multi-line block-art treatment (see
+ * `Starburst`/`Wordmark` below, which stay exclusive to the pre-conversation `EmptyState`). The
+ * bracketing rays and the ✦ core sweep the same accent→secondary blend `ProgressBar`/`Starburst`
+ * already use, and "AlfaCode" itself continues that exact gradient letter by letter, so the whole
+ * twelve-character mark reads as one unbroken red→gold sweep instead of a flat two-tone label —
+ * "genuinely small" without falling back to plain colored text.
+ *
+ * Deliberately static — no `useTwinkle`, unlike the splash `Wordmark`'s per-letter ripple. That
+ * mark only ever mounts pre-conversation; this one is mounted for the Header's entire lifetime,
+ * including all the way through a busy turn, and Header keeps every one of its own pieces (see
+ * `ActivityRule` in chat-tui.tsx) free of continuous per-tick animation so none of them join the
+ * sustained-repaint set that fights text selection while a response is streaming.
+ */
+export function CompactWordmark({ theme }: { readonly theme: Theme }): React.JSX.Element {
+  const word = "AlfaCode";
+  return <Text bold>
+    {compactMarkGlyphs.map((glyph, index) => <Text key={`mark-${index}`} color={mixHex(theme.accent, theme.secondary, index / (compactMarkGlyphs.length - 1))}>{glyph}</Text>)}
+    <Text> </Text>
+    {word.split("").map((char, index) => <Text key={`letter-${index}`} color={mixHex(theme.accent, theme.secondary, index / (word.length - 1))}>{char}</Text>)}
+  </Text>;
+}
+
 export function ProgressBar({ value, width, theme }: { readonly value: number; readonly width: number; readonly theme: Theme }): React.JSX.Element {
   const safeWidth = Math.max(4, width);
   const clamped = Math.max(0, Math.min(1, value));

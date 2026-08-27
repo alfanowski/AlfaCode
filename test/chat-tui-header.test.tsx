@@ -12,7 +12,6 @@ describe("Header", () => {
     const frame = render(<Header {...base} busy={false} />).lastFrame() ?? "";
     expect(frame).toContain("AlfaCode");
     expect(frame).toContain("ready");
-    expect(frame).toContain("route");
     expect(frame).toContain("model");
     expect(frame).toContain("3P");
     expect(frame).toContain("default");
@@ -22,7 +21,6 @@ describe("Header", () => {
     const frame = render(<Header {...base} busy compatible={false} />).lastFrame() ?? "";
     expect(frame).toContain("AlfaCode");
     expect(frame).toContain("working");
-    expect(frame).toContain("route");
     expect(frame).toContain("model");
     expect(frame).toContain("3P");
     expect(frame).toContain("default");

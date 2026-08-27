@@ -355,7 +355,8 @@ export function createCli(options: CreateCliOptions = {}): Command {
           loadUsage: () => options.queryUsage === undefined
             ? queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), { limit: 100 })
             : options.queryUsage({ limit: 100 }),
-          ...(flags.fullscreen === true ? { fullscreen: true } : {}),
+          // Fullscreen is the default rendering mode; only an explicit --no-fullscreen (flags.fullscreen === false) opts out.
+          fullscreen: flags.fullscreen !== false,
         });
       } finally {
         permissions.close();
@@ -381,7 +382,8 @@ export function createCli(options: CreateCliOptions = {}): Command {
 
   const program = new Command();
   program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true)
-    .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer")
+    .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer", true)
+    .option("--no-fullscreen", "Render inline using the terminal's native scrollback instead of the alternate screen buffer")
     .option("--screen-reader", "Render a plain, linear, screen-reader-friendly UI (same as ALFACODE_SCREEN_READER=1)")
     .action(nativeLaunch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
