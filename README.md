@@ -216,7 +216,7 @@ AlfaCode rings the terminal bell (`\x07`) when a response finishes or a permissi
 
 ### Fullscreen mode
 
-`--fullscreen` renders the chat UI on the terminal's alternate screen buffer (like vim or htop) with a fixed-bottom composer, using Ink's native support so the terminal is restored correctly even on a crash or `Ctrl+C`. `PageUp`/`PageDown` scroll by roughly a screen's worth of rows; `Ctrl+Home`/`Ctrl+End` jump to the oldest or newest message. A "N new messages below" indicator appears when scrolled away from the tail; nothing auto-jumps back to the bottom while you're reading history. Mouse support and in-transcript search are not implemented yet.
+AlfaCode renders the chat UI on the terminal's alternate screen buffer by default (like vim or htop), with a fixed topbar and a fixed-bottom composer that always stay on screen, using Ink's native support so the terminal is restored correctly even on a crash or `Ctrl+C`. Because the alternate screen buffer is its own pinned surface, the terminal's native scrollback doesn't apply to it; use `PageUp`/`PageDown` to scroll by roughly a screen's worth of rows and `Ctrl+Home`/`Ctrl+End` to jump to the oldest or newest message. A "N new messages below" indicator appears when scrolled away from the tail; nothing auto-jumps back to the bottom while you're reading history. Mouse support and in-transcript search are not implemented yet. Pass `--no-fullscreen` to render inline instead, using the terminal's native scrollback (the old default); `--fullscreen` is still accepted for backward compatibility, but it's now a no-op since fullscreen is already the default.
 
 ### Screen-reader mode
 
@@ -229,7 +229,8 @@ alfacode                              Start the native AlfaCode TUI
 alfacode --continue, -c               Resume the most recent session in this directory
 alfacode --resume, -r [name|id]       Resume a specific session, prompting if ambiguous
 alfacode --name <title>               Name the session as it starts
-alfacode --fullscreen                 Render on the alternate screen buffer
+alfacode --no-fullscreen              Render inline using the terminal's native scrollback (fullscreen is the default)
+alfacode --fullscreen                 Render on the alternate screen buffer (default; accepted for backward compatibility)
 alfacode --screen-reader              Render a plain, linear, screen-reader-friendly UI
 alfacode sessions [--json] [--limit]  List sessions AlfaCode can resume in this directory
 alfacode connect [provider]           Open provider setup
