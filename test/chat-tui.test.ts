@@ -19,6 +19,7 @@ import {
   resolveInitialVimMode,
   resolveLineEditorOperation,
   resolvePermissionModeAfterIdentity,
+  resolveQuestionChoiceAction,
   spellCheckActive,
   tailItemsByRows,
   truncateCheckpointsAt,
@@ -427,6 +428,85 @@ describe("shared single-line editor keymap", () => {
   it("ignores unmapped control/meta chords instead of inserting them", () => {
     expect(resolveLineEditorOperation("x", noKey({ ctrl: true }))).toBeUndefined();
     expect(resolveLineEditorOperation("x", noKey({ meta: true }))).toBeUndefined();
+  });
+});
+
+describe("QuestionCard keybinding resolution", () => {
+  const single = { multiSelect: false, options: [{ label: "Yes", description: "" }, { label: "No", description: "" }] };
+  const multi = { multiSelect: true, options: [{ label: "Alpha", description: "" }, { label: "Beta", description: "" }, { label: "Gamma", description: "" }] };
+
+  it("navigates with up/down, clamped at the option list boundaries (Other included)", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ downArrow: true }), single, 0, [], false)).toEqual({ type: "navigate", cursor: 1 });
+    // cursor 2 is the "Other" row (options.length); Down clamps there instead of overflowing.
+    expect(resolveQuestionChoiceAction("", noKey({ downArrow: true }), single, 2, [], false)).toEqual({ type: "navigate", cursor: 2 });
+    expect(resolveQuestionChoiceAction("", noKey({ upArrow: true }), single, 0, [], false)).toEqual({ type: "navigate", cursor: 0 });
+  });
+
+  it("wraps forward through every field, including Other, on tab", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ tab: true }), single, 0, [], false)).toEqual({ type: "navigate", cursor: 1 });
+    expect(resolveQuestionChoiceAction("", noKey({ tab: true }), single, 1, [], false)).toEqual({ type: "navigate", cursor: 2 });
+    expect(resolveQuestionChoiceAction("", noKey({ tab: true }), single, 2, [], false)).toEqual({ type: "navigate", cursor: 0 });
+  });
+
+  it("declines/dismisses on escape regardless of select mode", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ escape: true }), single, 0, [], false)).toEqual({ type: "cancel" });
+    expect(resolveQuestionChoiceAction("", noKey({ escape: true }), multi, 1, ["Alpha"], false)).toEqual({ type: "cancel" });
+  });
+
+  it("single-select: space is a no-op — nothing to toggle independently of the cursor", () => {
+    expect(resolveQuestionChoiceAction(" ", noKey(), single, 0, [], false)).toEqual({ type: "none" });
+  });
+
+  it("single-select: enter selects and submits the highlighted option in one press", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ return: true }), single, 1, [], false)).toEqual({ type: "complete", values: ["No"] });
+  });
+
+  it("single-select: enter on the Other row opens the free-text editor instead of submitting", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ return: true }), single, 2, [], false)).toEqual({ type: "openOther", cursor: 2 });
+  });
+
+  it("multi-select: space toggles the highlighted option on and back off", () => {
+    expect(resolveQuestionChoiceAction(" ", noKey(), multi, 1, [], false)).toEqual({ type: "toggle", cursor: 1, label: "Beta" });
+    expect(resolveQuestionChoiceAction(" ", noKey(), multi, 1, ["Beta"], false)).toEqual({ type: "toggle", cursor: 1, label: "Beta" });
+  });
+
+  it("multi-select: space on the Other row is a no-op (nothing to toggle there)", () => {
+    expect(resolveQuestionChoiceAction(" ", noKey(), multi, 3, [], false)).toEqual({ type: "none" });
+  });
+
+  it("multi-select: enter submits the accumulated toggled set, not just the cursor", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ return: true }), multi, 0, ["Beta", "Gamma"], false)).toEqual({ type: "complete", values: ["Beta", "Gamma"] });
+  });
+
+  it("multi-select: enter with nothing toggled falls back to the highlighted option", () => {
+    expect(resolveQuestionChoiceAction("", noKey({ return: true }), multi, 2, [], false)).toEqual({ type: "complete", values: ["Gamma"] });
+  });
+
+  it("digit quick-jump only applies in screen-reader mode — a bare digit is inert otherwise", () => {
+    expect(resolveQuestionChoiceAction("1", noKey(), single, 0, [], false)).toEqual({ type: "none" });
+    expect(resolveQuestionChoiceAction("2", noKey(), multi, 0, [], false)).toEqual({ type: "none" });
+  });
+
+  it("screen-reader mode: a digit jumps straight to that option and single-select submits immediately", () => {
+    expect(resolveQuestionChoiceAction("2", noKey(), single, 0, [], true)).toEqual({ type: "complete", values: ["No"] });
+  });
+
+  it("screen-reader mode: a digit jumps and toggles for multi-select without submitting", () => {
+    expect(resolveQuestionChoiceAction("3", noKey(), multi, 0, [], true)).toEqual({ type: "toggle", cursor: 2, label: "Gamma" });
+  });
+
+  it("screen-reader mode: 0 opens the Other free-text row in either select mode", () => {
+    expect(resolveQuestionChoiceAction("0", noKey(), single, 0, [], true)).toEqual({ type: "openOther", cursor: 2 });
+    expect(resolveQuestionChoiceAction("0", noKey(), multi, 0, [], true)).toEqual({ type: "openOther", cursor: 3 });
+  });
+
+  it("screen-reader mode: an out-of-range digit is ignored rather than throwing", () => {
+    expect(resolveQuestionChoiceAction("9", noKey(), single, 0, [], true)).toEqual({ type: "none" });
+  });
+
+  it("screen-reader mode: ctrl/meta-modified digits don't trigger the quick-jump", () => {
+    expect(resolveQuestionChoiceAction("1", noKey({ ctrl: true }), single, 0, [], true)).toEqual({ type: "none" });
+    expect(resolveQuestionChoiceAction("1", noKey({ meta: true }), single, 0, [], true)).toEqual({ type: "none" });
   });
 });
 
