@@ -22,7 +22,10 @@ import {
   resolveLineEditorOperation,
   resolvePermissionModeAfterIdentity,
   resolveQuestionChoiceAction,
+  resolveTaskPickerAction,
+  selectableTaskEntries,
   spellCheckActive,
+  subagentTranscript,
   tailItemsByRows,
   truncateCheckpointsAt,
   truncateOneLine,
@@ -88,7 +91,29 @@ describe("chat transcript reducer", () => {
   it("collapses subagent lifecycle events into one live activity row", () => {
     const started = reduceSdkMessage([], { type: "system", subtype: "task_started", uuid: "one", session_id: "session", task_id: "task", description: "Inspect project" } as unknown as SDKMessage);
     const completed = reduceSdkMessage(started, { type: "system", subtype: "task_notification", uuid: "two", session_id: "session", task_id: "task", status: "completed", summary: "Done" } as unknown as SDKMessage);
-    expect(completed).toEqual([{ id: "task-task", role: "tool", text: "Done", detail: "subagent", status: "completed" }]);
+    expect(completed).toEqual([{ id: "task-task", role: "tool", text: "Done", detail: "subagent", status: "completed", taskId: "task" }]);
+  });
+
+  it("captures the owning Task tool_use id and subagent type from task_started, carrying both through later task_progress/task_notification updates", () => {
+    const started = reduceSdkMessage([], { type: "system", subtype: "task_started", uuid: "one", session_id: "session", task_id: "task", tool_use_id: "tool-task-1", subagent_type: "code-reviewer", description: "Inspect project" } as unknown as SDKMessage);
+    expect(started).toEqual([{ id: "task-task", role: "tool", text: "Inspect project", detail: "subagent", status: "running", taskId: "task", parentToolUseId: "tool-task-1", subagentType: "code-reviewer" }]);
+    const progressed = reduceSdkMessage(started, { type: "system", subtype: "task_progress", uuid: "two", session_id: "session", task_id: "task", summary: "Reading files" } as unknown as SDKMessage);
+    expect(progressed[0]).toMatchObject({ text: "Reading files", parentToolUseId: "tool-task-1", subagentType: "code-reviewer" });
+    const completed = reduceSdkMessage(progressed, { type: "system", subtype: "task_notification", uuid: "three", session_id: "session", task_id: "task", status: "completed", summary: "Done" } as unknown as SDKMessage);
+    expect(completed[0]).toMatchObject({ status: "completed", parentToolUseId: "tool-task-1", subagentType: "code-reviewer" });
+  });
+
+  it("tags assistant text and tool calls produced by a subagent with the owning Task's tool_use id", () => {
+    const delta = reduceSdkMessage([], {
+      type: "stream_event", uuid: "one", session_id: "session", parent_tool_use_id: "tool-task-1",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "Working" } },
+    } as unknown as SDKMessage);
+    expect(delta).toEqual([{ id: expect.any(String), role: "assistant", text: "Working", streamId: "tool-task-1" }]);
+    const nestedTool = reduceSdkMessage(delta, {
+      type: "stream_event", uuid: "two", session_id: "session", parent_tool_use_id: "tool-task-1",
+      event: { type: "content_block_start", content_block: { type: "tool_use", id: "nested-1", name: "Read", input: {} } },
+    } as unknown as SDKMessage);
+    expect(nestedTool[1]).toMatchObject({ role: "tool", text: "Read", detail: "subagent", parentToolUseId: "tool-task-1" });
   });
 
   it("marks running tools as completed when the turn finishes", () => {
@@ -118,7 +143,7 @@ describe("chat transcript reducer", () => {
       message: { id: "m", role: "assistant", content: [{ type: "tool_use", id: "tool-use-2", name: "Write", input: { file_path: "a.ts" } }] },
     } as unknown as SDKMessage);
 
-    expect(items).toEqual([{ id: "tool-tool-use-2", role: "tool", text: "Write", status: "running", toolUseId: "tool-use-2", toolInput: { file_path: "a.ts" }, detail: "subagent" }]);
+    expect(items).toEqual([{ id: "tool-tool-use-2", role: "tool", text: "Write", status: "running", toolUseId: "tool-use-2", toolInput: { file_path: "a.ts" }, detail: "subagent", parentToolUseId: "parent-tool" }]);
   });
 
   it("settles a tool row and captures its sanitized output once the matching tool_result arrives", () => {
@@ -541,6 +566,89 @@ describe("QuestionCard keybinding resolution", () => {
   it("screen-reader mode: ctrl/meta-modified digits don't trigger the quick-jump", () => {
     expect(resolveQuestionChoiceAction("1", noKey({ ctrl: true }), single, 0, [], true)).toEqual({ type: "none" });
     expect(resolveQuestionChoiceAction("1", noKey({ meta: true }), single, 0, [], true)).toEqual({ type: "none" });
+  });
+});
+
+describe("selectableTaskEntries (subagent focus-mode picker candidates)", () => {
+  it("keeps only rows that are a running Task/subagent launch itself", () => {
+    const items: readonly TranscriptItem[] = [
+      { id: "task-1", role: "tool", text: "Reviewing", status: "running", taskId: "1" },
+      { id: "task-2", role: "tool", text: "Done", status: "completed", taskId: "2" },
+      { id: "tool-nested", role: "tool", text: "Read", status: "running", parentToolUseId: "tool-task-1" },
+      { id: "a1", role: "assistant", text: "hello" },
+    ];
+    expect(selectableTaskEntries(items).map((item) => item.id)).toEqual(["task-1"]);
+  });
+
+  it("returns an empty list once nothing is running", () => {
+    const items: readonly TranscriptItem[] = [{ id: "task-1", role: "tool", text: "Done", status: "completed", taskId: "1" }];
+    expect(selectableTaskEntries(items)).toEqual([]);
+  });
+});
+
+describe("subagentTranscript (focus-mode message stream)", () => {
+  const items: readonly TranscriptItem[] = [
+    { id: "u1", role: "user", text: "go" },
+    { id: "task-1", role: "tool", text: "Reviewing", status: "running", taskId: "1", parentToolUseId: "tool-task-1", subagentType: "code-reviewer" },
+    { id: "a-sub", role: "assistant", text: "Looking at the diff", streamId: "tool-task-1" },
+    { id: "tool-sub", role: "tool", text: "Read", status: "completed", detail: "subagent", parentToolUseId: "tool-task-1" },
+    { id: "a-main", role: "assistant", text: "Main reply", streamId: null },
+    { id: "task-2", role: "tool", text: "Other task", status: "running", taskId: "2", parentToolUseId: "tool-task-2" },
+    { id: "a-other-sub", role: "assistant", text: "Different subagent", streamId: "tool-task-2" },
+  ];
+
+  it("isolates exactly the one subagent's own assistant text and tool calls", () => {
+    expect(subagentTranscript(items, "tool-task-1").map((item) => item.id)).toEqual(["a-sub", "tool-sub"]);
+  });
+
+  it("excludes the task's own summary row and any other subagent's activity", () => {
+    const stream = subagentTranscript(items, "tool-task-1");
+    expect(stream.some((item) => item.id === "task-1")).toBe(false);
+    expect(stream.some((item) => item.id === "a-other-sub")).toBe(false);
+  });
+
+  it("excludes main-conversation text (streamId null) and unrelated user rows", () => {
+    const stream = subagentTranscript(items, "tool-task-1");
+    expect(stream.some((item) => item.id === "a-main")).toBe(false);
+    expect(stream.some((item) => item.id === "u1")).toBe(false);
+  });
+
+  it("returns an empty stream for a task id nothing correlates to", () => {
+    expect(subagentTranscript(items, "no-such-task")).toEqual([]);
+  });
+});
+
+describe("resolveTaskPickerAction (subagent focus-mode entry keymap)", () => {
+  const active = { composerEmpty: true, runningCount: 1 };
+
+  it("moves the picker cursor on Up/Down while the composer is empty and something is running", () => {
+    expect(resolveTaskPickerAction(noKey({ upArrow: true }), active)).toEqual({ type: "move", direction: -1 });
+    expect(resolveTaskPickerAction(noKey({ downArrow: true }), active)).toEqual({ type: "move", direction: 1 });
+  });
+
+  it("resolves a plain Enter to focusing the highlighted entry", () => {
+    expect(resolveTaskPickerAction(noKey({ return: true }), active)).toEqual({ type: "focus" });
+  });
+
+  it("leaves Shift+Enter alone so it still inserts a newline, never focus mode", () => {
+    expect(resolveTaskPickerAction(noKey({ return: true, shift: true }), active)).toBeUndefined();
+  });
+
+  it("stays inert once the composer has text — Up/Down/Enter keep their ordinary composer meaning", () => {
+    const composerHasText = { composerEmpty: false, runningCount: 1 };
+    expect(resolveTaskPickerAction(noKey({ upArrow: true }), composerHasText)).toBeUndefined();
+    expect(resolveTaskPickerAction(noKey({ return: true }), composerHasText)).toBeUndefined();
+  });
+
+  it("stays inert once nothing is running, even with an empty composer", () => {
+    const nothingRunning = { composerEmpty: true, runningCount: 0 };
+    expect(resolveTaskPickerAction(noKey({ upArrow: true }), nothingRunning)).toBeUndefined();
+    expect(resolveTaskPickerAction(noKey({ return: true }), nothingRunning)).toBeUndefined();
+  });
+
+  it("ignores unrelated keys", () => {
+    expect(resolveTaskPickerAction(noKey({ tab: true }), active)).toBeUndefined();
+    expect(resolveTaskPickerAction(noKey({ escape: true }), active)).toBeUndefined();
   });
 });
 

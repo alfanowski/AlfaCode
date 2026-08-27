@@ -85,9 +85,29 @@ export interface TranscriptItem {
   readonly toolInput?: unknown;
   /** Sanitized tool_result text, captured once the matching tool_use resolves. */
   readonly toolOutput?: string;
+  /**
+   * Set only on the row representing a Task/subagent launch itself (built from `task_started` /
+   * `task_progress` / `task_notification`, keyed by that engine `task_id`) — never on a tool call
+   * merely *made by* a subagent. This is what tells `selectableTaskEntries` and `subagentTranscript`
+   * apart: a row with `taskId` is a focus-mode target, a row without one but with `parentToolUseId`
+   * is content produced *inside* one.
+   */
+  readonly taskId?: string;
+  /**
+   * The `tool_use` id of the Task call this activity belongs to. Set on the task row itself (from
+   * `task_started`'s `tool_use_id`, mirroring the Task tool_use block that spawned it) and on every
+   * assistant/tool row a subagent produced (from that message's own `parent_tool_use_id`) — the
+   * correlation key `subagentTranscript` filters by to build one subagent's isolated stream.
+   * Assistant rows carry the identical value under `streamId` already (kept separately since that
+   * field also drives delta-accumulation); this field exists so tool rows — which have no such
+   * field — can be filtered the same way.
+   */
+  readonly parentToolUseId?: string;
+  /** Subagent type reported by `task_started`/`task_progress` (e.g. "code-reviewer"), when the engine provides one. Labels the focus-mode header; falls back to a generic "subagent" when absent. */
+  readonly subagentType?: string;
 }
 
-type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp";
+type Screen = "chat" | "models" | "providers" | "usage" | "permissions" | "help" | "rewind" | "theme" | "mcp" | "subagent";
 type ContextUsage = {
   readonly totalTokens: number;
   readonly maxTokens: number;
@@ -274,6 +294,14 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [mentionCursor, setMentionCursor] = useState(0);
   const [attachments, setAttachments] = useState<readonly ImageAttachment[]>([]);
   const [toolDetail, setToolDetail] = useState(false);
+  // Focus mode (see resolveTaskPickerAction / selectableTaskEntries / subagentTranscript): which
+  // running Task entry the Up/Down picker is currently highlighting in the main transcript
+  // (`taskCursor`, an index into that candidate list — clamped at each use site rather than via an
+  // effect, matching how ModelPicker/ProviderManager already clamp their own cursors), and which
+  // one — if any — the user has committed to with Enter (`focusedTaskItemId`, that row's own
+  // transcript id; `screen === "subagent"` is what actually switches the middle panel over).
+  const [taskCursor, setTaskCursor] = useState(0);
+  const [focusedTaskItemId, setFocusedTaskItemId] = useState<string>();
   const [todos, setTodos] = useState<readonly TodoItem[]>([]);
   const [todoPanelCollapsed, setTodoPanelCollapsed] = useState(false);
   const [backgroundTasks, setBackgroundTasks] = useState<readonly BackgroundTask[]>([]);
@@ -330,6 +358,16 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const maxScrollOffset = useMemo(() => maxScrollOffsetRows(messages, transcriptWidth), [messages, transcriptWidth]);
   const scrollWindow = useMemo(() => windowItemsByRows(messages, transcriptRows, transcriptWidth, scrollOffset), [messages, transcriptRows, transcriptWidth, scrollOffset]);
   const visibleMessages = scrollWindow.items;
+  // Focus mode's candidate list and current picker highlight (see resolveTaskPickerAction's doc
+  // comment for why Up/Down/Enter only ever engage here): `taskCursor` is clamped inline rather
+  // than reset via an effect, so a subagent completing mid-navigation just shifts the highlight
+  // rather than needing to be reconciled separately.
+  const runningTaskEntries = useMemo(() => selectableTaskEntries(messages), [messages]);
+  const highlightedTaskId = screen === "chat" && editor.value.length === 0 && runningTaskEntries.length > 0
+    ? runningTaskEntries[Math.min(taskCursor, runningTaskEntries.length - 1)]?.id
+    : undefined;
+  const focusedTaskItem = useMemo(() => focusedTaskItemId === undefined ? undefined : messages.find((item) => item.id === focusedTaskItemId), [focusedTaskItemId, messages]);
+  const focusedSubagentItems = useMemo(() => focusedTaskItem?.parentToolUseId === undefined ? [] : subagentTranscript(messages, focusedTaskItem.parentToolUseId), [focusedTaskItem, messages]);
   const finish = (action: ChatAction): void => { resolveAction(action); exit(); };
   // Reusable scroll-offset API (rows scrolled up from the tail): keyboard binds to it below, and a future
   // mouse-wheel handler can drive the same three entry points without touching the windowing math.
@@ -534,7 +572,9 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (screen === "permissions") { handlePermissionModeInput(text, key); return; }
     if (screen === "rewind") { handleRewindInput(key); return; }
     if (screen === "theme") { handleThemeInput(key); return; }
-    if (screen === "help" || screen === "usage" || screen === "mcp") return;
+    // Focus mode has no keymap of its own beyond the shared Esc-to-chat handling right above —
+    // it's a read-only view of one subagent's activity (see SubagentFocus's own doc comment).
+    if (screen === "help" || screen === "usage" || screen === "mcp" || screen === "subagent") return;
 
     // Image paste (Ctrl+V always reaches the terminal; Cmd+V only surfaces as key.super under the
     // kitty keyboard protocol — see clipboard-image.ts for why this can't just read stdin) and
@@ -598,6 +638,17 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
       setEditor({ value: promptSuggestion, cursor: promptSuggestion.length });
       setPromptSuggestion(undefined);
       return;
+    }
+    // Subagent focus-mode picker (resolveTaskPickerAction): checked ahead of vim mode for the same
+    // reason command/mention-palette navigation above is — vim's own NORMAL-mode motions would
+    // otherwise claim Up/Down as j/k cursor moves before this ever ran. Only ever active with an
+    // empty composer and at least one Task running (see the resolver's own doc comment), so this
+    // never shadows ordinary Up/Down history recall or Enter-to-submit in any other moment.
+    const taskPick = resolveTaskPickerAction(key, { composerEmpty: editor.value.length === 0, runningCount: runningTaskEntries.length });
+    if (taskPick?.type === "move") { setTaskCursor((current) => Math.max(0, Math.min(runningTaskEntries.length - 1, current + taskPick.direction))); return; }
+    if (taskPick?.type === "focus") {
+      const target = runningTaskEntries[Math.min(taskCursor, runningTaskEntries.length - 1)];
+      if (target !== undefined) { setFocusedTaskItemId(target.id); setScreen("subagent"); return; }
     }
     if (vimEnabled) {
       const step = stepVim(editor, vim, text, key);
@@ -1031,7 +1082,8 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
         lives in <Static> above this frame instead, so a fixed minHeight would only pad the
         live, redrawn region with blank lines. */}
     <Box flexDirection="column" {...(screenReader ? {} : { minHeight: transcriptRows })} paddingX={1} {...(fullscreen ? { flexGrow: 1, overflow: "hidden" as const } : {})}>
-      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} />) : null}
+      {screen === "chat" ? (screenReader ? <ScreenReaderTranscript lines={screenReaderLog.lines} stage={transcriptStage(messages, busy)} /> : <Transcript items={visibleMessages} theme={theme} width={transcriptWidth} busy={busy} detailed={toolDetail} {...(highlightedTaskId === undefined ? {} : { selectedTaskId: highlightedTaskId })} />) : null}
+      {screen === "subagent" ? <SubagentFocus task={focusedTaskItem} items={focusedSubagentItems} theme={theme} width={transcriptWidth} detailed={toolDetail} /> : null}
       {screen === "models" ? <ModelPicker models={filteredModels} cursor={modelCursor} filter={modelFilter} theme={theme} height={transcriptRows} width={transcriptWidth} activeRoute={activeModel} effortLevel={effortLevel} /> : null}
       {screen === "providers" ? confirmDeleteId === undefined ? <ProviderManager providers={config.providers} models={models} cursor={providerCursor} theme={theme} {...(config.defaultProviderId === undefined ? {} : { defaultId: config.defaultProviderId })} /> : <DeleteConfirmation providerId={confirmDeleteId} theme={theme} /> : null}
       {screen === "usage" ? <UsagePanel usage={usage} context={contextUsage} sessionCostUsd={sessionCostUsd} theme={theme} width={transcriptWidth} /> : null}
@@ -1061,15 +1113,15 @@ export function reduceSdkMessage(current: readonly TranscriptItem[], message: SD
     if (event.type === "content_block_start" && isRecord(event.content_block) && event.content_block.type === "tool_use") {
       const name = typeof event.content_block.name === "string" ? event.content_block.name : "tool";
       const toolUseId = typeof event.content_block.id === "string" ? event.content_block.id : undefined;
-      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
+      return [...items, { id: `tool-${message.uuid}-${items.length}`, role: "tool", text: name, status: "running", ...(message.parent_tool_use_id === null ? {} : { detail: "subagent", parentToolUseId: message.parent_tool_use_id }), ...(toolUseId === undefined ? {} : { toolUseId }) }];
     }
   }
   if (message.type === "assistant") return applyAssistantToolUse(items, message);
   if (message.type === "user") return applyToolResults(items, message);
   if (message.type === "system" && message.subtype === "notification") return [...items, { id: message.uuid, role: "system", text: sanitizeTerminalText(message.text) }];
-  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running" }];
-  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent");
-  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent");
+  if (message.type === "system" && message.subtype === "task_started") return [...items, { id: `task-${message.task_id}`, role: "tool", text: sanitizeTerminalText(message.description), detail: "subagent", status: "running", taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }), ...(message.subagent_type === undefined ? {} : { subagentType: sanitizeTerminalText(message.subagent_type) }) }];
+  if (message.type === "system" && message.subtype === "task_progress" && message.summary) return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), "running", "subagent", { taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }), ...(message.subagent_type === undefined ? {} : { subagentType: sanitizeTerminalText(message.subagent_type) }) });
+  if (message.type === "system" && message.subtype === "task_notification") return upsertTool(items, `task-${message.task_id}`, sanitizeTerminalText(message.summary), message.status === "completed" ? "completed" : "failed", "subagent", { taskId: message.task_id, ...(message.tool_use_id === undefined ? {} : { parentToolUseId: message.tool_use_id }) });
   if (message.type === "result") {
     items = items.map((item) => item.role === "tool" && item.status === "running" ? { ...item, status: message.is_error ? "failed" as const : "completed" as const } : item);
     if (message.is_error) {
@@ -1086,10 +1138,10 @@ function appendAssistantDelta(items: TranscriptItem[], text: string, parent: str
   if (last?.role === "assistant" && last.streamId === streamId) return [...items.slice(0, -1), { ...last, text: last.text + text }];
   return [...items, { id: createTranscriptItemId("assistant"), role: "assistant", text, streamId }];
 }
-function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string): TranscriptItem[] {
+function upsertTool(items: TranscriptItem[], id: string, text: string, status: "running" | "completed" | "failed", detail: string, extra?: Pick<TranscriptItem, "taskId" | "parentToolUseId" | "subagentType">): TranscriptItem[] {
   const index = items.findIndex((item) => item.id === id);
-  if (index < 0) return [...items, { id, role: "tool", text, status, detail }];
-  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail } : item);
+  if (index < 0) return [...items, { id, role: "tool", text, status, detail, ...extra }];
+  return items.map((item, itemIndex) => itemIndex === index ? { ...item, text, status, detail, ...extra } : item);
 }
 /**
  * The CLI emits one `assistant` message per completed content block, so a tool_use block arrives
@@ -1108,7 +1160,7 @@ function applyAssistantToolUse(items: TranscriptItem[], message: SDKAssistantMes
     const name = typeof block.name === "string" ? block.name : "tool";
     const index = next.findIndex((item) => item.toolUseId === toolUseId);
     if (index < 0) {
-      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent" }) }];
+      next = [...next, { id: `tool-${toolUseId}`, role: "tool", text: name, status: "running", toolUseId, ...(block.input === undefined ? {} : { toolInput: block.input }), ...(message.parent_tool_use_id === null ? {} : { detail: "subagent", parentToolUseId: message.parent_tool_use_id }) }];
     } else {
       next = next.map((item, itemIndex) => itemIndex === index ? { ...item, text: name, ...(block.input === undefined ? {} : { toolInput: block.input }) } : item);
     }
@@ -1202,17 +1254,17 @@ export function transcriptStage(items: readonly TranscriptItem[], busy: boolean)
   return last?.role === "assistant" ? "writing" : "thinking";
 }
 
-export function Transcript({ items, theme, width, busy, detailed }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean }): React.JSX.Element {
+export function Transcript({ items, theme, width, busy, detailed, selectedTaskId }: { readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly busy: boolean; readonly detailed: boolean; readonly selectedTaskId?: string }): React.JSX.Element {
   if (items.length === 0) return <EmptyState theme={theme} width={width} />;
   const stage = transcriptStage(items, busy);
   return <>{items.map((item) => {
     if (item.role === "assistant") return <Box key={item.id} marginTop={1} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.accent} paddingLeft={1}><Markdown theme={theme} width={width - 2}>{item.text}</Markdown></Box>;
     if (item.role === "user") return <Box key={item.id} marginTop={2} borderStyle="single" borderLeft borderRight={false} borderTop={false} borderBottom={false} borderColor={theme.secondary} paddingLeft={1}><Text><Text bold color={theme.secondary}>❯ </Text><Text color={theme.text} wrap="wrap">{item.text}</Text></Text></Box>;
-    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} />;
+    if (item.role === "tool") return <ToolActivity key={item.id} item={item} theme={theme} detailed={detailed} selected={item.id === selectedTaskId} />;
     return <Box key={item.id} marginTop={1}><Text color={theme.warning}>! </Text><Text color={theme.muted}>{item.text}</Text></Box>;
   })}{stage === "thinking" || stage === "writing" ? <ThinkingLine theme={theme} writing={stage === "writing"} /> : null}</>;
 }
-function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean }): React.JSX.Element {
+function ToolActivity({ item, theme, detailed, selected = false }: { readonly item: TranscriptItem; readonly theme: Theme; readonly detailed: boolean; readonly selected?: boolean }): React.JSX.Element {
   const spinner = useSpinner(item.status === "running");
   const icon = item.status === "running" ? spinner : item.status === "failed" ? "×" : "✓";
   const color = item.status === "running" ? theme.accent : item.status === "failed" ? theme.danger : theme.success;
@@ -1221,8 +1273,17 @@ function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem
   // "Bash" once it lands (the ✓/× icon already carries the outcome), "Bash" prefixed with a failure
   // callout when it doesn't.
   const prefix = item.status === "running" ? "Running " : item.status === "failed" ? "Failed — " : "";
-  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}`;
-  const summary = <Box><Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
+  // `selected` marks the row focus mode's Up/Down picker is currently highlighting (see
+  // resolveTaskPickerAction) — always a running Task row (taskId set) when true, per the caller's
+  // own selectableTaskEntries-derived candidate list, but re-checked here too so this component
+  // stays correct even if ever handed a stray id by mistake. No background fill for the picker
+  // highlight — matches the cursor-glyph-only convention QuestionCard already uses for "this is
+  // what Enter would act on" (see QuestionCard's `active` styling), and keeps Nova's red/gold
+  // palette out of the transcript entirely rather than reaching for the violet `surfaceRaised`
+  // token this session deliberately removed from live transcript rendering.
+  const isPickerTarget = selected && item.taskId !== undefined;
+  const suffix = `${item.detail === undefined ? "" : ` · ${item.detail}`}${item.status === "running" ? "…" : ""}${isPickerTarget ? " · enter to focus" : ""}`;
+  const summary = <Box>{isPickerTarget ? <Text bold color={theme.accent}>{"❯ "}</Text> : null}<Text color={color}>{icon}</Text><Text color={theme.muted}> {prefix}</Text><Text bold color={isPickerTarget ? theme.accent : theme.text}>{item.text}</Text><Text color={theme.muted}>{suffix}</Text></Box>;
   if (!detailed) return <Box paddingLeft={2}>{summary}</Box>;
   const input = item.toolInput === undefined ? "" : truncateForDisplay(stringifyToolPayload(item.toolInput));
   const output = item.toolOutput === undefined ? "" : truncateForDisplay(item.toolOutput);
@@ -1230,6 +1291,41 @@ function ToolActivity({ item, theme, detailed }: { readonly item: TranscriptItem
     {summary}
     {input.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>INPUT</Text><Text color={theme.muted}>{input}</Text></Box>}
     {output.length === 0 ? null : <Box flexDirection="column" paddingLeft={2} marginTop={1}><Text bold color={theme.faint}>OUTPUT</Text><Text color={theme.muted}>{output}</Text></Box>}
+  </Box>;
+}
+/**
+ * Focus mode: a filtered view of exactly one subagent's own message stream (`items`, already
+ * built by `subagentTranscript` at the call site), rendered through `Transcript` itself rather
+ * than a parallel renderer — the same assistant/tool row components a subagent's activity already
+ * knows how to draw in the main transcript, just scoped down. `task` is the Task's own
+ * summary/progress row (`taskId` set); its text, subagent type and status become this header's
+ * title line and live indicator. `panelBorder(theme, "active")` matches how every other focused
+ * panel in this app (QuestionCard, PermissionCard) signals "you're inside a distinct mode, not
+ * the ordinary transcript." Deliberately has no interaction of its own beyond what `Transcript`
+ * already renders — Esc is the only way out, handled by the shared screen-navigation keymap in
+ * `ChatTui`, not by this component. Stays mounted showing the subagent's final state once it
+ * completes: nothing here force-ejects the viewer back to chat.
+ */
+export function SubagentFocus({ task, items, theme, width, detailed }: { readonly task: TranscriptItem | undefined; readonly items: readonly TranscriptItem[]; readonly theme: Theme; readonly width: number; readonly detailed: boolean }): React.JSX.Element {
+  const running = task?.status === "running";
+  const spinner = useSpinner(running);
+  const icon = running ? spinner : task?.status === "failed" ? "×" : "✓";
+  const color = running ? theme.accent : task?.status === "failed" ? theme.danger : theme.success;
+  const label = task?.subagentType ?? "subagent";
+  const innerWidth = Math.max(20, width - 4);
+  return <Box flexDirection="column" flexGrow={1} {...panelBorder(theme, "active")} paddingX={1}>
+    <Box justifyContent="space-between">
+      <Text><Text color={color}>{icon}</Text><Text bold color={theme.text}> Viewing subagent: {label}</Text></Text>
+      <Text color={theme.faint}>esc to return</Text>
+    </Box>
+    {task === undefined
+      ? <Text color={theme.muted}>This subagent is no longer part of the transcript.</Text>
+      : <Text color={theme.muted} wrap="truncate-end">{task.text}</Text>}
+    <Box flexDirection="column" marginTop={1} flexGrow={1}>
+      {items.length === 0
+        ? <Text color={theme.faint}>{running ? "Waiting for this subagent's first activity…" : "This subagent produced no visible activity."}</Text>
+        : <Transcript items={items} theme={theme} width={innerWidth} busy={running} detailed={detailed} />}
+    </Box>
   </Box>;
 }
 /** Slowly cycled through while nothing has been written yet, so a long pre-token wait doesn't sit
@@ -1528,6 +1624,52 @@ export function lastAssistantResponses(items: readonly TranscriptItem[], count: 
  */
 export function mouseSelectionCopyText(items: readonly TranscriptItem[]): string {
   return items.map((item) => (item.role === "assistant" ? markdownToPlainText(item.text) : item.text)).join("\n\n");
+}
+/**
+ * Task/subagent entries currently running, in transcript order — the candidate set focus mode's
+ * picker cycles through and commits to. Always the task's own summary/progress row (`taskId`
+ * set), never a tool call the subagent itself made while running (those carry `parentToolUseId`
+ * instead — see `subagentTranscript`). Deliberately scoped to `status === "running"`: once a task
+ * settles it drops out of the picker's candidate set (arrow keys revert to plain composer history
+ * navigation the moment nothing is in flight), though a subagent already focused stays focused
+ * through completion — see `resolveTaskPickerAction` and the `screen === "subagent"` handling in
+ * `ChatTui`.
+ */
+export function selectableTaskEntries(items: readonly TranscriptItem[]): readonly TranscriptItem[] {
+  return items.filter((item) => item.taskId !== undefined && item.status === "running");
+}
+/**
+ * One subagent's isolated message stream: every assistant text block and tool call whose
+ * `parent_tool_use_id` traces back to `taskToolUseId` (the `tool_use` id of the Task call that
+ * spawned it) — captured as `streamId` on assistant rows (already used there to keep separate
+ * streams from merging into one accumulating bubble) and as `parentToolUseId` on tool rows. This
+ * is what focus mode renders in place of the full transcript, via `Transcript` itself — no
+ * separate renderer. Excludes the task's own summary row (`taskId` set): the focus view's header
+ * shows that separately instead of duplicating it inside the stream.
+ */
+export function subagentTranscript(items: readonly TranscriptItem[], taskToolUseId: string): readonly TranscriptItem[] {
+  return items.filter((item) =>
+    (item.role === "assistant" && item.streamId === taskToolUseId) ||
+    (item.role === "tool" && item.taskId === undefined && item.parentToolUseId === taskToolUseId));
+}
+export type TaskPickerAction = { readonly type: "move"; readonly direction: -1 | 1 } | { readonly type: "focus" };
+/**
+ * Resolves Up/Down/Enter against the subagent-picker keymap layered underneath the ordinary
+ * composer keymap: active only while the composer is empty and at least one Task entry is
+ * running (`runningCount`), which is exactly when plain Up/Down/Enter would otherwise be inert or
+ * merely recall prompt history — see the call site in `ChatTui`'s `useInput`, which checks this
+ * *before* history-navigation and vim-mode's own normal-mode motions so neither shadows it. Enter
+ * only resolves to `"focus"` un-shifted — Shift+Enter still inserts a newline everywhere else in
+ * the composer, focus mode doesn't change that. Returns `undefined` for every other key, and for
+ * these same keys the moment either gating condition stops holding, so the caller's existing
+ * handling (history recall, prompt submission) always applies unchanged in every other moment.
+ */
+export function resolveTaskPickerAction(key: Key, context: { readonly composerEmpty: boolean; readonly runningCount: number }): TaskPickerAction | undefined {
+  if (!context.composerEmpty || context.runningCount === 0) return undefined;
+  if (key.upArrow) return { type: "move", direction: -1 };
+  if (key.downArrow) return { type: "move", direction: 1 };
+  if (key.return && !key.shift) return { type: "focus" };
+  return undefined;
 }
 /** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
 export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
