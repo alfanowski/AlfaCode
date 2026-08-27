@@ -66,7 +66,7 @@ export interface ChatTuiOptions {
   readonly models: readonly ModelDescriptor[];
   readonly permissions: PermissionBroker;
   readonly loadUsage: () => Promise<UsageSummary>;
-  /** Render on the terminal's alternate screen buffer with a fixed-bottom composer, instead of the default scrolling layout. */
+  /** Render on the terminal's alternate screen buffer with a fixed-bottom composer, instead of the native-scrollback layout. Defaults to true; pass false (or --no-fullscreen on the CLI) to opt out. */
   readonly fullscreen?: boolean;
 }
 
@@ -183,13 +183,13 @@ export async function runChatTui(options: ChatTuiOptions): Promise<ChatAction> {
   let settled = false;
   const action = new Promise<ChatAction>((resolve) => { resolveAction = resolve; });
   const settle = (value: ChatAction): void => { if (!settled) { settled = true; resolveAction(value); } };
-  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, isScreenReaderEnabled: isScreenReaderMode(), ...(options.fullscreen ? { alternateScreen: true } : {}) });
+  const instance = render(<ChatTui {...options} resolveAction={settle} />, { exitOnCtrlC: false, patchConsole: false, isScreenReaderEnabled: isScreenReaderMode(), ...(options.fullscreen !== false ? { alternateScreen: true } : {}) });
   await instance.waitUntilExit();
   settle({ type: "exit" });
   return action;
 }
 
-function ChatTui({ session, identity, config, models, permissions, loadUsage, fullscreen = false, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
+function ChatTui({ session, identity, config, models, permissions, loadUsage, fullscreen = true, resolveAction }: ChatTuiOptions & { readonly resolveAction: (action: ChatAction) => void }): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [themeName, setThemeName] = useState<ThemeName>(() => resolveThemeName());
