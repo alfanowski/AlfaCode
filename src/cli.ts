@@ -382,7 +382,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
 
   const program = new Command();
   program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true)
-    .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer (default)", true)
+    .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer", true)
     .option("--no-fullscreen", "Render inline using the terminal's native scrollback instead of the alternate screen buffer")
     .option("--screen-reader", "Render a plain, linear, screen-reader-friendly UI (same as ALFACODE_SCREEN_READER=1)")
     .action(nativeLaunch);
