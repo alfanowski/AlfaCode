@@ -13,9 +13,11 @@ import {
   lastAssistantResponses,
   maxScrollOffsetRows,
   modelSupportsEffort,
+  mouseSelectionCopyText,
   nextEffortLevel,
   parseCopyCommand,
   reduceSdkMessage,
+  resolveInitialMouseCopyEnabled,
   resolveInitialVimMode,
   resolveLineEditorOperation,
   resolvePermissionModeAfterIdentity,
@@ -388,6 +390,38 @@ describe("vim mode initial config", () => {
     for (const truthy of ["1", "true", "TRUE", "yes", "on"]) {
       expect(resolveInitialVimMode({ ALFACODE_VIM_MODE: truthy })).toBe(true);
     }
+  });
+});
+
+describe("mouse-copy-on-select initial config", () => {
+  it("is on by default, and off only for recognized falsy ALFACODE_MOUSE_COPY values", () => {
+    expect(resolveInitialMouseCopyEnabled({})).toBe(true);
+    expect(resolveInitialMouseCopyEnabled({ ALFACODE_MOUSE_COPY: "nonsense" })).toBe(true);
+    for (const falsy of ["0", "false", "FALSE", "no", "off"]) {
+      expect(resolveInitialMouseCopyEnabled({ ALFACODE_MOUSE_COPY: falsy })).toBe(false);
+    }
+  });
+});
+
+describe("mouse-select clipboard payload", () => {
+  it("runs assistant text through markdownToPlainText but leaves other roles as-is", () => {
+    const items: readonly TranscriptItem[] = [
+      { id: "u1", role: "user", text: "plain user text" },
+      { id: "a1", role: "assistant", text: "**bold** response" },
+    ];
+    expect(mouseSelectionCopyText(items)).toBe("plain user text\n\nbold response");
+  });
+
+  it("joins multiple selected items with a blank line, oldest first", () => {
+    const items: readonly TranscriptItem[] = [
+      { id: "s1", role: "system", text: "first" },
+      { id: "t1", role: "tool", text: "second" },
+    ];
+    expect(mouseSelectionCopyText(items)).toBe("first\n\nsecond");
+  });
+
+  it("returns an empty string for no selected items", () => {
+    expect(mouseSelectionCopyText([])).toBe("");
   });
 });
 
