@@ -15,12 +15,13 @@ import { formatRelativeTime } from "./session-history.js";
 import { exportTranscript } from "./transcript-export.js";
 import type { UsageSummary } from "./usage-ledger.js";
 import { BackgroundTasksPanel, parseBackgroundTasksChanged, type BackgroundTask } from "./ui/background-tasks-panel.js";
-import { writeClipboardText } from "./ui/clipboard-copy.js";
+import { writeClipboardText, writeSystemClipboardText } from "./ui/clipboard-copy.js";
 import { mediaTypeForExtension, readClipboardImage } from "./ui/clipboard-image.js";
 import { detectDroppedPaths, resolveDroppedPaths, type DroppedPathCandidate } from "./ui/dropped-paths.js";
 import { editInput, splitAtCursor, type EditorState } from "./ui/input-editor.js";
 import { Markdown, markdownToPlainText, sanitizeTerminalText } from "./ui/markdown.js";
 import { activeMentionQuery, filterMentionEntries, insertMention, listMentionEntries, type MentionEntry } from "./ui/mentions.js";
+import { mouseSelectionRowSpan, parseSgrMouseSequence, reduceMouseSelection, resolveMouseSelectionItems, useMouseTrackingMode, type MouseSelectionSpan, type MouseSelectionTrackerState } from "./ui/mouse-select.js";
 import { useAnimationFrame, usePulse, useSpinner } from "./ui/motion.js";
 import { CompactWordmark, EmptyState, HintBar, KeyHint, panelBorder, ProgressBar, SectionTitle, StatusBadge } from "./ui/primitives.js";
 import {
@@ -129,6 +130,7 @@ const commands: readonly Command[] = [
   { name: "/spellcheck", description: "Toggle composer spell-check", shortcut: "on|off|checker|dictionary|color" },
   { name: "/notifications", description: "Toggle the turn-complete bell", shortcut: "on|off" },
   { name: "/copy", description: "Copy the last N assistant responses to the clipboard", shortcut: "[n]|on|off" },
+  { name: "/mousecopy", description: "Toggle copy-to-clipboard on mouse-drag select", shortcut: "on|off" },
   { name: "/clear", description: "Clear this transcript" },
   { name: "/help", description: "Show commands and shortcuts" },
   { name: "/exit", description: "Close AlfaCode" },
@@ -140,6 +142,21 @@ const defaultContextWarningThreshold = 80;
 export function resolveInitialVimMode(environment: NodeJS.ProcessEnv = process.env): boolean {
   const requested = environment.ALFACODE_VIM_MODE?.trim().toLowerCase();
   return requested === "1" || requested === "true" || requested === "yes" || requested === "on";
+}
+
+/**
+ * Same "no persisted config, env var + in-session `/command` toggle" pattern as
+ * `resolveInitialVimMode` above and `/notifications`' `ALFACODE_NOTIFY_BELL` — a plain boolean
+ * doesn't need its own settings file the way `/spellcheck` does (checker/dictionary/color are
+ * worth remembering together; this is one flag). Unlike vim mode and notifications, this defaults
+ * to *enabled*: copy-on-select is the entire point of the feature, so doing nothing out of the box
+ * would defeat it — the same reasoning `/copy` itself already uses for defaulting on (see the
+ * comment above `copyEnabled`'s `useState` below).
+ */
+export function resolveInitialMouseCopyEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const requested = environment.ALFACODE_MOUSE_COPY?.trim().toLowerCase();
+  if (requested === undefined) return true;
+  return requested !== "0" && requested !== "false" && requested !== "no" && requested !== "off";
 }
 
 /**
@@ -252,6 +269,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const [historySearch, setHistorySearch] = useState<{ readonly query: string; readonly index: number }>();
   const [vimEnabled, setVimEnabled] = useState(resolveInitialVimMode);
   const [vim, setVim] = useState<VimState>(createVimState);
+  const [mouseCopyEnabled, setMouseCopyEnabled] = useState(resolveInitialMouseCopyEnabled);
   const [mentionEntries, setMentionEntries] = useState<readonly MentionEntry[]>([]);
   const [mentionCursor, setMentionCursor] = useState(0);
   const [attachments, setAttachments] = useState<readonly ImageAttachment[]>([]);
@@ -276,10 +294,20 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   const toolBellTimers = useRef(new Map<string, NodeJS.Timeout>());
   const spellCheckStore = useMemo(() => new FileSpellCheckSettingsStore(defaultSpellCheckSettingsPath()), []);
   const spellCheckController = useRef<SpellCheckController | undefined>(undefined);
+  // In-flight mouse-drag selection (press seen, release not yet). A ref, not state: intermediate
+  // drag events happen far more often than anything that should trigger a re-render, and nothing
+  // renders differently while a drag is in progress — only a *completed* selection (via
+  // handleMouseSelectionComplete below) ever touches state, by appending a system message.
+  const mouseSelectionState = useRef<MouseSelectionTrackerState | undefined>(undefined);
   // Keeps width/height (and everything derived from them below) live across a terminal resize —
   // see useTerminalResize's doc comment. The generation counter itself is unused here; calling the
   // hook is what matters.
   useTerminalResize(stdout);
+  // Mouse SGR tracking-mode escape sequences: enabled on mount (and whenever /mousecopy flips this
+  // on), disabled on every teardown path — see useMouseTrackingMode's doc comment. The actual SGR
+  // reports are read via the existing useInput callback below, not here (see that module's doc for
+  // why a second, independent stdin listener would fight Ink's own input handling).
+  useMouseTrackingMode({ enabled: mouseCopyEnabled });
 
   const callableModels = useMemo(() => models.filter((model) => model.availability === "available" && model.capabilities.tools), [models]);
   const filteredModels = useMemo(() => {
@@ -460,6 +488,22 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
   useEffect(() => { spellCheckController.current?.setText(editor.value); }, [editor.value]);
 
   useInput((text, key) => {
+    // Mouse SGR reports (enabled only while mouseCopyEnabled — see useMouseTrackingMode above)
+    // arrive here as an ordinary, unrecognized-key `text` event: Ink's own key parser doesn't know
+    // about them, strips their leading ESC byte the same as any sequence it can't classify as a
+    // named key, and hands the rest through untouched (see parseSgrMouseSequence's doc comment for
+    // exactly how that was confirmed against Ink's source). Handling it here, first — before even
+    // the status-bar clear below — is the only way to keep a drag's coordinate bytes from otherwise
+    // falling through to the composer-insertion branch far below and being typed in as literal
+    // garbage — every other useInput listener would still fire independently since Ink fans this
+    // event out to all of them.
+    const mouseEvent = parseSgrMouseSequence(text);
+    if (mouseEvent !== undefined) {
+      const reduced = reduceMouseSelection(mouseSelectionState.current, mouseEvent);
+      mouseSelectionState.current = reduced.state;
+      if (reduced.completed !== undefined) handleMouseSelectionComplete(reduced.completed);
+      return;
+    }
     // A status-bar notice reads as "still relevant" only until the user does something else —
     // clear it unconditionally up front; any branch below that wants to show a fresh one calls
     // showStatus() later in this same handler, which simply overrides this with the new text (no
@@ -884,6 +928,7 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     if (name === "/spellcheck") { await handleSpellCheckCommand(command); return; }
     if (name === "/notifications") { handleNotificationsCommand(command); return; }
     if (name === "/copy") { handleCopyCommand(command); return; }
+    if (name === "/mousecopy") { handleMouseCopyCommand(command); return; }
     sendPrompt(command);
   }
   function handleNotificationsCommand(command: string): void {
@@ -892,6 +937,38 @@ function ChatTui({ session, identity, config, models, permissions, loadUsage, fu
     const bell = sub === "on" || (sub === undefined && !notificationSettings.bell);
     setNotificationSettings((current) => ({ ...current, bell }));
     showStatus(setStatusMessage, `Turn-complete bell: ${bell ? "on" : "off"}`);
+  }
+  function handleMouseCopyCommand(command: string): void {
+    const [, sub] = command.split(/\s+/u).filter((token) => token.length > 0);
+    if (sub !== undefined && sub !== "on" && sub !== "off") { showStatus(setStatusMessage, "Usage: /mousecopy [on|off]"); return; }
+    const enabled = sub === "on" || (sub === undefined && !mouseCopyEnabled);
+    setMouseCopyEnabled(enabled);
+    // A toggle mid-drag would otherwise leave a stale press cell behind for whatever comes next.
+    mouseSelectionState.current = undefined;
+    showStatus(setStatusMessage, `Copy on mouse-select: ${enabled ? "on" : "off"}`);
+  }
+  /**
+   * Resolves a completed mouse-drag span to whole rendered transcript items and writes them to the
+   * system clipboard — see mouse-select.ts's `resolveMouseSelectionItems` doc comment for exactly
+   * what granularity this gives you (message-level, not exact (row, col) → character mapping).
+   * Only meaningful on the chat screen: every other screen (models, providers, theme, ...) renders
+   * its own picker/list instead of the transcript, which this has no text mapping for at all — a
+   * drag there is deliberately a no-op rather than copying stale/unrelated transcript content.
+   */
+  function handleMouseSelectionComplete(span: MouseSelectionSpan): void {
+    if (!mouseCopyEnabled || screen !== "chat") return;
+    const rowSpan = mouseSelectionRowSpan(span);
+    const items = resolveMouseSelectionItems(visibleMessages, rowSpan, (item) => estimateItemRows(item, transcriptWidth));
+    const text = mouseSelectionCopyText(items);
+    if (text.trim().length === 0) return;
+    void writeSystemClipboardText(text)
+      .then((result) => {
+        const label = items.length === 1 ? "Copied selection to clipboard." : `Copied selection (${items.length} messages) to clipboard.`;
+        showStatus(setStatusMessage, result.truncated ? `${label} (truncated to fit terminal limits)` : label);
+      })
+      .catch((error: unknown) => {
+        showStatus(setStatusMessage, `Mouse-select copy failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
   }
   function handleCopyCommand(command: string): void {
     const parsed = parseCopyCommand(command);
@@ -1440,6 +1517,17 @@ export function parseCopyCommand(command: string): { readonly kind: "toggle"; re
 export function lastAssistantResponses(items: readonly TranscriptItem[], count: number): readonly string[] {
   const assistantTexts = items.filter((item) => item.role === "assistant").map((item) => item.text);
   return assistantTexts.slice(Math.max(0, assistantTexts.length - count));
+}
+/**
+ * Builds the mouse-copy-on-select clipboard payload from whole selected transcript items, oldest
+ * first. Assistant text is raw markdown source, so it goes through `markdownToPlainText` — the same
+ * treatment `/copy` already gives assistant responses (see `lastAssistantResponses` above), which
+ * also re-runs `sanitizeTerminalText` as a second pass. Every other role's `.text` is already plain,
+ * sanitized text by the time it lands in the transcript (see `appendSystem` and `reduceSdkMessage`),
+ * so it's used as-is.
+ */
+export function mouseSelectionCopyText(items: readonly TranscriptItem[]): string {
+  return items.map((item) => (item.role === "assistant" ? markdownToPlainText(item.text) : item.text)).join("\n\n");
 }
 /** Shared single-line text-editing keymap used by both the AskUserQuestion "Other" answer and the permission-decision note editor. */
 export function resolveLineEditorOperation(text: string, key: Key): Parameters<typeof editInput>[1] | undefined {
