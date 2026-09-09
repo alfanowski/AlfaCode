@@ -1,5 +1,5 @@
 import type { DynamicProviderDescriptorData } from "./models-dev-runtime.js";
-import { sanitizeTerminalText } from "./ui/markdown.js";
+import { sanitizeTerminalText } from "./terminal-ui.js";
 
 export interface ProviderDescriptor {
   readonly id: string;

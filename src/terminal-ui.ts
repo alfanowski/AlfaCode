@@ -66,3 +66,11 @@ function isTty(input: NodeJS.ReadableStream): boolean {
 export function requireInteractive(interactive: boolean): void {
   if (!interactive) throw new Error("This command requires an interactive terminal. Use --api-key-env for non-interactive setup.");
 }
+
+export function sanitizeTerminalText(value: string): string {
+  return value
+    .replace(/\u001B(?:\]|P|X|\^|_)[\s\S]*?(?:\u0007|\u001B\\)/gu, "")
+    .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/\u001B[@-_]/gu, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, "");
+}
