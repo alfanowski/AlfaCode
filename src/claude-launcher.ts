@@ -45,7 +45,6 @@ const inheritedSecretKeys = new Set([
   "VERTEX_REGION",
   "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-  "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
   "CLAUDE_CODE_DISABLE_1M_CONTEXT",
   "DISABLE_COMPACT",
   "DISABLE_AUTO_COMPACT",
@@ -125,6 +124,7 @@ const safeClaudeDefaults: Readonly<Record<string, string>> = {
   CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "0",
   CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
+  CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1",
 };
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {
@@ -144,12 +144,10 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
     if (normalized === "ANTHROPIC_CUSTOM_HEADERS" && !secretKeys.has(normalized)) continue;
     delete environment[key];
   }
-  Object.assign(environment, {
-    ANTHROPIC_BASE_URL: options.baseUrl,
-    ANTHROPIC_AUTH_TOKEN: options.authToken,
-    CLAUDE_CONFIG_DIR: options.configDir ?? join(homedir(), ".alfacode", "claude"),
-    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
-  });
+  if (options.baseUrl.length > 0) environment.ANTHROPIC_BASE_URL = options.baseUrl;
+  if (options.authToken.length > 0) environment.ANTHROPIC_AUTH_TOKEN = options.authToken;
+  environment.CLAUDE_CONFIG_DIR = options.configDir ?? join(homedir(), ".alfacode", "claude");
+  environment.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
   if (options.defaultModelId !== undefined) {
     environment.ANTHROPIC_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_OPUS_MODEL = options.defaultModelId;

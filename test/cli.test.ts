@@ -110,19 +110,23 @@ describe("createCli", () => {
     expect(closed).toBe(true);
   });
 
-  describe("default provider bootstrap", () => {
-    it("reports a ready status with the seeded provider from `doctor` on a fresh install", async () => {
-      const home = await mkdtemp(join(tmpdir(), "alfacode-cli-bootstrap-doctor-"));
-      directories.push(home);
-      const configStore = new ConfigStore({ homeDirectory: home });
-      const written: string[] = [];
-      const cli = createCli({ configStore, ui: fakeUi({ write: (message) => { written.push(message); } }) });
-
-      await cli.parseAsync(["node", "alfacode", "doctor"], { from: "node" });
-
-      expect(written.join("\n")).toContain("Status: ready");
-      expect(written.join("\n")).toContain("Default provider: zen");
-      expect((await configStore.read()).providers).toEqual([{ id: "zen", type: "opencode-zen", options: { catalogProviderId: "opencode" } }]);
+  it("skips the gateway entirely and launches plain claude when no provider is available", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-no-provider-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    let startRuntimeCalls = 0;
+    const launched: unknown[] = [];
+    const cli = createCli({
+      configStore,
+      keychain: { store: async () => undefined },
+      startRuntime: async () => { startRuntimeCalls += 1; return { baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }; },
+      launch: async (options) => { launched.push(options); return 0; },
+      ui: fakeUi(),
     });
+
+    await cli.parseAsync(["node", "alfacode", "--", "--print", "hi"], { from: "node" });
+    expect(startRuntimeCalls).toBe(0);
+    expect(launched).toEqual([{ claudeArgs: ["--print", "hi"], baseUrl: "", authToken: "" }]);
   });
+
 });

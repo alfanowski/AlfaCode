@@ -155,6 +155,11 @@ describe("launchClaude", () => {
     expect(result.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined();
   });
 
+  it("always disables unknown-model window enforcement, since every gateway model is unknown to claude's built-in catalog", () => {
+    const environment = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "http://127.0.0.1:1", authToken: "token" });
+    expect(environment.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT).toBe("1");
+  });
+
   it("refuses loose permissions on an existing config directory", async () => {
     const configDir = join(await privateTestRoot(), "claude");
     await mkdir(configDir, { mode: 0o700 });
