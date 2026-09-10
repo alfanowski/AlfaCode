@@ -145,8 +145,23 @@ export function createCli(options: CreateCliOptions = {}): Command {
     }
     try {
       for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
+      // claude's own default model alias (e.g. "sonnet") is meaningless to a gateway that only
+      // understands alfacode-anthropic/<provider>/<model> IDs, so without an explicit --model
+      // claude sends an alias the gateway can't decode and every request 400s ("Invalid model
+      // identifier") -- including claude's own built-in models, since the gateway has no way to
+      // know about them unless an "anthropic" provider is configured too. Pick a real, routable
+      // model ourselves whenever the caller didn't already choose one, so the launch always
+      // starts on something that works; /model switches to anything else at any time.
+      const hasExplicitModel = args.some((value) => value === "--model" || value === "-m" || value.startsWith("--model="));
+      const defaultCandidate = hasExplicitModel
+        ? undefined
+        : (runtime.modelCandidates ?? []).find((candidate) => candidate.availability === "available" && candidate.capabilities.tools);
+      if (defaultCandidate !== undefined) {
+        ui.write(`No --model given; starting on ${defaultCandidate.displayName}. Switch anytime with /model.`);
+      }
+      const claudeArgs = defaultCandidate === undefined ? args : ["--model", encodeModelId(defaultCandidate.providerId, defaultCandidate.id), ...args];
       const launchOptions: ClaudeLaunchOptions = {
-        claudeArgs: args,
+        claudeArgs,
         baseUrl: runtime.baseUrl,
         authToken: runtime.authToken,
         ...(runtime.secretEnvironmentNames === undefined ? {} : { scrubEnvironmentKeys: runtime.secretEnvironmentNames }),
