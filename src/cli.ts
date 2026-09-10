@@ -7,7 +7,6 @@ import { keychainService, MacOSKeychain } from "./secrets.js";
 import { startRuntime } from "./runtime.js";
 import { createTerminalUi, requireInteractive, type TerminalUi } from "./terminal-ui.js";
 import { descriptorsFromDynamicCatalog, providerDescriptors, type ProviderDescriptor } from "./provider-descriptors.js";
-import { UsageLedger, type UsageQuery, type UsageSummary } from "./usage-ledger.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
@@ -17,8 +16,6 @@ import type { ModelDescriptor } from "./providers/foundation/types.js";
 export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
-  readonly defaultModelId?: string;
-  readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   readonly modelCandidates?: readonly ModelDescriptor[];
   readonly warnings?: readonly string[];
@@ -34,16 +31,14 @@ export interface GatewayModel {
   readonly headroom?: { readonly contextWindowTokens?: number; readonly availableInputTokens?: number; readonly maxOutputTokens?: number };
 }
 
-export type StartRuntime = (input: { provider: ProviderRecord; config: AlfaCodeConfig; purpose?: "launch" | "discovery" }) => Promise<RuntimeHandle>;
-export type DiscoverModels = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<readonly GatewayModel[]>;
-export type QueryUsage = (query: UsageQuery) => Promise<UsageSummary>;
+export type StartRuntime = (input: { config: AlfaCodeConfig }) => Promise<RuntimeHandle>;
+export type DiscoverModels = (input: { config: AlfaCodeConfig }) => Promise<readonly GatewayModel[]>;
 
 export interface CreateCliOptions {
   readonly configStore?: ConfigStore;
   readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>;
   readonly startRuntime?: StartRuntime;
   readonly discoverModels?: DiscoverModels;
-  readonly queryUsage?: QueryUsage;
   readonly launch?: (options: ClaudeLaunchOptions) => Promise<number>;
   readonly ui?: TerminalUi;
   readonly legacyConfigPath?: string;
@@ -53,7 +48,6 @@ export interface CreateCliOptions {
 
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
 interface RemoveFlags { readonly deleteKeychain?: boolean; }
-interface UsageFlags { readonly json?: boolean; readonly provider?: string; readonly model?: string; readonly session?: string; readonly limit?: string; }
 
 export function createCli(options: CreateCliOptions = {}): Command {
   const configStore = options.configStore ?? new ConfigStore();
@@ -72,17 +66,11 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return configStore.read();
   };
 
-  const selectedProvider = async (config: AlfaCodeConfig, id?: string): Promise<ProviderRecord> => {
-    const provider = config.providers.find((item) => item.id === (id ?? config.defaultProviderId));
-    if (provider === undefined) throw new Error("No provider is selected. Run: alfacode connect google");
-    return provider;
-  };
-
-  const catalog = async (config: AlfaCodeConfig, provider?: ProviderRecord): Promise<readonly GatewayModel[]> => {
-    const selected = provider ?? await selectedProvider(config);
-    if (options.discoverModels !== undefined) return options.discoverModels({ provider: selected, config });
+  const catalog = async (config: AlfaCodeConfig, providerId?: string): Promise<readonly GatewayModel[]> => {
+    if (options.discoverModels !== undefined) return options.discoverModels({ config });
     if (runtimeStarter === undefined) throw new Error("Model discovery is not configured yet");
-    return discoverModelsFromGateway(runtimeStarter, { provider: selected, config });
+    const models = await discoverModelsFromGateway(runtimeStarter, { config });
+    return providerId === undefined ? models : models.filter((model) => decodeModelId(model.id)?.providerId === providerId);
   };
 
   const connect = async (type: string, flags: ConnectFlags): Promise<ProviderRecord> => {
@@ -114,45 +102,6 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return provider;
   };
 
-  const setDefaultModel = async (model: string): Promise<void> => {
-    const decoded = decodeModelId(model);
-    if (decoded === undefined) throw new Error("Use a model id from `alfacode models`, for example alfacode-anthropic/google/model-id");
-    await configStore.update((config) => {
-      const provider = config.providers.find((item) => item.id === decoded.providerId);
-      if (provider === undefined) throw new Error(`Provider not found: ${decoded.providerId}`);
-      return {
-        ...config,
-        defaultProviderId: provider.id,
-        providers: config.providers.map((item) => item.id === provider.id ? { ...item, options: { ...(item.options ?? {}), defaultModel: decoded.upstreamModel } } : item),
-      };
-    });
-    ui.write(`Default model: ${model}`);
-  };
-
-  const chooseDefaultModel = async (): Promise<void> => {
-    requireInteractive(ui.interactive);
-    const config = await loadConfig();
-    const models = await catalog(config);
-    const model = await ui.select("Choose the default model", models.map((item) => ({ value: item.id, label: item.displayName, hint: item.id })));
-    await setDefaultModel(model);
-  };
-
-  const clearDefaultModel = async (): Promise<void> => {
-    const config = await loadConfig();
-    const provider = await selectedProvider(config);
-    await configStore.update((current) => ({
-      ...current,
-      providers: current.providers.map((item) => {
-        if (item.id !== provider.id || item.options?.defaultModel === undefined) return item;
-        const { defaultModel: _pinnedModel, ...remainingOptions } = item.options;
-        if (Object.keys(remainingOptions).length > 0) return { ...item, options: remainingOptions };
-        const { options: _removedOptions, ...withoutOptions } = item;
-        return withoutOptions;
-      }),
-    }));
-    ui.write("Default model: automatic selection.");
-  };
-
   const classicLaunch = async (args: readonly string[]): Promise<void> => {
     const config = await loadConfig();
     if (config.providers.length === 0) {
@@ -160,16 +109,13 @@ export function createCli(options: CreateCliOptions = {}): Command {
       return;
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
-    const provider = await selectedProvider(config);
-    const runtime = await runtimeStarter({ provider, config });
+    const runtime = await runtimeStarter({ config });
     try {
       for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
       const launchOptions: ClaudeLaunchOptions = {
         claudeArgs: args,
         baseUrl: runtime.baseUrl,
         authToken: runtime.authToken,
-        ...(runtime.defaultModelId === undefined ? {} : { defaultModelId: runtime.defaultModelId }),
-        ...(runtime.contextWindowTokens === undefined ? {} : { contextWindowTokens: runtime.contextWindowTokens }),
         ...(runtime.secretEnvironmentNames === undefined ? {} : { scrubEnvironmentKeys: runtime.secretEnvironmentNames }),
       };
       process.exitCode = await (options.launch ?? launchClaude)(launchOptions);
@@ -216,33 +162,15 @@ export function createCli(options: CreateCliOptions = {}): Command {
     });
     ui.write(`Removed provider ${id}.${flags.deleteKeychain ? " Its AlfaCode Keychain item was deleted." : " Its credential was left untouched."}`);
   });
-  providers.command("default <id>").action(async (id: string) => {
-    await configStore.update((config) => {
-      if (!config.providers.some((item) => item.id === id)) throw new Error(`Provider not found: ${id}`);
-      return { ...config, defaultProviderId: id };
-    });
-    ui.write(`Default provider: ${id}`);
-  });
-
   const legacy = program.command("provider").description("Compatibility aliases for provider management");
   legacy.command("add <type>").option("--id <id>").option("--api-key-env <name>").option("--keychain").option("--base-url <url>").action(async (type: string, flags: ConnectFlags) => { await connect(type, flags); });
 
   program.command("models [provider]").option("--json", "Emit JSON").action(async (providerId: string | undefined, flags: { json?: boolean }) => {
     const config = await loadConfig();
-    const models = await catalog(config, await selectedProvider(config, providerId));
+    const models = await catalog(config, providerId);
     if (flags.json) return ui.write(JSON.stringify(models));
     if (models.length === 0) return ui.write("No models available.");
     for (const model of models) ui.write(renderModel(model));
-  });
-  program.command("default [model]").description("Pin a default model, or clear it with 'auto'").action(async (model: string | undefined) => {
-    if (model === undefined) await chooseDefaultModel();
-    else if (model === "auto") await clearDefaultModel();
-    else await setDefaultModel(model);
-  });
-  program.command("usage").option("--json", "Emit JSON").option("--provider <id>").option("--model <id>").option("--session <id>").option("--limit <count>").action(async (flags: UsageFlags) => {
-    const query = usageQuery(flags);
-    const summary = options.queryUsage === undefined ? await queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), query) : await options.queryUsage(query);
-    ui.write(flags.json ? JSON.stringify(summary) : renderUsage(summary));
   });
   program.command("doctor").option("--json", "Emit JSON").action(async (flags: { json?: boolean }) => {
     const config = await loadConfig();
@@ -255,8 +183,8 @@ export function createCli(options: CreateCliOptions = {}): Command {
   return program;
 }
 
-async function discoverModelsFromGateway(start: StartRuntime, input: { provider: ProviderRecord; config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
-  const runtime = await start({ ...input, purpose: "discovery" });
+async function discoverModelsFromGateway(start: StartRuntime, input: { config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
+  const runtime = await start(input);
   try {
     if (runtime.modelCandidates !== undefined) return runtime.modelCandidates.map(toGatewayModel);
     const response = await fetch(`${runtime.baseUrl}/v1/models`, { headers: { authorization: `Bearer ${runtime.authToken}` } });
@@ -339,38 +267,6 @@ function renderModel(model: GatewayModel): string {
   return `${model.id}\t${model.displayName}\tavailability:${availability}${capabilities}${quota}${headroom}`;
 }
 
-function usageQuery(flags: UsageFlags): UsageQuery {
-  const limit = flags.limit === undefined ? undefined : Number(flags.limit);
-  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) throw new Error("--limit must be a positive integer");
-  return {
-    ...(flags.provider === undefined ? {} : { providerId: flags.provider }),
-    ...(flags.model === undefined ? {} : { routeModelId: flags.model }),
-    ...(flags.session === undefined ? {} : { session: flags.session }),
-    ...(limit === undefined ? {} : { limit }),
-  };
-}
-
-async function queryUsageLedger(directory: string, query: UsageQuery): Promise<UsageSummary> {
-  const ledger = await UsageLedger.open(directory);
-  try {
-    return await ledger.query(query);
-  } finally {
-    await ledger.close();
-  }
-}
-
-function renderUsage(summary: UsageSummary): string {
-  const totals = summary.totals;
-  const lines = [
-    `Attempts: ${summary.attempts.length}`,
-    `Tokens: total ${totals.totalTokens} | input ${totals.inputTokens} | output ${totals.outputTokens} | cached ${totals.cachedInputTokens} | reasoning ${totals.reasoningTokens} | tools ${totals.toolTokens}`,
-  ];
-  for (const attempt of summary.attempts) {
-    lines.push(`${attempt.providerId}\t${attempt.routeModelId}\t${attempt.outcome}\tusage:${attempt.usageCompleteness}\ttokens:${attempt.totalTokens ?? "unknown"}`);
-  }
-  return lines.join("\n");
-}
-
 export async function main(argv = process.argv): Promise<void> {
   let dynamicDescriptors: readonly ProviderDescriptor[] = [];
   let catalog: Awaited<ReturnType<ModelsDevCatalogClient["load"]>>["catalog"] | undefined;
@@ -383,7 +279,7 @@ export async function main(argv = process.argv): Promise<void> {
   }
   await createCli({
     providerDescriptors: [...providerDescriptors, ...dynamicDescriptors],
-    startRuntime: (input) => startRuntime(input, catalog === undefined ? {} : { modelMetadata: createModelsDevMetadataResolver(catalog, input.config) }),
+    startRuntime: (input) => startRuntime({ config: input.config }, catalog === undefined ? {} : { modelMetadata: createModelsDevMetadataResolver(catalog, input.config) }),
   }).parseAsync(argv);
 }
 

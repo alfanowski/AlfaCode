@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createConfiguredProvider, startRuntime } from "../../src/runtime.js";
 import type { ProviderRecord } from "../../src/config.js";
-import { AutomaticModelSelector } from "../../src/model-selection.js";
 import { SecretResolver } from "../../src/secrets.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -74,22 +73,22 @@ describe("runtime provider factory", () => {
     expect(urls).toEqual(["https://example.invalid/v1/models", "https://example.invalid/v1/models/dynamic-model"]);
   });
 
-  it("sets Claude's context from the automatically selected model, never the smallest catalog entry", async () => {
+  it("merges every configured provider's candidates and reports per-provider warnings, without picking a default", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-runtime-"));
     const fake = () => ({
-      async listModels() { return [{ id: "small", displayName: "Small", contextWindow: 4096 }, { id: "selected", displayName: "Selected", contextWindow: 1_000_000 }]; },
+      async listModels() { return [{ id: "selected", displayName: "Selected", contextWindow: 1_000_000 }]; },
       async countTokens() { return 1; }, async *stream() {}, async close() {},
     });
     const metadata = { async resolve() { return { capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: false, reasoningState: "none" as const, nativeTokenCounting: true, jsonSchema: "subset" as const } }; } };
-    const selector = new AutomaticModelSelector({ quotaReporter: { async getQuota(candidate) { return { known: true as const, headroom: candidate.id === "selected" ? 1 : 0.5 }; } } });
     const record: ProviderRecord = { id: "google", type: "google", apiKey: { kind: "env", name: "TEST_KEY" } };
-    const runtime = await startRuntime({ provider: record, config: { version: 1, defaultProviderId: "google", providers: [record, { id: "broken", type: "catalog" }] } }, {
-      homeDirectory: home, secrets: new SecretResolver({ environment: { TEST_KEY: "secret" } }), createGoogle: () => fake() as never, modelMetadata: metadata, modelSelector: selector,
+    const runtime = await startRuntime({ config: { version: 1, providers: [record, { id: "broken", type: "catalog" }] } }, {
+      homeDirectory: home, secrets: new SecretResolver({ environment: { TEST_KEY: "secret" } }), createGoogle: () => fake() as never, modelMetadata: metadata,
     });
     try {
-      expect(runtime.defaultModelId).toContain("/selected");
-      expect(runtime.contextWindowTokens).toBe(1_000_000);
+      expect(runtime.modelCandidates.map((model) => model.id)).toEqual(["selected"]);
       expect(runtime.warnings).toEqual(["Provider 'broken' unavailable: no API key reference"]);
+      expect(runtime).not.toHaveProperty("defaultModelId");
+      expect(runtime).not.toHaveProperty("contextWindowTokens");
     } finally { await runtime.close(); await rm(home, { recursive: true, force: true }); }
   });
 });

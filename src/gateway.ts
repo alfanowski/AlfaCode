@@ -11,7 +11,6 @@ import {
   type ProviderMessageRequest,
   providerError,
 } from "./provider-contract.js";
-import { type AttemptOutcome, type UsageLedger } from "./usage-ledger.js";
 
 const MESSAGE_REQUEST = z.object({
   model: z.string().min(1),
@@ -30,9 +29,6 @@ export interface GatewayOptions {
   readonly token: string;
   readonly providers: readonly Provider[];
   readonly pingIntervalMs?: number;
-  readonly usageLedger?: UsageLedger;
-  readonly onProviderOutcome?: (outcome: { readonly providerId: string; readonly modelId: string; readonly statusCode: number; readonly retryAfter?: string | number }) => Promise<void> | void;
-  readonly selectFallback?: (failure: { readonly providerId: string; readonly modelId: string; readonly statusCode: number; readonly retryAfter?: string | number }) => Promise<{ readonly provider: Provider; readonly model: ProviderModel } | undefined>;
 }
 
 interface AnthropicErrorEnvelope {
@@ -100,47 +96,24 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       const abort = () => controller.abort();
       request.raw.once("aborted", abort);
       const context = providerContext(request, controller.signal);
-      let provider = resolved.provider;
-      let model = resolved.model;
-      let routeModelId = parsed.data.model;
-      const attemptedRoutes = new Set([routeModelId]);
+      const { provider, model } = resolved;
+      const routeModelId = parsed.data.model;
       try {
-        while (!controller.signal.aborted) {
-          const effectiveRequest = withAlfaCodeIdentity({ ...resolved.request, model: model.id }, provider, model);
-          const tracker = await startAttempt(options.usageLedger, provider, model, routeModelId, resolved.extendedContext, effectiveRequest, context);
-          try {
-            const response = await collectResponse(provider, effectiveRequest, context, async (usage) => tracker.observe(usage));
-            await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", true);
-            return { ...response, model: routeModelId };
-          } catch (error) {
-            await tracker.finish(controller.signal.aborted ? "cancelled" : "failed", false, errorClass(error));
-            if (controller.signal.aborted) return reply.code(499).send(anthropicError("cancelled_error", "Request cancelled"));
-            const normalized = normalizeProviderError(error);
-            if (isFailoverStatus(normalized.status)) {
-              const failure = { providerId: provider.id, modelId: model.id, statusCode: normalized.status, ...(normalized.retryAfter === undefined ? {} : { retryAfter: normalized.retryAfter }) };
-              await options.onProviderOutcome?.(failure);
-              const fallback = await options.selectFallback?.(failure);
-              const fallbackRoute = fallback === undefined ? undefined : encodeModelId(fallback.provider.id, fallback.model.id);
-              if (fallback !== undefined && fallbackRoute !== undefined && !attemptedRoutes.has(fallbackRoute)) {
-                provider = fallback.provider;
-                model = fallback.model;
-                routeModelId = fallbackRoute;
-                attemptedRoutes.add(fallbackRoute);
-                continue;
-              }
-            }
-            if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
-            return reply.code(normalized.status).send(normalized.body);
-          }
-        }
-        return reply.code(499).send(anthropicError("cancelled_error", "Request cancelled"));
+        const effectiveRequest = withAlfaCodeIdentity({ ...resolved.request, model: model.id }, provider, model);
+        const response = await collectResponse(provider, effectiveRequest, context, async () => undefined);
+        return { ...response, model: routeModelId };
+      } catch (error) {
+        if (controller.signal.aborted) return reply.code(499).send(anthropicError("cancelled_error", "Request cancelled"));
+        const normalized = normalizeProviderError(error);
+        if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
+        return reply.code(normalized.status).send(normalized.body);
       } finally {
         request.raw.removeListener("aborted", abort);
       }
     }
 
     reply.hijack();
-    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.extendedContext, resolved.request, pingIntervalMs, options.usageLedger, options.onProviderOutcome, options.selectFallback);
+    await streamResponse(reply.raw, request, resolved.provider, resolved.model, parsed.data.model, resolved.request, pingIntervalMs);
   });
 
   app.post("/v1/messages/count_tokens", async (request, reply) => {
@@ -161,7 +134,6 @@ export function createGatewayServer(options: GatewayOptions): FastifyInstance {
       return { input_tokens: usage.inputTokens };
     } catch (error) {
       const normalized = normalizeProviderError(error);
-      await recordProviderOutcome(options, resolved.provider.id, resolved.model.id, normalized.status, normalized.retryAfter);
       if (normalized.status === 429) reply.header("retry-after", retryAfterHeader(normalized.retryAfter));
       return reply.code(normalized.status).send(normalized.body);
     }
@@ -310,15 +282,11 @@ function resolveProviderRequest(
 async function streamResponse(
   response: ServerResponse,
   request: FastifyRequest,
-  initialProvider: Provider,
-  initialProviderModel: ProviderModel,
-  initialRouteModelId: string,
-  extendedContext: boolean,
-  initialProviderRequest: ProviderMessageRequest,
+  provider: Provider,
+  providerModel: ProviderModel,
+  routeModelId: string,
+  providerRequest: ProviderMessageRequest,
   pingIntervalMs: number,
-  ledger: UsageLedger | undefined,
-  onProviderOutcome: GatewayOptions["onProviderOutcome"],
-  selectFallback: GatewayOptions["selectFallback"],
 ): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -332,99 +300,47 @@ async function streamResponse(
   response.setHeader("x-accel-buffering", "no");
   const context = providerContext(request, controller.signal);
   let wireStarted = false;
-  let outputStarted = false;
-  let provider = initialProvider;
-  let providerModel = initialProviderModel;
-  let routeModelId = initialRouteModelId;
-  const attemptedRoutes = new Set([initialRouteModelId]);
   try {
-    while (!controller.signal.aborted) {
-      const providerRequest = withAlfaCodeIdentity(
-        { ...initialProviderRequest, model: providerModel.id },
-        provider,
-        providerModel,
-      );
-      const tracker = await startAttempt(ledger, provider, providerModel, routeModelId, extendedContext, providerRequest, context);
-      const iterator = provider.streamMessage(providerRequest, context)[Symbol.asyncIterator]();
-      let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
-      let attemptOutputStarted = false;
-      try {
-        while (!controller.signal.aborted) {
-          pendingNext ??= iterator.next();
-          const next = await nextOrPing(pendingNext, pingIntervalMs, controller.signal);
-          if (next === "ping") {
-            wireStarted = true;
-            await write(response, sse("ping", { type: "ping" }), controller.signal);
-            continue;
-          }
-          pendingNext = undefined;
-          if (next.done) {
-            await tracker.finish(tracker.hasFinalUsage ? "completed" : "partial", attemptOutputStarted);
-            return;
-          }
-          if (next.value.type === "usage") await tracker.observe(next.value.usage);
-          else {
-            wireStarted = true;
-            outputStarted = true;
-            attemptOutputStarted = true;
-            const event = next.value.type === "message_start"
-              ? { ...next.value, message: { ...next.value.message, model: routeModelId } } as CanonicalStreamEvent
-              : next.value;
-            await write(response, serializeEvent(event), controller.signal);
-          }
+    const effectiveRequest = withAlfaCodeIdentity({ ...providerRequest, model: providerModel.id }, provider, providerModel);
+    const iterator = provider.streamMessage(effectiveRequest, context)[Symbol.asyncIterator]();
+    let pendingNext: Promise<IteratorResult<CanonicalStreamEvent>> | undefined;
+    try {
+      while (!controller.signal.aborted) {
+        pendingNext ??= iterator.next();
+        const next = await nextOrPing(pendingNext, pingIntervalMs, controller.signal);
+        if (next === "ping") {
+          wireStarted = true;
+          await write(response, sse("ping", { type: "ping" }), controller.signal);
+          continue;
         }
-        await tracker.finish("cancelled", attemptOutputStarted);
-        return;
-      } catch (error) {
-        const normalized = normalizeProviderError(error);
-        await tracker.finish(controller.signal.aborted ? "cancelled" : attemptOutputStarted ? "partial" : "failed", attemptOutputStarted, errorClass(error));
-        if (controller.signal.aborted) return;
-        if (!outputStarted && isFailoverStatus(normalized.status)) {
-          const failure = {
-            providerId: provider.id,
-            modelId: providerModel.id,
-            statusCode: normalized.status,
-            ...(normalized.retryAfter === undefined ? {} : { retryAfter: normalized.retryAfter }),
-          } as const;
-          await onProviderOutcome?.(failure);
-          const fallback = await selectFallback?.(failure);
-          const fallbackRoute = fallback === undefined ? undefined : encodeModelId(fallback.provider.id, fallback.model.id);
-          if (fallback !== undefined && fallbackRoute !== undefined && !attemptedRoutes.has(fallbackRoute)) {
-            provider = fallback.provider;
-            providerModel = fallback.model;
-            routeModelId = fallbackRoute;
-            attemptedRoutes.add(fallbackRoute);
-            continue;
-          }
-        }
-        if (!wireStarted) {
-          response.statusCode = normalized.status;
-          if (normalized.status === 429) response.setHeader("retry-after", retryAfterHeader(normalized.retryAfter));
-          response.setHeader("content-type", "application/json; charset=utf-8");
-          response.end(JSON.stringify(normalized.body));
-        } else {
-          await write(response, sse("error", normalized.body), controller.signal).catch(() => undefined);
-        }
-        return;
-      } finally {
-        await iterator.return?.().catch(() => undefined);
+        pendingNext = undefined;
+        if (next.done) return;
+        if (next.value.type === "usage") continue;
+        wireStarted = true;
+        const event = next.value.type === "message_start"
+          ? { ...next.value, message: { ...next.value.message, model: routeModelId } } as CanonicalStreamEvent
+          : next.value;
+        await write(response, serializeEvent(event), controller.signal);
       }
+    } finally {
+      await iterator.return?.().catch(() => undefined);
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    const normalized = normalizeProviderError(error);
+    if (!wireStarted) {
+      response.statusCode = normalized.status;
+      if (normalized.status === 429) response.setHeader("retry-after", retryAfterHeader(normalized.retryAfter));
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.end(JSON.stringify(normalized.body));
+    } else {
+      await write(response, sse("error", normalized.body), controller.signal).catch(() => undefined);
     }
   } finally {
     request.raw.removeListener("aborted", abort);
     response.removeListener("close", abort);
     if (!response.writableEnded) response.end();
   }
-}
-
-async function recordProviderOutcome(options: GatewayOptions, providerId: string, modelId: string, status: number, retryAfter?: string | number): Promise<void> {
-  if (isFailoverStatus(status)) {
-    await options.onProviderOutcome?.({ providerId, modelId, statusCode: status, ...(retryAfter === undefined ? {} : { retryAfter }) });
-  }
-}
-
-function isFailoverStatus(status: number): boolean {
-  return status === 404 || status === 429 || status >= 500;
 }
 
 function providerContext(request: FastifyRequest, signal: AbortSignal): import("./provider-contract.js").ProviderRequestContext {
@@ -435,45 +351,6 @@ function providerContext(request: FastifyRequest, signal: AbortSignal): import("
     agent: headerValue(request.headers["x-claude-code-agent-id"]) ?? "main",
     ...(parentAgent === undefined ? {} : { parentAgent }),
   };
-}
-
-interface AttemptTracker {
-  readonly hasFinalUsage: boolean;
-  observe(usage: import("./provider-contract.js").UsageSnapshot): Promise<void>;
-  finish(outcome: AttemptOutcome, responseStarted: boolean, errorClass?: string): Promise<void>;
-}
-
-async function startAttempt(
-  ledger: UsageLedger | undefined,
-  provider: Provider,
-  model: ProviderModel,
-  routeModelId: string,
-  extendedContext: boolean,
-  request: ProviderMessageRequest,
-  context: ReturnType<typeof providerContext>,
-): Promise<AttemptTracker> {
-  if (ledger === undefined) {
-    return { hasFinalUsage: false, observe: async () => undefined, finish: async () => undefined };
-  }
-  const attempt = await ledger.start({
-    session: context.session, agent: context.agent, ...(context.parentAgent === undefined ? {} : { parentAgent: context.parentAgent }),
-    providerId: provider.id, routeModelId, upstreamModel: model.id, model, extendedContext,
-    ...(request.max_tokens === undefined ? {} : { requestedOutputTokens: request.max_tokens }),
-  });
-  let hasFinalUsage = false;
-  return {
-    get hasFinalUsage() { return hasFinalUsage; },
-    observe: async (usage) => {
-      if (usage.stage === "final") hasFinalUsage = true;
-      await ledger.observe(attempt, usage);
-    },
-    finish: async (outcome, responseStarted, error) => ledger.finish(attempt, outcome, responseStarted, error),
-  };
-}
-
-function errorClass(error: unknown): string {
-  const known = providerError(error);
-  return known?.kind ?? "api";
 }
 
 async function nextOrPing<T>(

@@ -1,13 +1,9 @@
 import { getEventListeners, once } from "node:events";
 import { request as httpRequest } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { createGatewayServer, listenLocalGateway } from "../src/gateway.js";
 import { decodeModelId, encodeModelId } from "../src/model-id.js";
 import type { CanonicalStreamEvent, Provider } from "../src/provider-contract.js";
-import { UsageLedger } from "../src/usage-ledger.js";
 
 const modelId = encodeModelId("mock", "claude-test");
 const events: readonly CanonicalStreamEvent[] = [
@@ -112,105 +108,6 @@ describe("Anthropic gateway", () => {
     });
     expect(decodeModelId("claude-test")).toBeUndefined();
     expect(decodeModelId("alfacode-anthropic/a/%ZZ")).toBeUndefined();
-  });
-
-  it("records final cumulative usage without emitting a private SSE event", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "alfacode-gateway-usage-"));
-    const ledger = await UsageLedger.open(directory);
-    const provider = fakeProvider({
-      async *streamMessage() {
-        yield events[0]!;
-        yield { type: "usage", usage: { semantics: "cumulative", stage: "interim", source: "provider", inputTokens: 2, outputTokens: 1 } };
-        yield { type: "usage", usage: { semantics: "cumulative", stage: "final", source: "provider", inputTokens: 2, outputTokens: 3, totalTokens: 5 } };
-        yield events[5]!;
-      },
-    });
-    const server = createGatewayServer({ token: "test-token", providers: [provider], usageLedger: ledger });
-    try {
-      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: { ...authorizedHeaders(), "x-claude-code-session-id": "session-private", "x-claude-code-agent-id": "subagent" }, payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
-      expect(response.body).not.toContain("event: usage");
-      expect((await ledger.query({ session: "session-private" })).attempts[0]).toMatchObject({ outcome: "completed", usageCompleteness: "final", inputTokens: 2, outputTokens: 3, totalTokens: 5 });
-    } finally {
-      await server.close();
-      await ledger.close();
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("records failed-before-output and partial-after-output attempts", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "alfacode-gateway-failures-"));
-    const ledger = await UsageLedger.open(directory);
-    const before = createGatewayServer({ token: "test-token", providers: [fakeProvider({
-      async *streamMessage() { throw { kind: "api", message: "upstream failed" }; },
-    })], usageLedger: ledger });
-    const after = createGatewayServer({ token: "test-token", providers: [fakeProvider({
-      async *streamMessage() { yield events[0]!; throw { kind: "api", message: "upstream failed" }; },
-    })], usageLedger: ledger });
-    try {
-      const payload = { model: modelId, messages: [], max_tokens: 10, stream: true };
-      expect((await before.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload })).statusCode).toBe(500);
-      const streamed = await after.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload });
-      expect(streamed.body).toContain("event: error");
-      expect((await ledger.query()).attempts.map((attempt) => attempt.outcome).sort()).toEqual(["failed", "partial"]);
-    } finally {
-      await before.close();
-      await after.close();
-      await ledger.close();
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("feeds live availability failures back to automatic selection", async () => {
-    const outcomes: Array<{ providerId: string; modelId: string; statusCode: number; retryAfter?: string | number }> = [];
-    const server = createGatewayServer({
-      token: "test-token",
-      providers: [fakeProvider({ async *streamMessage() { throw { kind: "rate_limit", message: "busy", statusCode: 429, retryAfter: 14_125 }; } })],
-      onProviderOutcome: async (outcome) => { outcomes.push(outcome); },
-    });
-    try {
-      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: modelId, messages: [], max_tokens: 10, stream: true } });
-      expect(response.statusCode).toBe(429);
-      expect(response.headers["retry-after"]).toBe("15");
-      expect(outcomes).toEqual([{ providerId: "mock", modelId: "claude-test", statusCode: 429, retryAfter: 14_125 }]);
-    } finally { await server.close(); }
-  });
-
-  it("fails over on an overloaded model before output even after keepalive pings", async () => {
-    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { await new Promise((resolve) => setTimeout(resolve, 10)); throw { kind: "overloaded", message: "busy", statusCode: 503 }; } });
-    let receivedByFallback: unknown;
-    const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }], async *streamMessage(request) { receivedByFallback = request; yield* events; } });
-    const failures: string[] = [];
-    const server = createGatewayServer({
-      token: "test-token", providers: [exhausted, healthy], pingIntervalMs: 1,
-      onProviderOutcome: async (failure) => { failures.push(`${failure.providerId}/${failure.modelId}`); },
-      selectFallback: async () => ({ provider: healthy, model: healthy.models[0]! }),
-    });
-    try {
-      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: encodeModelId("exhausted", "model-a"), messages: [], max_tokens: 10, stream: true } });
-      expect(response.statusCode).toBe(200);
-      expect(response.body).toContain("event: ping");
-      expect(response.body).toContain('"text":"hello"');
-      expect(response.body).toContain(`"model":"${encodeModelId("healthy", "model-b")}"`);
-      expect(failures).toEqual(["exhausted/model-a"]);
-      expect(systemText(receivedByFallback)).toContain('Active provider ID: "healthy"');
-      expect(systemText(receivedByFallback)).toContain('Active model ID: "model-b"');
-      expect(systemText(receivedByFallback)).not.toContain('Active model ID: "model-a"');
-    } finally { await server.close(); }
-  });
-
-  it("fails over non-streaming retries without returning a streamed response", async () => {
-    const exhausted = fakeProvider({ id: "exhausted", models: [{ id: "model-a" }], async *streamMessage() { throw { kind: "overloaded", message: "busy", statusCode: 503 }; } });
-    const healthy = fakeProvider({ id: "healthy", models: [{ id: "model-b" }] });
-    const server = createGatewayServer({
-      token: "test-token", providers: [exhausted, healthy],
-      selectFallback: async () => ({ provider: healthy, model: healthy.models[0]! }),
-    });
-    try {
-      const response = await server.inject({ method: "POST", url: "/v1/messages", headers: authorizedHeaders(), payload: { model: encodeModelId("exhausted", "model-a"), messages: [], max_tokens: 10, stream: false } });
-      expect(response.statusCode).toBe(200);
-      expect(response.headers["content-type"]).toContain("application/json");
-      expect(response.json()).toMatchObject({ model: encodeModelId("healthy", "model-b"), content: [{ text: "hello" }] });
-    } finally { await server.close(); }
   });
 
   it("forwards unknown fields and translates canonical events in exact SSE order", async () => {

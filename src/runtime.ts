@@ -13,7 +13,6 @@ import type {
   ProviderRequestContext,
   TokenCount,
 } from "./provider-contract.js";
-import { UsageLedger } from "./usage-ledger.js";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import { SecretResolver } from "./secrets.js";
 import { GoogleProvider } from "./providers/google/provider.js";
@@ -22,8 +21,6 @@ import { OpenAIChatAdapter, OpenAIResponsesAdapter } from "./providers/openai/in
 import { CompositeProvider } from "./providers/composite.js";
 import { discoverZenModels } from "./providers/zen/catalog.js";
 import { CAPABILITIES, type ModelDescriptor, type WireProtocol } from "./providers/foundation/types.js";
-import { AutomaticModelSelector, LedgerModelUsageHistory } from "./model-selection.js";
-import { FileModelSelectionStateStore } from "./model-selection-state.js";
 import type {
   AnthropicRequest as GoogleRequest,
   CanonicalStreamEvent as GoogleEvent,
@@ -33,29 +30,23 @@ import type {
 export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
-  readonly defaultModelId?: string;
   readonly modelCandidates: readonly ModelDescriptor[];
-  readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   readonly warnings?: readonly string[];
   close(): Promise<void>;
 }
 
 export interface StartRuntimeInput {
-  readonly provider: ProviderRecord;
   readonly config: AlfaCodeConfig;
-  readonly purpose?: "launch" | "discovery";
 }
 
 export interface RuntimeDependencies {
   readonly secrets?: SecretResolver;
   readonly homeDirectory?: string;
   readonly createGoogle?: (options: ConstructorParameters<typeof GoogleProvider>[0]) => GoogleProvider;
-  readonly usageLedger?: UsageLedger;
   readonly fetch?: typeof fetch;
   /** Optional account-independent catalog evidence (for example models.dev). */
   readonly modelMetadata?: DynamicModelMetadataResolver;
-  readonly modelSelector?: AutomaticModelSelector;
 }
 
 export interface DynamicModelMetadataResolver {
@@ -292,7 +283,6 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
   const secrets = dependencies.secrets ?? new SecretResolver();
   const homeDirectory = dependencies.homeDirectory ?? homedir();
   const providers: Provider[] = [];
-  const ledger = dependencies.usageLedger ?? await UsageLedger.open(join(homeDirectory, ".alfacode", "usage"));
 
   try {
     const candidates: ModelDescriptor[] = [];
@@ -300,8 +290,9 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
     for (const record of input.config.providers) {
       try {
         const anonymousZen = (record.type === "opencode-zen" || record.type === "zen") && record.apiKey === undefined;
-        if (record.apiKey === undefined && !anonymousZen) throw new Error("no API key reference");
-        const apiKey = anonymousZen ? "public" : await secrets.resolve(record.apiKey!);
+        const anonymousLocal = record.type === "ollama-local" && record.apiKey === undefined;
+        if (record.apiKey === undefined && !anonymousZen && !anonymousLocal) throw new Error("no API key reference");
+        const apiKey = anonymousZen ? "public" : anonymousLocal ? "ollama" : await secrets.resolve(record.apiKey!);
         if (apiKey === undefined || apiKey.length === 0) throw new Error("API key unavailable");
         const built = await createConfiguredProvider(record, apiKey, dependencies, homeDirectory);
         providers.push(built.provider);
@@ -311,62 +302,23 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       }
     }
 
-    const pinnedModel = typeof input.provider.options?.defaultModel === "string"
-      ? candidates.find((model) => model.providerId === input.provider.id && model.id === input.provider.options?.defaultModel
-        && model.availability === "available" && model.capabilities.tools)
-      : undefined;
-    let selectedModel: ModelDescriptor | undefined;
-    let activeSelector: AutomaticModelSelector | undefined;
-    if (input.purpose !== "discovery") {
-      const selector = dependencies.modelSelector ?? new AutomaticModelSelector({
-        usageHistory: new LedgerModelUsageHistory(ledger),
-        stateStore: new FileModelSelectionStateStore(join(homeDirectory, ".alfacode", "state", "model-selection.json")),
-      });
-      activeSelector = selector;
-      selectedModel = pinnedModel ?? (await selector.select(candidates, { streaming: true, tools: true })).selected;
-      if (selectedModel === undefined) throw new Error(`No dynamically discovered model is currently available with verified tool support${warnings.length === 0 ? "" : `. ${warnings.join("; ")}`}`);
-    }
-
     const authToken = randomBytes(32).toString("base64url");
-    for (const provider of providers) {
-      for (const model of provider.models) {
-        await ledger.registerModel(provider.id, encodeModelId(provider.id, model.id), model);
-      }
-    }
-    const gateway = await listenLocalGateway({
-      token: authToken,
-      providers,
-      usageLedger: ledger,
-      ...(activeSelector === undefined ? {} : {
-        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: number; retryAfter?: string | number }) => activeSelector.recordOutcome(outcome),
-        selectFallback: async () => {
-          const fallback = (await activeSelector.select(candidates, { streaming: true, tools: true })).selected;
-          if (fallback === undefined) return undefined;
-          const provider = providers.find((item) => item.id === fallback.providerId);
-          const model = provider?.models.find((item) => item.id === fallback.id);
-          return provider === undefined || model === undefined ? undefined : { provider, model };
-        },
-      }),
-    });
+    const gateway = await listenLocalGateway({ token: authToken, providers });
     let closed = false;
     return {
       baseUrl: gateway.address,
       authToken,
-      ...(selectedModel === undefined ? {} : { defaultModelId: encodeModelId(selectedModel.providerId, selectedModel.id) }),
       modelCandidates: candidates,
       ...(warnings.length === 0 ? {} : { warnings }),
-      ...(selectedModel?.contextWindow === undefined ? {} : { contextWindowTokens: selectedModel.contextWindow }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => {
         if (closed) return;
         closed = true;
         await gateway.app.close();
-        await ledger.close();
       },
     };
   } catch (error) {
     await Promise.allSettled(providers.map(async (provider) => provider.close()));
-    await ledger.close();
     throw error;
   }
 }
