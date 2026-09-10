@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createCli } from "../src/cli.js";
-import { ConfigStore } from "../src/config.js";
+import { ConfigStore, type AlfaCodeConfig } from "../src/config.js";
 import type { TerminalUi } from "../src/terminal-ui.js";
 
 const directories: string[] = [];
@@ -119,6 +119,7 @@ describe("createCli", () => {
     const cli = createCli({
       configStore,
       keychain: { store: async () => undefined },
+      probeOllamaLocal: async () => false,
       startRuntime: async () => { startRuntimeCalls += 1; return { baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }; },
       launch: async (options) => { launched.push(options); return 0; },
       ui: fakeUi(),
@@ -127,6 +128,42 @@ describe("createCli", () => {
     await cli.parseAsync(["node", "alfacode", "--", "--print", "hi"], { from: "node" });
     expect(startRuntimeCalls).toBe(0);
     expect(launched).toEqual([{ claudeArgs: ["--print", "hi"], baseUrl: "", authToken: "" }]);
+  });
+
+  it("adds a local Ollama provider automatically when it's reachable and not already configured", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-ollama-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    const seenConfigs: AlfaCodeConfig[] = [];
+    const cli = createCli({
+      configStore,
+      probeOllamaLocal: async () => true,
+      startRuntime: async (input) => { seenConfigs.push(input.config); return { baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }; },
+      launch: async () => 0,
+      ui: fakeUi(),
+    });
+
+    await cli.parseAsync(["node", "alfacode"], { from: "node" });
+    expect(seenConfigs[0]?.providers.map((provider) => provider.id)).toEqual(["ollama-local"]);
+    expect(await configStore.exists()).toBe(false);
+  });
+
+  it("does not duplicate an already-configured ollama-local provider", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-ollama-dup-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, providers: [{ id: "ollama-local", type: "ollama-local" }] });
+    const seenConfigs: AlfaCodeConfig[] = [];
+    const cli = createCli({
+      configStore,
+      probeOllamaLocal: async () => true,
+      startRuntime: async (input) => { seenConfigs.push(input.config); return { baseUrl: "http://gateway", authToken: "token", modelCandidates: [], close: async () => undefined }; },
+      launch: async () => 0,
+      ui: fakeUi(),
+    });
+
+    await cli.parseAsync(["node", "alfacode"], { from: "node" });
+    expect(seenConfigs[0]?.providers).toHaveLength(1);
   });
 
 });

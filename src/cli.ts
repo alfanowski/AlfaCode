@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
 import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
+import { ollamaLocalProviderRecord, probeOllamaLocal } from "./ollama-local.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -44,6 +45,7 @@ export interface CreateCliOptions {
   readonly legacyConfigPath?: string;
   /** Platform-supplied catalog; the bundled catalog is only a bootstrap fallback. */
   readonly providerDescriptors?: readonly ProviderDescriptor[];
+  readonly probeOllamaLocal?: () => Promise<boolean>;
 }
 
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
@@ -55,6 +57,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
   const runtimeStarter = options.startRuntime;
   const ui = options.ui ?? createTerminalUi();
   const descriptors = options.providerDescriptors ?? providerDescriptors;
+  const probeOllama = options.probeOllamaLocal ?? probeOllamaLocal;
   let migrationChecked = false;
 
   const loadConfig = async (): Promise<AlfaCodeConfig> => {
@@ -104,12 +107,15 @@ export function createCli(options: CreateCliOptions = {}): Command {
 
   const classicLaunch = async (args: readonly string[]): Promise<void> => {
     const config = await loadConfig();
-    if (config.providers.length === 0) {
+    const withOllama = config.providers.some((item) => item.type === "ollama-local")
+      ? config
+      : await probeOllama() ? { ...config, providers: [...config.providers, ollamaLocalProviderRecord()] } : config;
+    if (withOllama.providers.length === 0) {
       process.exitCode = await (options.launch ?? launchClaude)({ claudeArgs: args, baseUrl: "", authToken: "" });
       return;
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
-    const runtime = await runtimeStarter({ config });
+    const runtime = await runtimeStarter({ config: withOllama });
     try {
       for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
       const launchOptions: ClaudeLaunchOptions = {

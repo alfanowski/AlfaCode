@@ -73,6 +73,17 @@ describe("runtime provider factory", () => {
     expect(urls).toEqual(["https://example.invalid/v1/models", "https://example.invalid/v1/models/dynamic-model"]);
   });
 
+  it("discovers ollama-local without a base URL or API key", async () => {
+    const record: ProviderRecord = { id: "ollama-local", type: "ollama-local" };
+    const urls: string[] = [];
+    const built = await createConfiguredProvider(record, "ollama", {
+      fetch: async (input) => { urls.push(String(input)); return Response.json(String(input).endsWith("/models") ? { data: [{ id: "gemma4:31b" }] } : { id: "gemma4:31b" }); },
+      modelMetadata: { async resolve() { return { capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: false, reasoningState: "optional" as const, nativeTokenCounting: false, jsonSchema: "full" as const } }; } },
+    }, "/tmp/alfacode-test");
+    expect(built.descriptors[0]).toMatchObject({ id: "gemma4:31b", availability: "available" });
+    expect(urls[0]).toBe("http://localhost:11434/v1/models");
+  });
+
   it("merges every configured provider's candidates and reports per-provider warnings, without picking a default", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-runtime-"));
     const fake = () => ({

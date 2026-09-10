@@ -115,6 +115,11 @@ export async function createConfiguredProvider(record: ProviderRecord, apiKey: s
     const descriptors = await discoverConfiguredModels(record, apiKey, "openai-chat", baseUrl, dependencies);
     return { provider: createWireProvider({ id: record.id, apiKey, baseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
   }
+  if (record.type === "ollama-local") {
+    const localBaseUrl = baseUrl ?? "http://localhost:11434/v1";
+    const descriptors = await discoverConfiguredModels(record, apiKey, "openai-chat", localBaseUrl, dependencies);
+    return { provider: createWireProvider({ id: record.id, apiKey, baseUrl: localBaseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
+  }
   if (record.type === "opencode-zen" || record.type === "zen") {
     const zenBase = baseUrl ?? "https://opencode.ai/zen/v1";
     const listed = await discoverZenModels({ apiKey, baseUrl: zenBase, ...(dependencies.fetch === undefined ? {} : { fetch: dependencies.fetch }) });
