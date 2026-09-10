@@ -228,6 +228,100 @@ describe("Anthropic gateway", () => {
     }
   });
 
+  it("translates a non-streaming provider error into the Anthropic error envelope with the mapped status code", async () => {
+    const response = await app(fakeProvider({
+      async *streamMessage() { throw { kind: "not_found", message: "Model retired" }; },
+    })).inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 10, stream: false },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({ type: "error", error: { type: "not_found_error", message: "Model retired" } });
+  });
+
+  it("sets the retry-after header on a 429 for a non-streaming request", async () => {
+    const response = await app(fakeProvider({
+      async *streamMessage() { throw { kind: "rate_limit", message: "Slow down", retryAfter: 5_000 }; },
+    })).inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 10, stream: false },
+    });
+
+    expect(response.statusCode).toBe(429);
+    expect(response.headers["retry-after"]).toBe("5");
+    expect(response.json()).toEqual({ type: "error", error: { type: "rate_limit_error", message: "Slow down" } });
+  });
+
+  it("returns a JSON error status when a streaming request fails before any output", async () => {
+    const response = await app(fakeProvider({
+      async *streamMessage() { throw { kind: "overloaded", message: "Try later" }; },
+    })).inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 10, stream: true },
+    });
+
+    expect(response.statusCode).toBe(529);
+    expect(response.headers["content-type"]).toContain("application/json");
+    expect(response.json()).toEqual({ type: "error", error: { type: "overloaded_error", message: "Try later" } });
+  });
+
+  it("emits an SSE error event when a streaming request fails after output has already started", async () => {
+    const response = await app(fakeProvider({
+      async *streamMessage() {
+        yield events[0]!;
+        yield events[1]!;
+        throw { kind: "api", message: "Upstream broke mid-stream" };
+      },
+    })).inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 10, stream: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("event: error");
+    expect(response.body).toContain('"type":"api_error"');
+    expect(response.body).toContain('"message":"Upstream broke mid-stream"');
+  });
+
+  it("returns a 499 when a non-streaming client disconnects before the provider responds", async () => {
+    let rawRequest: import("node:http").IncomingMessage | undefined;
+    const provider = fakeProvider({
+      async *streamMessage(_request, context) {
+        await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => resolve(), { once: true }));
+        throw new Error("client gone");
+      },
+    });
+    const server = createGatewayServer({ token: "test-token", providers: [provider] });
+    openApps.push(server);
+    // Registered after createGatewayServer's own onRequest auth hook, so it observes only
+    // already-authorized requests, and captures the raw request so this test can simulate the
+    // underlying connection dropping (`request.raw.emit("aborted")`) without tearing down the
+    // in-memory injection socket that `.inject()` also needs to deliver the response back here.
+    server.addHook("onRequest", async (request) => { rawRequest = request.raw; });
+
+    const responsePromise = server.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: authorizedHeaders(),
+      payload: { model: modelId, messages: [], max_tokens: 1, stream: false },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    rawRequest?.emit("aborted");
+    const response = await responsePromise;
+
+    expect(response.statusCode).toBe(499);
+    expect(response.json()).toEqual({ type: "error", error: { type: "cancelled_error", message: "Request cancelled" } });
+  });
+
   it("removes per-chunk abort listeners after successful streaming", async () => {
     let signal: AbortSignal | undefined;
     const response = await app(fakeProvider({

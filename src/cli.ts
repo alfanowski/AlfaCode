@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
 import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
-import { ollamaLocalProviderRecord, probeOllamaLocal } from "./ollama-local.js";
+import { OLLAMA_LOCAL_PROVIDER_ID, ollamaLocalProviderRecord, probeOllamaLocal } from "./ollama-local.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
@@ -76,6 +76,18 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return providerId === undefined ? models : models.filter((model) => decodeModelId(model.id)?.providerId === providerId);
   };
 
+  /**
+   * Loads persisted config and, unless a provider already claims the reserved
+   * `ollama-local` id (of any `type` — a hand-configured record shadows the
+   * probe just as much as a previously auto-detected one), merges in an
+   * auto-detected local Ollama record. Never persisted back to disk.
+   */
+  const resolveLaunchConfig = async (): Promise<AlfaCodeConfig> => {
+    const config = await loadConfig();
+    if (config.providers.some((item) => item.id === OLLAMA_LOCAL_PROVIDER_ID)) return config;
+    return (await probeOllama()) ? { ...config, providers: [...config.providers, ollamaLocalProviderRecord()] } : config;
+  };
+
   const connect = async (type: string, flags: ConnectFlags): Promise<ProviderRecord> => {
     const descriptor = descriptors.find((item) => item.id === type);
     if (descriptor === undefined) throw new Error(`Unsupported provider type: ${type}. Use: ${descriptors.map((item) => item.id).join(", ")}`);
@@ -105,17 +117,28 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return provider;
   };
 
+  const passthroughLaunch = (args: readonly string[]): Promise<number> =>
+    (options.launch ?? launchClaude)({ claudeArgs: args, baseUrl: "", authToken: "" });
+
   const classicLaunch = async (args: readonly string[]): Promise<void> => {
-    const config = await loadConfig();
-    const withOllama = config.providers.some((item) => item.type === "ollama-local")
-      ? config
-      : await probeOllama() ? { ...config, providers: [...config.providers, ollamaLocalProviderRecord()] } : config;
-    if (withOllama.providers.length === 0) {
-      process.exitCode = await (options.launch ?? launchClaude)({ claudeArgs: args, baseUrl: "", authToken: "" });
+    const config = await resolveLaunchConfig();
+    if (config.providers.length === 0) {
+      process.exitCode = await passthroughLaunch(args);
       return;
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
-    const runtime = await runtimeStarter({ config: withOllama });
+    const runtime = await runtimeStarter({ config });
+    // A configured provider that resolved zero usable models (auth expired, no
+    // model pulled yet, etc.) leaves the gateway empty and useless to claude
+    // (nothing in /model, every request 404s) — fall back to plain claude
+    // exactly like the zero-provider case, instead of handing the user a
+    // gateway that cannot do anything.
+    if ((runtime.modelCandidates ?? []).length === 0) {
+      for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
+      await runtime.close();
+      process.exitCode = await passthroughLaunch(args);
+      return;
+    }
     try {
       for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
       const launchOptions: ClaudeLaunchOptions = {
@@ -147,8 +170,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     if (config.providers.length === 0) return ui.write("No providers configured.");
     for (const item of config.providers) {
       const secret = item.apiKey?.kind === "env" ? `env:${item.apiKey.name}` : item.apiKey?.kind === "keychain" ? `keychain:${item.apiKey.service}/${item.apiKey.account}` : "no credential";
-      const model = typeof item.options?.defaultModel === "string" ? ` default-model:${item.options.defaultModel}` : "";
-      ui.write(`${item.id}\t${item.type}\t${secret}${item.id === config.defaultProviderId ? "\tdefault-provider" : ""}${model}`);
+      ui.write(`${item.id}\t${item.type}\t${secret}${item.id === config.defaultProviderId ? "\tdefault-provider" : ""}`);
     }
   });
   providers.command("remove <id>").option("--delete-keychain", "Delete the AlfaCode Keychain item as well").action(async (id: string, flags: RemoveFlags) => {
@@ -172,15 +194,15 @@ export function createCli(options: CreateCliOptions = {}): Command {
   legacy.command("add <type>").option("--id <id>").option("--api-key-env <name>").option("--keychain").option("--base-url <url>").action(async (type: string, flags: ConnectFlags) => { await connect(type, flags); });
 
   program.command("models [provider]").option("--json", "Emit JSON").action(async (providerId: string | undefined, flags: { json?: boolean }) => {
-    const config = await loadConfig();
+    const config = await resolveLaunchConfig();
     const models = await catalog(config, providerId);
     if (flags.json) return ui.write(JSON.stringify(models));
     if (models.length === 0) return ui.write("No models available.");
     for (const model of models) ui.write(renderModel(model));
   });
   program.command("doctor").option("--json", "Emit JSON").action(async (flags: { json?: boolean }) => {
-    const config = await loadConfig();
-    const report = { configPath: configStore.path, providers: config.providers.map((provider) => ({ id: provider.id, type: provider.type, credential: provider.apiKey?.kind ?? "missing" })), defaultProviderId: config.defaultProviderId ?? null, isolatedClaudeConfig: `${configStore.homeDirectory}/.alfacode/claude`, status: config.providers.length > 0 ? "ready" : "setup-required" };
+    const config = await resolveLaunchConfig();
+    const report = { configPath: configStore.path, providers: config.providers.map((provider) => ({ id: provider.id, type: provider.type, credential: provider.apiKey?.kind ?? "missing" })), defaultProviderId: config.defaultProviderId ?? null, isolatedClaudeConfig: `${configStore.homeDirectory}/.alfacode/claude`, status: config.providers.length > 0 ? "ready" : "passthrough" };
     if (flags.json) return ui.write(JSON.stringify(report));
     ui.write(`Config: ${report.configPath}`); ui.write(`Providers: ${report.providers.length}`); ui.write(`Default provider: ${report.defaultProviderId ?? "not set"}`); ui.write(`Claude state: ${report.isolatedClaudeConfig}`); ui.write(`Status: ${report.status}`);
   });

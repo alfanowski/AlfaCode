@@ -129,6 +129,15 @@ const safeClaudeDefaults: Readonly<Record<string, string>> = {
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {
   const base = options.environment ?? process.env;
+  // No gateway means nothing non-standard is happening: hand claude the parent
+  // environment untouched (plus any caller-requested extraEnv) so bare alfacode
+  // behaves identically to running claude directly, including the user's own
+  // real Claude Code login/settings/history and their real ANTHROPIC_*/proxy
+  // configuration. The isolated-directory/scrub/safe-defaults logic below only
+  // makes sense once AlfaCode is actually routing traffic through its own gateway.
+  if (options.baseUrl.length === 0 && options.authToken.length === 0) {
+    return { ...base, ...options.extraEnv };
+  }
   const secretKeys = new Set([...inheritedSecretKeys, ...(options.scrubEnvironmentKeys ?? [])].map((key) => key.toUpperCase()));
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
@@ -161,11 +170,16 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
 }
 
 export async function launchClaude(options: ClaudeLaunchOptions): Promise<number> {
-  const configDirectory = options.configDir ?? join(homedir(), ".alfacode", "claude");
   if (options.contextWindowTokens !== undefined && (!Number.isSafeInteger(options.contextWindowTokens) || options.contextWindowTokens <= 0)) {
     throw new Error("contextWindowTokens must be a positive integer");
   }
-  await ensurePrivateDirectory(configDirectory);
+  // Passthrough mode (no gateway) never uses an isolated config directory, so
+  // there is nothing here to create or harden — see buildClaudeEnvironment.
+  const isPassthrough = options.baseUrl.length === 0 && options.authToken.length === 0;
+  if (!isPassthrough) {
+    const configDirectory = options.configDir ?? join(homedir(), ".alfacode", "claude");
+    await ensurePrivateDirectory(configDirectory);
+  }
   return (options.spawner ?? systemClaudeSpawner)({ command: options.claudePath ?? "claude", args: options.claudeArgs, env: buildClaudeEnvironment(options) });
 }
 

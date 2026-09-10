@@ -16,6 +16,7 @@ import type {
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import { SecretResolver } from "./secrets.js";
 import { GoogleProvider } from "./providers/google/provider.js";
+import { OLLAMA_LOCAL_BASE_URL } from "./ollama-local.js";
 import { AnthropicMessagesAdapter } from "./providers/anthropic/messages.js";
 import { OpenAIChatAdapter, OpenAIResponsesAdapter } from "./providers/openai/index.js";
 import { CompositeProvider } from "./providers/composite.js";
@@ -116,7 +117,7 @@ export async function createConfiguredProvider(record: ProviderRecord, apiKey: s
     return { provider: createWireProvider({ id: record.id, apiKey, baseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
   }
   if (record.type === "ollama-local") {
-    const localBaseUrl = baseUrl ?? "http://localhost:11434/v1";
+    const localBaseUrl = baseUrl ?? OLLAMA_LOCAL_BASE_URL;
     const descriptors = await discoverConfiguredModels(record, apiKey, "openai-chat", localBaseUrl, dependencies);
     return { provider: createWireProvider({ id: record.id, apiKey, baseUrl: localBaseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
   }
