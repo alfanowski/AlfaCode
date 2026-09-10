@@ -120,10 +120,14 @@ describe("createCli", () => {
         close: async () => { closed = true; },
       }),
       launch: async (options) => { launched.push(options); return 0; },
+      ui: fakeUi(),
     });
 
     await cli.parseAsync(["node", "alfacode", "launch", "--resume", "session-id", "-p", "hello"], { from: "node" });
-    expect(launched).toEqual([expect.objectContaining({ claudeArgs: ["--resume", "session-id", "-p", "hello"] })]);
+    // The gateway starts with one routable model and no --model was given, so the default-model
+    // fallback (tested in detail elsewhere) prepends one — everything after it must still be the
+    // caller's original, unmodified arguments.
+    expect(launched).toEqual([expect.objectContaining({ claudeArgs: ["--model", "alfacode-anthropic/google/gemini-3-pro", "--resume", "session-id", "-p", "hello"] })]);
     expect(launched).toEqual([expect.objectContaining({ scrubEnvironmentKeys: ["CUSTOM_KEY"] })]);
     expect(closed).toBe(true);
   });
@@ -255,6 +259,88 @@ describe("createCli", () => {
     expect(written).toContain("Warning: Provider 'ollama-local' unavailable: no discovered model passed the tool-calling availability filter");
     expect(launched).toEqual([{ claudeArgs: ["--print", "hi"], baseUrl: "", authToken: "" }]);
     expect(closed).toBe(true);
+  });
+
+  it("picks a routable default model when the gateway starts and no --model was given", async () => {
+    // Real-world repro: any configured provider without a matching "anthropic" provider (e.g.
+    // Google + Ollama Cloud, no direct Anthropic key). The gateway starts fine and has real
+    // routable models, but claude's own default alias (e.g. "sonnet") isn't a gateway-decodable
+    // ID, so every request 400s with "Invalid model identifier" — including claude's own built-in
+    // models, since the gateway has no way to proxy those without an "anthropic" provider. Picking
+    // a real routable model ourselves when the caller didn't pass --model avoids that crash.
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-default-model-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, providers: [{ id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } }] });
+    const written: string[] = [];
+    const launched: unknown[] = [];
+    const cli = createCli({
+      configStore,
+      probeOllamaLocal: async () => false,
+      startRuntime: async () => ({
+        baseUrl: "http://gateway",
+        authToken: "token",
+        modelCandidates: [{
+          providerId: "google",
+          id: "gemini-3.1-flash-lite-preview",
+          displayName: "Gemini 3.1 Flash Lite Preview",
+          wireProtocol: "gemini-generate-content",
+          capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: true, reasoningState: "optional", nativeTokenCounting: true, jsonSchema: "subset" },
+          availability: "available",
+          support: "best-effort",
+        }],
+        routableModelCount: 1,
+        close: async () => undefined,
+      }),
+      launch: async (options) => { launched.push(options); return 0; },
+      ui: fakeUi({ write: (message) => { written.push(message); } }),
+    });
+
+    await cli.parseAsync(["node", "alfacode", "--", "--print", "hi"], { from: "node" });
+    expect(written).toContain("No --model given; starting on Gemini 3.1 Flash Lite Preview. Switch anytime with /model.");
+    expect(launched).toEqual([{
+      claudeArgs: ["--model", "alfacode-anthropic/google/gemini-3.1-flash-lite-preview", "--print", "hi"],
+      baseUrl: "http://gateway",
+      authToken: "token",
+    }]);
+  });
+
+  it("does not override an explicit --model when the gateway starts", async () => {
+    const home = await mkdtemp(join(tmpdir(), "alfacode-cli-explicit-model-"));
+    directories.push(home);
+    const configStore = new ConfigStore({ homeDirectory: home });
+    await configStore.write({ version: 1, providers: [{ id: "google", type: "google", apiKey: { kind: "keychain", service: "alfacode", account: "google" } }] });
+    const written: string[] = [];
+    const launched: unknown[] = [];
+    const cli = createCli({
+      configStore,
+      probeOllamaLocal: async () => false,
+      startRuntime: async () => ({
+        baseUrl: "http://gateway",
+        authToken: "token",
+        modelCandidates: [{
+          providerId: "google",
+          id: "gemini-3.1-flash-lite-preview",
+          displayName: "Gemini 3.1 Flash Lite Preview",
+          wireProtocol: "gemini-generate-content",
+          capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: true, reasoningState: "optional", nativeTokenCounting: true, jsonSchema: "subset" },
+          availability: "available",
+          support: "best-effort",
+        }],
+        routableModelCount: 1,
+        close: async () => undefined,
+      }),
+      launch: async (options) => { launched.push(options); return 0; },
+      ui: fakeUi({ write: (message) => { written.push(message); } }),
+    });
+
+    await cli.parseAsync(["node", "alfacode", "--", "--model", "alfacode-anthropic/google/gemini-3.1-flash-lite-preview", "--print", "hi"], { from: "node" });
+    expect(written.some((line) => line.startsWith("No --model given"))).toBe(false);
+    expect(launched).toEqual([{
+      claudeArgs: ["--model", "alfacode-anthropic/google/gemini-3.1-flash-lite-preview", "--print", "hi"],
+      baseUrl: "http://gateway",
+      authToken: "token",
+    }]);
   });
 
   it("alfacode doctor sees the auto-detected local Ollama provider instead of reporting passthrough", async () => {
