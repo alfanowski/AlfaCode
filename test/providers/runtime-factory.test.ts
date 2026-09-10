@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createConfiguredProvider, startRuntime } from "../../src/runtime.js";
 import type { ProviderRecord } from "../../src/config.js";
-import { AutomaticModelSelector } from "../../src/model-selection.js";
 import { SecretResolver } from "../../src/secrets.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -74,22 +73,52 @@ describe("runtime provider factory", () => {
     expect(urls).toEqual(["https://example.invalid/v1/models", "https://example.invalid/v1/models/dynamic-model"]);
   });
 
-  it("sets Claude's context from the automatically selected model, never the smallest catalog entry", async () => {
+  it("discovers ollama-local without a base URL or API key", async () => {
+    const record: ProviderRecord = { id: "ollama-local", type: "ollama-local" };
+    const urls: string[] = [];
+    const built = await createConfiguredProvider(record, "ollama", {
+      fetch: async (input) => { urls.push(String(input)); return Response.json(String(input).endsWith("/models") ? { data: [{ id: "gemma4:31b" }] } : { id: "gemma4:31b" }); },
+      modelMetadata: { async resolve() { return { capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: false, reasoningState: "optional" as const, nativeTokenCounting: false, jsonSchema: "full" as const } }; } },
+    }, "/tmp/alfacode-test");
+    expect(built.descriptors[0]).toMatchObject({ id: "gemma4:31b", availability: "available" });
+    expect(urls[0]).toBe("http://localhost:11434/v1/models");
+  });
+
+  it("merges every configured provider's candidates and reports per-provider warnings, without picking a default", async () => {
     const home = await mkdtemp(join(tmpdir(), "alfacode-runtime-"));
     const fake = () => ({
-      async listModels() { return [{ id: "small", displayName: "Small", contextWindow: 4096 }, { id: "selected", displayName: "Selected", contextWindow: 1_000_000 }]; },
+      async listModels() { return [{ id: "selected", displayName: "Selected", contextWindow: 1_000_000 }]; },
       async countTokens() { return 1; }, async *stream() {}, async close() {},
     });
     const metadata = { async resolve() { return { capabilities: { streaming: true, tools: true, parallelTools: true, forcedToolChoice: true, vision: false, reasoningState: "none" as const, nativeTokenCounting: true, jsonSchema: "subset" as const } }; } };
-    const selector = new AutomaticModelSelector({ quotaReporter: { async getQuota(candidate) { return { known: true as const, headroom: candidate.id === "selected" ? 1 : 0.5 }; } } });
     const record: ProviderRecord = { id: "google", type: "google", apiKey: { kind: "env", name: "TEST_KEY" } };
-    const runtime = await startRuntime({ provider: record, config: { version: 1, defaultProviderId: "google", providers: [record, { id: "broken", type: "catalog" }] } }, {
-      homeDirectory: home, secrets: new SecretResolver({ environment: { TEST_KEY: "secret" } }), createGoogle: () => fake() as never, modelMetadata: metadata, modelSelector: selector,
+    const runtime = await startRuntime({ config: { version: 1, providers: [record, { id: "broken", type: "catalog" }] } }, {
+      homeDirectory: home, secrets: new SecretResolver({ environment: { TEST_KEY: "secret" } }), createGoogle: () => fake() as never, modelMetadata: metadata,
     });
     try {
-      expect(runtime.defaultModelId).toContain("/selected");
-      expect(runtime.contextWindowTokens).toBe(1_000_000);
+      expect(runtime.modelCandidates.map((model) => model.id)).toEqual(["selected"]);
       expect(runtime.warnings).toEqual(["Provider 'broken' unavailable: no API key reference"]);
+      expect(runtime).not.toHaveProperty("defaultModelId");
+      expect(runtime).not.toHaveProperty("contextWindowTokens");
+    } finally { await runtime.close(); await rm(home, { recursive: true, force: true }); }
+  });
+
+  it("reports zero routable models when every discovered candidate fails the availability/tools filter", async () => {
+    // Reproduces a real local Ollama daemon: models.dev has no verified tool-calling entry for the
+    // pulled tags, so discovery returns non-empty raw candidates that are all availability:"unknown"
+    // (or "deprecated") and therefore never make it into a Provider's routable `models` list.
+    const home = await mkdtemp(join(tmpdir(), "alfacode-runtime-unroutable-"));
+    const record: ProviderRecord = { id: "ollama-local", type: "ollama-local" };
+    const fetchMock = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/models")) return Response.json({ data: [{ id: "llama3.2:3b" }, { id: "qwen2.5-coder:7b" }] });
+      return Response.json({ id: "unused" });
+    };
+    const runtime = await startRuntime({ config: { version: 1, providers: [record] } }, { homeDirectory: home, fetch: fetchMock });
+    try {
+      expect(runtime.modelCandidates.length).toBeGreaterThan(0);
+      expect(runtime.modelCandidates.every((model) => model.availability !== "available")).toBe(true);
+      expect(runtime.routableModelCount).toBe(0);
     } finally { await runtime.close(); await rm(home, { recursive: true, force: true }); }
   });
 });

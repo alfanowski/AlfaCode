@@ -2,29 +2,45 @@
 
 ## Runtime topology
 
+`alfacode` is a thin launcher: it never renders its own UI or embeds an
+inference engine. It decides whether a gateway is needed, then execs the
+real, unmodified `claude` binary and lets it render its own terminal UI.
+
 ```text
 alfacode CLI
   ├─ loads non-secret provider configuration
+  ├─ probes localhost:11434 for a zero-config local Ollama
   ├─ resolves credentials from the OS keychain or environment
-  ├─ starts a loopback-only gateway on an ephemeral port
-  └─ renders the AlfaCode Ink TUI over the pinned Claude Agent SDK
-       └─ starts the embedded Claude Code engine
+  ├─ if no provider resolves any usable model: exec `claude` with the
+  │    parent environment untouched (bare passthrough — see below)
+  └─ otherwise: starts a loopback-only gateway on an ephemeral port,
+       then execs `claude` with
        ├─ CLAUDE_CONFIG_DIR=~/.alfacode/claude
        ├─ ANTHROPIC_BASE_URL=http://127.0.0.1:<port>
        ├─ ANTHROPIC_AUTH_TOKEN=<ephemeral token>
        └─ CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-The engine sends Anthropic Messages API traffic to a single endpoint. The gateway aggregates model catalogs and routes each inference request using the AlfaCode model picker or automatic selector.
+In gateway mode, `claude` sends Anthropic Messages API traffic to that single
+loopback endpoint, and the gateway aggregates the model catalogs of every
+configured (and auto-detected) provider behind it. Model choice is entirely
+`claude`'s own `/model` — alfacode does not rank, pin, or fail over between
+models or providers.
 
-## Dynamic catalog and selection
+In passthrough mode (no provider resolved any usable model), `buildClaudeEnvironment`
+returns the parent process environment untouched, plus any caller-supplied
+`extraEnv`: no isolated `CLAUDE_CONFIG_DIR`, no credential/proxy scrubbing, no
+gateway env vars. Bare `alfacode` with nothing configured, or with a
+configured provider that turned out to have zero usable models, behaves
+identically to running `claude` directly.
+
+## Dynamic catalog
 
 - Provider-owned account catalogs are authoritative for additions and removals.
 - AlfaCode verifies availability with non-inference endpoints before routing.
-- models.dev supplies refreshable protocol/capability metadata, never credentials or a default-model policy.
-- Selection never parses a model ID, version, display name, or catalog position. Known normalized quota headroom wins; otherwise the privacy-preserving local usage ledger prioritizes routes already proven compatible and fairly schedules comparable candidates.
-- Provider 404/429/retryable-5xx outcomes persist into future selection. Before any response bytes are emitted, AlfaCode transparently fails over to an untried eligible route; an exhausted catalog returns the upstream error instead of looping.
-- The context limit passed to Claude Code belongs to the selected model. It is never the smallest unrelated entry in a heterogeneous provider catalog.
+- models.dev supplies refreshable protocol/capability metadata, never credentials.
+- AlfaCode never parses a model ID, version, display name, or catalog position to guess a protocol or a default model. There is no automatic selection or failover between providers; `claude`'s own `/model` picks manually, and a failing model or provider is worked around by switching models by hand.
+- The context limit `claude` sees for a model comes from that model's own catalog entry, reported by the gateway's `/v1/models`.
 
 ## Model identifiers
 
@@ -38,14 +54,12 @@ The prefix is a compatibility marker, not a claim that the upstream model is an 
 
 ## Components
 
-### Agent session
+### Launcher (`src/cli.ts`, `src/claude-launcher.ts`)
 
-- Uses process-local environment overrides only.
-- Keeps AlfaCode sessions and settings separate through `CLAUDE_CONFIG_DIR`.
-- Scrubs inherited provider-selection and API-key variables from the child process.
-- Uses the official Agent SDK streaming-input contract and its Claude Code system/tool presets.
-- Forwards permissions, partial output, tool calls, task/subagent events, interrupts, sessions, and model changes to the native UI.
-- Exact-pins the SDK and embedded engine version and stops the gateway with the session.
+- `classicLaunch` loads configuration, probes for a local Ollama, and decides whether a gateway is needed.
+- In gateway mode, the child process gets only a process-local environment override: an isolated `CLAUDE_CONFIG_DIR` keeps AlfaCode's own sessions and settings separate from the user's normal Claude Code state, and inherited provider-selection, API-key, and proxy variables are scrubbed so `claude` cannot silently fall back to the user's own credentials instead of the gateway's.
+- In passthrough mode, none of the above applies — see Runtime topology.
+- `claude` is spawned with inherited stdio; alfacode forwards nothing else and renders nothing itself. The gateway stops when `claude` exits, and alfacode exits with `claude`'s own exit code.
 
 ### Gateway
 
@@ -53,7 +67,7 @@ The prefix is a compatibility marker, not a claim that the upstream model is an 
 - Requires a high-entropy per-process credential.
 - Implements `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, and `/api/hello`.
 - Streams Anthropic SSE events without buffering a complete response.
-- Propagates client cancellation and never retries after response bytes have been emitted.
+- Propagates client cancellation (a non-streaming abort returns 499) and translates provider errors into the Anthropic error envelope, with a `retry-after` header on 429. There is no retry or failover — a single failed request surfaces to `claude` as a translated error, once as `application/json` if it fails before any output, or as an `event: error` SSE frame if streaming output had already started.
 - Logs request metadata only; prompts and responses are disabled by default.
 
 ### Provider contract

@@ -7,26 +7,20 @@ import { keychainService, MacOSKeychain } from "./secrets.js";
 import { startRuntime } from "./runtime.js";
 import { createTerminalUi, requireInteractive, type TerminalUi } from "./terminal-ui.js";
 import { descriptorsFromDynamicCatalog, providerDescriptors, type ProviderDescriptor } from "./provider-descriptors.js";
-import { UsageLedger, type UsageQuery, type UsageSummary } from "./usage-ledger.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { ModelsDevCatalogClient } from "./models-dev-catalog.js";
 import { createModelsDevMetadataResolver, dynamicProviderDescriptors } from "./models-dev-runtime.js";
 import type { ModelDescriptor } from "./providers/foundation/types.js";
-import { runProviderSetup, type ProviderSetupOptions, type ProviderSetupResult } from "./setup-tui.js";
-import { AgentSession, type AgentSessionIdentity } from "./agent-session.js";
-import { PermissionBroker } from "./permission-broker.js";
-import { runChatTui, type ChatAction } from "./chat-tui.js";
-import { pendingEngineCompatibility } from "./engine-compatibility.js";
-import { describeSessionPickerEntry, listRecentSessions, resolveResumeTarget, type SessionPickerEntry, type SessionsBackend } from "./session-history.js";
+import { OLLAMA_LOCAL_PROVIDER_ID, ollamaLocalProviderRecord, probeOllamaLocal } from "./ollama-local.js";
 
 export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
-  readonly defaultModelId?: string;
-  readonly contextWindowTokens?: number;
   readonly secretEnvironmentNames?: readonly string[];
   readonly modelCandidates?: readonly ModelDescriptor[];
+  /** Count of models actually wired into the gateway (not just discovered) — see runtime.ts. */
+  readonly routableModelCount?: number;
   readonly warnings?: readonly string[];
   close(): Promise<void>;
 }
@@ -40,32 +34,24 @@ export interface GatewayModel {
   readonly headroom?: { readonly contextWindowTokens?: number; readonly availableInputTokens?: number; readonly maxOutputTokens?: number };
 }
 
-export type StartRuntime = (input: { provider: ProviderRecord; config: AlfaCodeConfig; purpose?: "launch" | "discovery" }) => Promise<RuntimeHandle>;
-export type DiscoverModels = (input: { provider: ProviderRecord; config: AlfaCodeConfig }) => Promise<readonly GatewayModel[]>;
-export type QueryUsage = (query: UsageQuery) => Promise<UsageSummary>;
+export type StartRuntime = (input: { config: AlfaCodeConfig }) => Promise<RuntimeHandle>;
+export type DiscoverModels = (input: { config: AlfaCodeConfig }) => Promise<readonly GatewayModel[]>;
 
 export interface CreateCliOptions {
   readonly configStore?: ConfigStore;
   readonly keychain?: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>;
   readonly startRuntime?: StartRuntime;
   readonly discoverModels?: DiscoverModels;
-  readonly queryUsage?: QueryUsage;
   readonly launch?: (options: ClaudeLaunchOptions) => Promise<number>;
   readonly ui?: TerminalUi;
   readonly legacyConfigPath?: string;
   /** Platform-supplied catalog; the bundled catalog is only a bootstrap fallback. */
   readonly providerDescriptors?: readonly ProviderDescriptor[];
-  readonly providerSetup?: (options: ProviderSetupOptions) => Promise<void>;
-  readonly startAgentSession?: typeof AgentSession.start;
-  readonly chatTui?: typeof runChatTui;
-  /** Overrides the SDK-backed session source used to resolve `--resume`/list `sessions`; for tests. */
-  readonly sessionsBackend?: SessionsBackend;
+  readonly probeOllamaLocal?: () => Promise<boolean>;
 }
 
 interface ConnectFlags { readonly id?: string; readonly apiKeyEnv?: string; readonly keychain?: boolean; readonly baseUrl?: string; }
 interface RemoveFlags { readonly deleteKeychain?: boolean; }
-interface UsageFlags { readonly json?: boolean; readonly provider?: string; readonly model?: string; readonly session?: string; readonly limit?: string; }
-interface NativeLaunchFlags { readonly fullscreen?: boolean; readonly screenReader?: boolean; }
 
 export function createCli(options: CreateCliOptions = {}): Command {
   const configStore = options.configStore ?? new ConfigStore();
@@ -73,6 +59,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
   const runtimeStarter = options.startRuntime;
   const ui = options.ui ?? createTerminalUi();
   const descriptors = options.providerDescriptors ?? providerDescriptors;
+  const probeOllama = options.probeOllamaLocal ?? probeOllamaLocal;
   let migrationChecked = false;
 
   const loadConfig = async (): Promise<AlfaCodeConfig> => {
@@ -84,35 +71,23 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return configStore.read();
   };
 
-  /**
-   * A brand-new install has no config file at all yet — distinct from a config file that exists
-   * but currently has zero providers, which means a user deliberately removed every provider and
-   * must never be silently repopulated. `configStore.exists()` is what carries that distinction:
-   * unlike `read()`, which falls back to an in-memory empty config either way, `exists()` is false
-   * only when the file is genuinely absent. In that case only, seed the exact anonymous Zen
-   * provider record `saveTuiProvider` writes for "Free public models" (no API key, no account),
-   * so a fresh install is immediately usable without the blocking setup wizard.
-   */
-  const bootstrapDefaultProvider = async (config: AlfaCodeConfig): Promise<AlfaCodeConfig> => {
-    if (config.providers.length > 0 || await configStore.exists()) return config;
-    const zen = defaultZenProvider(descriptors);
-    if (zen === undefined) return config;
-    const seeded: AlfaCodeConfig = { version: 1, providers: [zen], defaultProviderId: zen.id };
-    await configStore.write(seeded);
-    return seeded;
-  };
-
-  const selectedProvider = async (config: AlfaCodeConfig, id?: string): Promise<ProviderRecord> => {
-    const provider = config.providers.find((item) => item.id === (id ?? config.defaultProviderId));
-    if (provider === undefined) throw new Error("No provider is selected. Run: alfacode connect google");
-    return provider;
-  };
-
-  const catalog = async (config: AlfaCodeConfig, provider?: ProviderRecord): Promise<readonly GatewayModel[]> => {
-    const selected = provider ?? await selectedProvider(config);
-    if (options.discoverModels !== undefined) return options.discoverModels({ provider: selected, config });
+  const catalog = async (config: AlfaCodeConfig, providerId?: string): Promise<readonly GatewayModel[]> => {
+    if (options.discoverModels !== undefined) return options.discoverModels({ config });
     if (runtimeStarter === undefined) throw new Error("Model discovery is not configured yet");
-    return discoverModelsFromGateway(runtimeStarter, { provider: selected, config });
+    const models = await discoverModelsFromGateway(runtimeStarter, { config });
+    return providerId === undefined ? models : models.filter((model) => decodeModelId(model.id)?.providerId === providerId);
+  };
+
+  /**
+   * Loads persisted config and, unless a provider already claims the reserved
+   * `ollama-local` id (of any `type` — a hand-configured record shadows the
+   * probe just as much as a previously auto-detected one), merges in an
+   * auto-detected local Ollama record. Never persisted back to disk.
+   */
+  const resolveLaunchConfig = async (): Promise<AlfaCodeConfig> => {
+    const config = await loadConfig();
+    if (config.providers.some((item) => item.id === OLLAMA_LOCAL_PROVIDER_ID)) return config;
+    return (await probeOllama()) ? { ...config, providers: [...config.providers, ollamaLocalProviderRecord()] } : config;
   };
 
   const connect = async (type: string, flags: ConnectFlags): Promise<ProviderRecord> => {
@@ -144,126 +119,36 @@ export function createCli(options: CreateCliOptions = {}): Command {
     return provider;
   };
 
-  const saveTuiProvider = async (result: ProviderSetupResult, replaceProviderId?: string, forceAdd = false): Promise<void> => {
-    if (keychain.storeSecret === undefined || keychain.delete === undefined) throw new Error("Native credential storage is unavailable");
-    const config = await loadConfig();
-    const replaceable = replaceProviderId === undefined
-      ? forceAdd ? undefined : config.providers.find((item) => item.type === result.descriptor.configType)
-      : config.providers.find((item) => item.id === replaceProviderId);
-    const id = replaceable?.id ?? availableProviderId(localProviderId(result.descriptor.id), config.providers);
-    const baseUrl = result.baseUrl;
-    if (result.descriptor.requiresBaseUrl && baseUrl === undefined) throw new Error("Enter a base URL");
-    if (baseUrl !== undefined && !isHttpUrl(baseUrl)) throw new Error("Base URL must be an absolute HTTPS URL (HTTP is allowed only for localhost, 127.0.0.1, or ::1)");
-    const provider: ProviderRecord = {
-      id,
-      type: result.descriptor.configType,
-      ...(result.apiKey === undefined ? {} : { apiKey: { kind: "keychain" as const, service: keychainService, account: id } }),
-      ...((baseUrl === undefined && result.descriptor.configurationOptions === undefined) ? {} : {
-        options: { ...(result.descriptor.configurationOptions ?? {}), ...(baseUrl === undefined ? {} : { baseUrl }) },
-      }),
-    };
-    const previousKeychain = replaceable?.apiKey?.kind === "keychain" && replaceable.apiKey.service === keychainService
-      ? replaceable.apiKey
-      : undefined;
-    if (result.apiKey !== undefined && previousKeychain !== undefined && keychain.retrieve === undefined) {
-      throw new Error("Credential backup is unavailable; refusing to overwrite the existing Keychain item");
-    }
-    let previousSecret: string | undefined;
-    if (previousKeychain !== undefined && keychain.retrieve !== undefined) {
-      try {
-        previousSecret = await keychain.retrieve(previousKeychain.account, previousKeychain.service);
-      } catch {
-        // Can't safely back up the existing credential before overwriting it — refuse rather
-        // than risk losing it if the new one turns out not to work.
-        throw new Error("Credential backup is unavailable; refusing to overwrite the existing Keychain item");
-      }
-    }
-    if (result.apiKey !== undefined) await keychain.storeSecret(id, result.apiKey, keychainService);
-    try {
-      const providers = replaceable === undefined ? [...config.providers, provider] : config.providers.map((item) => item.id === replaceable.id ? provider : item);
-      const draft: AlfaCodeConfig = { ...config, providers, defaultProviderId: id };
-      if (runtimeStarter === undefined) throw new Error("Gateway runtime is unavailable");
-      const probe = await runtimeStarter({ provider, config: draft, purpose: "discovery" });
-      try {
-        const callable = probe.modelCandidates?.filter((model) => model.providerId === id && model.availability === "available" && model.capabilities.tools) ?? [];
-        if (callable.length === 0) throw new Error(probe.warnings?.join("; ") || "No tool-capable model is available for this credential");
-      } finally { await probe.close(); }
-      await configStore.write(draft);
-    } catch (error) {
-      if (result.apiKey !== undefined) {
-        if (previousSecret === undefined) await keychain.delete(id, keychainService).catch(() => undefined);
-        else await keychain.storeSecret(previousKeychain!.account, previousSecret, previousKeychain!.service).catch(() => undefined);
-      }
-      throw error;
-    }
-    if (result.apiKey === undefined && previousKeychain !== undefined) {
-      await keychain.delete(previousKeychain.account, previousKeychain.service).catch(() => undefined);
-    }
-  };
-  const connectFromTui = (result: ProviderSetupResult): Promise<void> => saveTuiProvider(result);
-
-  const setDefaultModel = async (model: string): Promise<void> => {
-    const decoded = decodeModelId(model);
-    if (decoded === undefined) throw new Error("Use a model id from `alfacode models`, for example alfacode-anthropic/google/model-id");
-    await configStore.update((config) => {
-      const provider = config.providers.find((item) => item.id === decoded.providerId);
-      if (provider === undefined) throw new Error(`Provider not found: ${decoded.providerId}`);
-      return {
-        ...config,
-        defaultProviderId: provider.id,
-        providers: config.providers.map((item) => item.id === provider.id ? { ...item, options: { ...(item.options ?? {}), defaultModel: decoded.upstreamModel } } : item),
-      };
-    });
-    ui.write(`Default model: ${model}`);
-  };
-
-  const chooseDefaultModel = async (): Promise<void> => {
-    requireInteractive(ui.interactive);
-    const config = await loadConfig();
-    const models = await catalog(config);
-    const model = await ui.select("Choose the default model", models.map((item) => ({ value: item.id, label: item.displayName, hint: item.id })));
-    await setDefaultModel(model);
-  };
-
-  const clearDefaultModel = async (): Promise<void> => {
-    const config = await loadConfig();
-    const provider = await selectedProvider(config);
-    await configStore.update((current) => ({
-      ...current,
-      providers: current.providers.map((item) => {
-        if (item.id !== provider.id || item.options?.defaultModel === undefined) return item;
-        const { defaultModel: _pinnedModel, ...remainingOptions } = item.options;
-        if (Object.keys(remainingOptions).length > 0) return { ...item, options: remainingOptions };
-        const { options: _removedOptions, ...withoutOptions } = item;
-        return withoutOptions;
-      }),
-    }));
-    ui.write("Default model: automatic selection.");
-  };
+  const passthroughLaunch = (args: readonly string[]): Promise<number> =>
+    (options.launch ?? launchClaude)({ claudeArgs: args, baseUrl: "", authToken: "" });
 
   const classicLaunch = async (args: readonly string[]): Promise<void> => {
-    let config = await bootstrapDefaultProvider(await loadConfig());
-    const unavailable = await selectedCredentialUnavailable(config, keychain);
-    if (config.providers.length === 0 || unavailable !== undefined) {
-      requireInteractive(ui.interactive);
-      await (options.providerSetup ?? runProviderSetup)({
-        descriptors,
-        ...(unavailable === undefined ? {} : { notice: `The saved provider '${unavailable}' has no credential. Reconnect it to continue.` }),
-        connect: connectFromTui,
-      });
-      config = await loadConfig();
+    const config = await resolveLaunchConfig();
+    if (config.providers.length === 0) {
+      process.exitCode = await passthroughLaunch(args);
+      return;
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
-    const provider = await selectedProvider(config);
-    const runtime = await runtimeStarter({ provider, config });
+    const runtime = await runtimeStarter({ config });
+    // A configured provider that resolved zero *routable* models (auth expired, no
+    // model pulled yet, discovered models unverified for tool-calling, etc.) leaves
+    // the gateway empty and useless to claude (nothing in /model, every request
+    // 400s) — fall back to plain claude exactly like the zero-provider case, instead
+    // of handing the user a gateway that cannot do anything. This must check
+    // routableModelCount, not modelCandidates.length: modelCandidates is the raw
+    // discovery list and can be non-empty while every candidate is unroutable.
+    if ((runtime.routableModelCount ?? 0) === 0) {
+      for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
+      await runtime.close();
+      process.exitCode = await passthroughLaunch(args);
+      return;
+    }
     try {
       for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
       const launchOptions: ClaudeLaunchOptions = {
         claudeArgs: args,
         baseUrl: runtime.baseUrl,
         authToken: runtime.authToken,
-        ...(runtime.defaultModelId === undefined ? {} : { defaultModelId: runtime.defaultModelId }),
-        ...(runtime.contextWindowTokens === undefined ? {} : { contextWindowTokens: runtime.contextWindowTokens }),
         ...(runtime.secretEnvironmentNames === undefined ? {} : { scrubEnvironmentKeys: runtime.secretEnvironmentNames }),
       };
       process.exitCode = await (options.launch ?? launchClaude)(launchOptions);
@@ -272,129 +157,12 @@ export function createCli(options: CreateCliOptions = {}): Command {
     }
   };
 
-  const removeProvider = async (id: string, deleteCredential: boolean): Promise<void> => {
-    const config = await loadConfig();
-    const provider = config.providers.find((item) => item.id === id);
-    if (provider === undefined) throw new Error(`Provider not found: ${id}`);
-    if (deleteCredential && provider.apiKey?.kind === "keychain" && provider.apiKey.service === keychainService && keychain.delete !== undefined) {
-      await keychain.delete(provider.apiKey.account, provider.apiKey.service).catch(() => undefined);
-    }
-    await configStore.update((current) => {
-      const remaining = current.providers.filter((item) => item.id !== id);
-      const defaultProviderId = current.defaultProviderId === id ? remaining[0]?.id : current.defaultProviderId;
-      return { version: 1, providers: remaining, ...(defaultProviderId === undefined ? {} : { defaultProviderId }) };
-    });
-  };
-
-  const sessionsConfigDir = (): string => join(configStore.homeDirectory, ".alfacode", "claude");
-
-  /** Resolves a `--resume`/`-r` flag (a name, an id, or bare) to a concrete session id, prompting when ambiguous. */
-  const resolveResumeFlag = async (flag: string | true): Promise<string> => {
-    const resolution = await resolveResumeTarget({ cwd: process.cwd(), configDir: sessionsConfigDir(), ...(options.sessionsBackend === undefined ? {} : { backend: options.sessionsBackend }), ...(flag === true ? {} : { query: flag }) });
-    if (resolution.kind === "id") return resolution.sessionId;
-    if (resolution.kind === "not-found") {
-      throw new Error(flag === true ? "No previous sessions found in this directory." : `No session matches "${flag}".`);
-    }
-    requireInteractive(ui.interactive);
-    return ui.select("Resume which session?", resolution.candidates.map(toSessionChoice));
-  };
-
-  const nativeLaunch = async (args: readonly string[], flags: NativeLaunchFlags = {}): Promise<void> => {
-    // Minimal additive opt-in: --screen-reader is sugar for ALFACODE_SCREEN_READER=1, read
-    // directly by the UI modules (see ui/screen-reader-mode.ts), the same way ALFACODE_THEME and
-    // ALFACODE_REDUCED_MOTION already work.
-    if (flags.screenReader) process.env.ALFACODE_SCREEN_READER = "1";
-    if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
-    const resumeFlag = parseResumeFlag(args);
-    const continueFlag = parseContinueFlag(args);
-    const nameFlag = parseNameFlag(args);
-    if (resumeFlag !== undefined && continueFlag) throw new Error("Use either --continue or --resume, not both");
-    const resolvedResume = resumeFlag === undefined ? undefined : await resolveResumeFlag(resumeFlag);
-    let nextAction: ChatAction = { type: "connect" };
-    while (nextAction.type !== "exit") {
-      let config = await bootstrapDefaultProvider(await loadConfig());
-      const unavailable = await selectedCredentialUnavailable(config, keychain);
-      if (config.providers.length === 0 || unavailable !== undefined) {
-        requireInteractive(ui.interactive);
-        await (options.providerSetup ?? runProviderSetup)({
-          descriptors,
-          ...(unavailable === undefined ? {} : { notice: `The saved provider '${unavailable}' has no credential. Reconnect it to continue.` }),
-          connect: connectFromTui,
-        });
-        config = await loadConfig();
-      }
-      const provider = await selectedProvider(config);
-      const runtime = await runtimeStarter({ provider, config });
-      const permissions = new PermissionBroker();
-      let session: AgentSession | undefined;
-      try {
-        session = await (options.startAgentSession ?? AgentSession.start)({
-          runtime,
-          cwd: process.cwd(),
-          canUseTool: permissions.canUseTool,
-          ...(resolvedResume === undefined ? {} : { resume: resolvedResume }),
-          ...(continueFlag ? { continue: true } : {}),
-        });
-        if (nameFlag !== undefined) {
-          void session.rename(nameFlag).catch((error: unknown) => ui.write(`Unable to name session: ${error instanceof Error ? error.message : String(error)}`));
-        }
-        const compatibility = pendingEngineCompatibility();
-        const identity: AgentSessionIdentity = {
-          sessionId: "pending",
-          model: runtime.defaultModelId ?? "automatic",
-          claudeCodeVersion: compatibility.actual,
-          compatibility,
-          capabilities: [],
-        };
-        nextAction = await (options.chatTui ?? runChatTui)({
-          session,
-          identity,
-          config,
-          models: runtime.modelCandidates ?? [],
-          permissions,
-          loadUsage: () => options.queryUsage === undefined
-            ? queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), { limit: 100 })
-            : options.queryUsage({ limit: 100 }),
-          // Fullscreen is the default rendering mode; only an explicit --no-fullscreen (flags.fullscreen === false) opts out.
-          fullscreen: flags.fullscreen !== false,
-        });
-      } finally {
-        permissions.close();
-        if (session === undefined) await runtime.close(); else await session.close();
-      }
-
-      const action = nextAction;
-      if (action.type === "connect") {
-        await (options.providerSetup ?? runProviderSetup)({ descriptors, connect: (result) => saveTuiProvider(result, undefined, true) });
-      } else if (action.type === "delete-provider") {
-        await removeProvider(action.providerId, true);
-      } else if (action.type === "reconnect-provider") {
-        const current = (await loadConfig()).providers.find((item) => item.id === action.providerId);
-        if (current === undefined) throw new Error(`Provider not found: ${action.providerId}`);
-        const descriptor = descriptorForProvider(current, descriptors);
-        if (descriptor === undefined) throw new Error(`No connector is available for provider type '${current.type}'`);
-        await (options.providerSetup ?? runProviderSetup)({ descriptors: [descriptor], notice: `Reconnect '${current.id}'`, connect: (result) => saveTuiProvider(result, current.id) });
-      } else if (action.type === "set-default-provider") {
-        await configStore.update((current) => ({ ...current, defaultProviderId: action.providerId }));
-      }
-    }
-  };
-
   const program = new Command();
-  program.name("alfacode").description("Run the AlfaCode terminal agent on the Claude Code engine").argument("[args...]", "Native session options").allowUnknownOption(true)
-    .option("--fullscreen", "Render the chat UI on the terminal's alternate screen buffer, with a fixed-bottom composer", true)
-    .option("--no-fullscreen", "Render inline using the terminal's native scrollback instead of the alternate screen buffer")
-    .option("--screen-reader", "Render a plain, linear, screen-reader-friendly UI (same as ALFACODE_SCREEN_READER=1)")
-    .action(nativeLaunch);
+  program.name("alfacode").description("Run the real Claude Code TUI with extra models available through the gateway").argument("[args...]", "Arguments passed through to claude").allowUnknownOption(true)
+    .action(classicLaunch);
   program.command("connect [type]").description("Connect a provider without sending credentials through a Claude transcript")
     .option("--id <id>", "Provider identifier").option("--api-key-env <name>", "Reference an environment variable for non-interactive use").option("--keychain", "Prompt macOS Keychain securely").option("--base-url <url>", "Base URL for an OpenAI-compatible provider")
     .action(async (type: string | undefined, flags: ConnectFlags) => {
-      if (flags.apiKeyEnv === undefined && flags.baseUrl === undefined && !flags.keychain && flags.id === undefined) {
-        const choices = type === undefined ? descriptors : descriptors.filter((item) => item.id === type);
-        if (choices.length === 0) throw new Error(`Unsupported provider type: ${type}`);
-        await (options.providerSetup ?? runProviderSetup)({ descriptors: choices, connect: (result) => saveTuiProvider(result, undefined, true) });
-        return;
-      }
       const selectedType = type ?? (ui.interactive ? await ui.select("Choose a provider", descriptors.map(toChoice)) : undefined);
       if (selectedType === undefined) throw new Error("Specify a provider type in a non-interactive terminal");
       await connect(selectedType, flags);
@@ -406,8 +174,7 @@ export function createCli(options: CreateCliOptions = {}): Command {
     if (config.providers.length === 0) return ui.write("No providers configured.");
     for (const item of config.providers) {
       const secret = item.apiKey?.kind === "env" ? `env:${item.apiKey.name}` : item.apiKey?.kind === "keychain" ? `keychain:${item.apiKey.service}/${item.apiKey.account}` : "no credential";
-      const model = typeof item.options?.defaultModel === "string" ? ` default-model:${item.options.defaultModel}` : "";
-      ui.write(`${item.id}\t${item.type}\t${secret}${item.id === config.defaultProviderId ? "\tdefault-provider" : ""}${model}`);
+      ui.write(`${item.id}\t${item.type}\t${secret}${item.id === config.defaultProviderId ? "\tdefault-provider" : ""}`);
     }
   });
   providers.command("remove <id>").option("--delete-keychain", "Delete the AlfaCode Keychain item as well").action(async (id: string, flags: RemoveFlags) => {
@@ -427,109 +194,29 @@ export function createCli(options: CreateCliOptions = {}): Command {
     });
     ui.write(`Removed provider ${id}.${flags.deleteKeychain ? " Its AlfaCode Keychain item was deleted." : " Its credential was left untouched."}`);
   });
-  providers.command("default <id>").action(async (id: string) => {
-    await configStore.update((config) => {
-      if (!config.providers.some((item) => item.id === id)) throw new Error(`Provider not found: ${id}`);
-      return { ...config, defaultProviderId: id };
-    });
-    ui.write(`Default provider: ${id}`);
-  });
-
   const legacy = program.command("provider").description("Compatibility aliases for provider management");
   legacy.command("add <type>").option("--id <id>").option("--api-key-env <name>").option("--keychain").option("--base-url <url>").action(async (type: string, flags: ConnectFlags) => { await connect(type, flags); });
 
   program.command("models [provider]").option("--json", "Emit JSON").action(async (providerId: string | undefined, flags: { json?: boolean }) => {
-    const config = await loadConfig();
-    const models = await catalog(config, await selectedProvider(config, providerId));
+    const config = await resolveLaunchConfig();
+    const models = await catalog(config, providerId);
     if (flags.json) return ui.write(JSON.stringify(models));
     if (models.length === 0) return ui.write("No models available.");
     for (const model of models) ui.write(renderModel(model));
   });
-  program.command("default [model]").description("Pin a default model, or clear it with 'auto'").action(async (model: string | undefined) => {
-    if (model === undefined) await chooseDefaultModel();
-    else if (model === "auto") await clearDefaultModel();
-    else await setDefaultModel(model);
-  });
-  program.command("usage").option("--json", "Emit JSON").option("--provider <id>").option("--model <id>").option("--session <id>").option("--limit <count>").action(async (flags: UsageFlags) => {
-    const query = usageQuery(flags);
-    const summary = options.queryUsage === undefined ? await queryUsageLedger(join(configStore.homeDirectory, ".alfacode", "usage"), query) : await options.queryUsage(query);
-    ui.write(flags.json ? JSON.stringify(summary) : renderUsage(summary));
-  });
-  program.command("sessions").description("List sessions AlfaCode can resume in this directory").option("--json", "Emit JSON").option("--limit <count>", "Maximum sessions to list").action(async (flags: { json?: boolean; limit?: string }) => {
-    const limit = flags.limit === undefined ? undefined : Number(flags.limit);
-    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) throw new Error("--limit must be a positive integer");
-    const sessions = await listRecentSessions({ cwd: process.cwd(), configDir: sessionsConfigDir(), ...(options.sessionsBackend === undefined ? {} : { backend: options.sessionsBackend }), ...(limit === undefined ? {} : { limit }) });
-    if (flags.json) return ui.write(JSON.stringify(sessions));
-    if (sessions.length === 0) return ui.write("No resumable sessions in this directory yet.");
-    for (const session of sessions) ui.write(`${session.sessionId}\t${describeSessionPickerEntry(session)}`);
-  });
   program.command("doctor").option("--json", "Emit JSON").action(async (flags: { json?: boolean }) => {
-    const config = await bootstrapDefaultProvider(await loadConfig());
-    const report = { configPath: configStore.path, providers: config.providers.map((provider) => ({ id: provider.id, type: provider.type, credential: provider.apiKey?.kind ?? "missing" })), defaultProviderId: config.defaultProviderId ?? null, isolatedClaudeConfig: `${configStore.homeDirectory}/.alfacode/claude`, status: config.providers.length > 0 ? "ready" : "setup-required" };
+    const config = await resolveLaunchConfig();
+    const report = { configPath: configStore.path, providers: config.providers.map((provider) => ({ id: provider.id, type: provider.type, credential: provider.apiKey?.kind ?? "missing" })), defaultProviderId: config.defaultProviderId ?? null, isolatedClaudeConfig: `${configStore.homeDirectory}/.alfacode/claude`, status: config.providers.length > 0 ? "ready" : "passthrough" };
     if (flags.json) return ui.write(JSON.stringify(report));
     ui.write(`Config: ${report.configPath}`); ui.write(`Providers: ${report.providers.length}`); ui.write(`Default provider: ${report.defaultProviderId ?? "not set"}`); ui.write(`Claude state: ${report.isolatedClaudeConfig}`); ui.write(`Status: ${report.status}`);
   });
   program.command("config").command("path").action(() => ui.write(configStore.path));
-  program.command("launch [args...]").description("Compatibility mode using Anthropic's original terminal UI").allowUnknownOption(true).action(classicLaunch);
-  program.command("run [args...]").allowUnknownOption(true).option("--non-interactive", "Fail instead of prompting for setup").action(async (args: string[], flags: { nonInteractive?: boolean }) => {
-    if (flags.nonInteractive && !ui.interactive) {
-      const config = await bootstrapDefaultProvider(await loadConfig());
-      if (config.providers.length === 0) throw new Error("No provider configured. Use `alfacode connect google --api-key-env NAME` first.");
-    }
-    await classicLaunch(args);
-  });
+  program.command("launch [args...]").description("Same as running alfacode with no subcommand").allowUnknownOption(true).action(classicLaunch);
   return program;
 }
 
-async function selectedCredentialUnavailable(
-  config: AlfaCodeConfig,
-  keychain: Pick<MacOSKeychain, "store"> & Partial<Pick<MacOSKeychain, "storeSecret" | "retrieve" | "delete">>,
-): Promise<string | undefined> {
-  const provider = config.providers.find((item) => item.id === config.defaultProviderId) ?? config.providers[0];
-  if (provider === undefined) return undefined;
-  if ((provider.type === "opencode-zen" || provider.type === "zen") && provider.apiKey === undefined) return undefined;
-  if (provider.apiKey === undefined) return provider.id;
-  if (provider.apiKey.kind === "env") return process.env[provider.apiKey.name] ? undefined : provider.id;
-  if (keychain.retrieve === undefined) return undefined;
-  try {
-    return await keychain.retrieve(provider.apiKey.account, provider.apiKey.service) ? undefined : provider.id;
-  } catch {
-    // A genuinely unexpected Keychain failure (locked vault, ambiguous entry) degrades to the
-    // same "reconnect this provider" flow as a missing credential, instead of crashing the CLI.
-    return provider.id;
-  }
-}
-
-/**
- * A `--resume`/`-r` flag: a name or id to search for, or `true` for the bare flag (open a
- * picker over every resumable session in this directory).
- */
-function parseResumeFlag(args: readonly string[]): string | true | undefined {
-  const index = args.findIndex((value) => value === "--resume" || value === "-r");
-  if (index < 0) return undefined;
-  const next = args[index + 1];
-  return next === undefined || next.startsWith("-") ? true : next;
-}
-
-/** `claude --continue`/`-c`: resume the most recent session in this directory. */
-function parseContinueFlag(args: readonly string[]): boolean {
-  return args.includes("--continue") || args.includes("-c");
-}
-
-/** `--name <title>`: names the session once it starts, so a later `--resume` picker shows it. */
-function parseNameFlag(args: readonly string[]): string | undefined {
-  const index = args.findIndex((value) => value === "--name");
-  if (index < 0) return undefined;
-  const next = args[index + 1];
-  return next === undefined || next.startsWith("-") ? undefined : next;
-}
-
-function toSessionChoice(entry: SessionPickerEntry): { value: string; label: string; hint: string } {
-  return { value: entry.sessionId, label: entry.title, hint: describeSessionPickerEntry(entry) };
-}
-
-async function discoverModelsFromGateway(start: StartRuntime, input: { provider: ProviderRecord; config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
-  const runtime = await start({ ...input, purpose: "discovery" });
+async function discoverModelsFromGateway(start: StartRuntime, input: { config: AlfaCodeConfig }): Promise<readonly GatewayModel[]> {
+  const runtime = await start(input);
   try {
     if (runtime.modelCandidates !== undefined) return runtime.modelCandidates.map(toGatewayModel);
     const response = await fetch(`${runtime.baseUrl}/v1/models`, { headers: { authorization: `Bearer ${runtime.authToken}` } });
@@ -588,23 +275,6 @@ function validateProviderId(value: string): void {
   }
 }
 
-/**
- * The same anonymous, no-credential Zen provider record `saveTuiProvider` writes when a user
- * picks "Free public models" — free, tool-capable OpenCode Zen models with no API key or account.
- * Looked up by `allowsAnonymous` rather than a hardcoded id so it tracks whichever descriptor
- * actually offers that path; returns undefined if this catalog offers none (never true for the
- * bundled descriptors, only possible with a restricted catalog injected for tests).
- */
-function defaultZenProvider(descriptors: readonly ProviderDescriptor[]): ProviderRecord | undefined {
-  const descriptor = descriptors.find((item) => item.allowsAnonymous === true);
-  if (descriptor === undefined) return undefined;
-  return {
-    id: localProviderId(descriptor.id),
-    type: descriptor.configType,
-    ...(descriptor.configurationOptions === undefined ? {} : { options: { ...descriptor.configurationOptions } }),
-  };
-}
-
 function localProviderId(descriptorId: string): string {
   const normalized = descriptorId.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 64);
   return normalized.length === 0 ? "provider" : normalized;
@@ -621,49 +291,12 @@ function availableProviderId(base: string, providers: readonly ProviderRecord[])
   throw new Error(`Unable to allocate a local provider id for ${base}`);
 }
 
-function descriptorForProvider(provider: ProviderRecord, descriptors: readonly ProviderDescriptor[]): ProviderDescriptor | undefined {
-  const matching = descriptors.filter((descriptor) => descriptor.configType === provider.type);
-  return matching.find((descriptor) => Object.entries(descriptor.configurationOptions ?? {}).every(([key, value]) => provider.options?.[key] === value)) ?? matching[0];
-}
-
 function renderModel(model: GatewayModel): string {
   const availability = model.availability ?? "unknown";
   const capabilities = model.capabilities === undefined ? "" : ` capabilities:${Object.entries(model.capabilities).filter(([, value]) => value === true).map(([name]) => name).join(",") || "none"}`;
   const quota = model.quota === undefined ? "" : ` quota:${model.quota.state}${model.quota.remainingRequests === undefined ? "" : ` (${model.quota.remainingRequests} remaining)`}${model.quota.retryAfterSeconds === undefined ? "" : ` retry:${model.quota.retryAfterSeconds}s`}`;
   const headroom = model.headroom === undefined ? "" : ` headroom:context=${model.headroom.contextWindowTokens ?? "?"},input=${model.headroom.availableInputTokens ?? "?"},output=${model.headroom.maxOutputTokens ?? "?"}`;
   return `${model.id}\t${model.displayName}\tavailability:${availability}${capabilities}${quota}${headroom}`;
-}
-
-function usageQuery(flags: UsageFlags): UsageQuery {
-  const limit = flags.limit === undefined ? undefined : Number(flags.limit);
-  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) throw new Error("--limit must be a positive integer");
-  return {
-    ...(flags.provider === undefined ? {} : { providerId: flags.provider }),
-    ...(flags.model === undefined ? {} : { routeModelId: flags.model }),
-    ...(flags.session === undefined ? {} : { session: flags.session }),
-    ...(limit === undefined ? {} : { limit }),
-  };
-}
-
-async function queryUsageLedger(directory: string, query: UsageQuery): Promise<UsageSummary> {
-  const ledger = await UsageLedger.open(directory);
-  try {
-    return await ledger.query(query);
-  } finally {
-    await ledger.close();
-  }
-}
-
-function renderUsage(summary: UsageSummary): string {
-  const totals = summary.totals;
-  const lines = [
-    `Attempts: ${summary.attempts.length}`,
-    `Tokens: total ${totals.totalTokens} | input ${totals.inputTokens} | output ${totals.outputTokens} | cached ${totals.cachedInputTokens} | reasoning ${totals.reasoningTokens} | tools ${totals.toolTokens}`,
-  ];
-  for (const attempt of summary.attempts) {
-    lines.push(`${attempt.providerId}\t${attempt.routeModelId}\t${attempt.outcome}\tusage:${attempt.usageCompleteness}\ttokens:${attempt.totalTokens ?? "unknown"}`);
-  }
-  return lines.join("\n");
 }
 
 export async function main(argv = process.argv): Promise<void> {
@@ -678,7 +311,7 @@ export async function main(argv = process.argv): Promise<void> {
   }
   await createCli({
     providerDescriptors: [...providerDescriptors, ...dynamicDescriptors],
-    startRuntime: (input) => startRuntime(input, catalog === undefined ? {} : { modelMetadata: createModelsDevMetadataResolver(catalog, input.config) }),
+    startRuntime: (input) => startRuntime({ config: input.config }, catalog === undefined ? {} : { modelMetadata: createModelsDevMetadataResolver(catalog, input.config) }),
   }).parseAsync(argv);
 }
 

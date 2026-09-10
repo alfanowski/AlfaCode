@@ -155,6 +155,11 @@ describe("launchClaude", () => {
     expect(result.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeUndefined();
   });
 
+  it("always disables unknown-model window enforcement, since every gateway model is unknown to claude's built-in catalog", () => {
+    const environment = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "http://127.0.0.1:1", authToken: "token" });
+    expect(environment.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT).toBe("1");
+  });
+
   it("refuses loose permissions on an existing config directory", async () => {
     const configDir = join(await privateTestRoot(), "claude");
     await mkdir(configDir, { mode: 0o700 });
@@ -199,5 +204,59 @@ describe("launchClaude", () => {
 
     await expect(launchClaude({ claudeArgs: [], baseUrl: "http://gateway", authToken: "token", configDir, spawner: async () => 0 }))
       .rejects.toThrow(/not owned by the current user/);
+  });
+
+  describe("passthrough mode (no gateway: empty baseUrl and authToken)", () => {
+    it("does not set CLAUDE_CONFIG_DIR to the isolated path", () => {
+      const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "", authToken: "", environment: { PATH: "/bin" } });
+      expect(result.CLAUDE_CONFIG_DIR).toBeUndefined();
+      expect(result).toEqual({ PATH: "/bin" });
+    });
+
+    it("does not scrub ANTHROPIC_API_KEY or proxy vars from the parent environment", () => {
+      const environment = {
+        ANTHROPIC_API_KEY: "real-anthropic-key",
+        ANTHROPIC_AUTH_TOKEN: "real-anthropic-token",
+        HTTP_PROXY: "http://proxy.example:8080",
+        HTTPS_PROXY: "http://proxy.example:8080",
+        NO_PROXY: "localhost",
+        NODE_EXTRA_CA_CERTS: "/etc/ssl/corp-ca.pem",
+        PATH: "/bin",
+      };
+      const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "", authToken: "", environment });
+      expect(result).toEqual(environment);
+    });
+
+    it("does not apply any of the gateway-mode safe defaults or the gateway model-discovery flag", () => {
+      const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "", authToken: "", environment: { PATH: "/bin" } });
+      expect(result.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY).toBeUndefined();
+      expect(result.CLAUDE_CODE_DISABLE_ARTIFACT).toBeUndefined();
+      expect(result.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT).toBeUndefined();
+    });
+
+    it("still applies extraEnv on top of the untouched parent environment", () => {
+      const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "", authToken: "", environment: { PATH: "/bin" }, extraEnv: { CUSTOM: "1" } });
+      expect(result).toEqual({ PATH: "/bin", CUSTOM: "1" });
+    });
+
+    it("does not mutate the supplied process environment", () => {
+      const environment = { ANTHROPIC_API_KEY: "outside", PATH: "/bin" };
+      const result = buildClaudeEnvironment({ claudeArgs: [], baseUrl: "", authToken: "", environment });
+      expect(environment).toEqual({ ANTHROPIC_API_KEY: "outside", PATH: "/bin" });
+      expect(result.ANTHROPIC_API_KEY).toBe("outside");
+    });
+
+    it("does not require or harden an isolated config directory before spawning", async () => {
+      const root = await privateTestRoot();
+      await chmod(root, 0o755); // would fail assertPrivateDirectory if launchClaude tried to create configDir here
+      const configDir = join(root, "claude");
+      const spawner = vi.fn(async () => 0);
+
+      const exitCode = await launchClaude({ claudeArgs: ["--print", "hi"], baseUrl: "", authToken: "", configDir, spawner });
+
+      expect(exitCode).toBe(0);
+      expect(spawner).toHaveBeenCalledTimes(1);
+      await expect(lstat(configDir)).rejects.toMatchObject({ code: "ENOENT" });
+    });
   });
 });

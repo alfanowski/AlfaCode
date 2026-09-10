@@ -17,15 +17,14 @@ contain:
 
 ## Runtime boundary
 
-AlfaCode may launch or drive an unmodified Claude Code runtime published by
-Anthropic and may configure the documented `ANTHROPIC_BASE_URL` gateway
-interface. AlfaCode owns its terminal UI and gateway implementation. Similar
-interaction conventions are implemented independently; visual assets and
-source code are not copied.
+AlfaCode spawns an unmodified `claude` binary published by Anthropic and may
+configure the documented `ANTHROPIC_BASE_URL` gateway interface. AlfaCode owns
+its gateway implementation; it does not implement its own terminal UI —
+`claude` renders its own, unmodified.
 
 Every user authenticates directly with a provider using credentials they own.
 AlfaCode must never offer Claude.ai OAuth login, capture Claude.ai credentials,
-or route consumer subscription credentials through the Agent SDK.
+or route consumer subscription credentials through `claude`.
 
 ## Branding
 
@@ -43,7 +42,7 @@ Before every public release:
 3. Review current Anthropic legal/compliance and trademark pages.
 4. Review current provider terms and regional restrictions.
 5. Verify all users bring their own credentials and usage is never resold.
-6. Confirm the compatibility suite passes against the pinned engine version.
+6. Confirm the compatibility suite passes against the installed `claude` binary.
 
 Relevant primary sources, checked on 2026-08-23:
 

@@ -5,13 +5,13 @@ supported by Anthropic, OpenCode, Google, or any model provider.
 
 ## Anthropic software
 
-AlfaCode interoperates with unmodified software published by Anthropic and
-declares `@anthropic-ai/claude-agent-sdk` as an external dependency. Claude,
-Claude Code, Anthropic, and related names and marks belong to Anthropic.
+AlfaCode spawns the unmodified `claude` binary published by Anthropic as a
+child process; it does not vendor or declare any Anthropic package as a
+dependency of its own. Claude, Claude Code, Anthropic, and related names and
+marks belong to Anthropic.
 
-Anthropic's Claude Code and TypeScript Claude Agent SDK are proprietary and are
-not covered by AlfaCode's MIT License. Their use is subject to Anthropic's
-applicable legal agreements:
+Anthropic's Claude Code is proprietary and is not covered by AlfaCode's MIT
+License. Its use is subject to Anthropic's applicable legal agreements:
 
 - https://code.claude.com/docs/en/legal-and-compliance
 - https://www.anthropic.com/legal/commercial-terms
@@ -49,9 +49,6 @@ AlfaCode's other direct runtime dependencies are licensed as follows:
 - `@napi-rs/keyring` — MIT License.
 - `commander` — MIT License.
 - `fastify` — MIT License.
-- `ink` — MIT License.
-- `marked` — MIT License.
-- `react` — MIT License.
 - `string-width` — MIT License.
 - `zod` — MIT License.
 

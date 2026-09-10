@@ -45,7 +45,6 @@ const inheritedSecretKeys = new Set([
   "VERTEX_REGION",
   "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-  "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
   "CLAUDE_CODE_DISABLE_1M_CONTEXT",
   "DISABLE_COMPACT",
   "DISABLE_AUTO_COMPACT",
@@ -125,10 +124,20 @@ const safeClaudeDefaults: Readonly<Record<string, string>> = {
   CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: "0",
   CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
+  CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1",
 };
 
 export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.ProcessEnv {
   const base = options.environment ?? process.env;
+  // No gateway means nothing non-standard is happening: hand claude the parent
+  // environment untouched (plus any caller-requested extraEnv) so bare alfacode
+  // behaves identically to running claude directly, including the user's own
+  // real Claude Code login/settings/history and their real ANTHROPIC_*/proxy
+  // configuration. The isolated-directory/scrub/safe-defaults logic below only
+  // makes sense once AlfaCode is actually routing traffic through its own gateway.
+  if (options.baseUrl.length === 0 && options.authToken.length === 0) {
+    return { ...base, ...options.extraEnv };
+  }
   const secretKeys = new Set([...inheritedSecretKeys, ...(options.scrubEnvironmentKeys ?? [])].map((key) => key.toUpperCase()));
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(base)) {
@@ -144,12 +153,10 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
     if (normalized === "ANTHROPIC_CUSTOM_HEADERS" && !secretKeys.has(normalized)) continue;
     delete environment[key];
   }
-  Object.assign(environment, {
-    ANTHROPIC_BASE_URL: options.baseUrl,
-    ANTHROPIC_AUTH_TOKEN: options.authToken,
-    CLAUDE_CONFIG_DIR: options.configDir ?? join(homedir(), ".alfacode", "claude"),
-    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
-  });
+  if (options.baseUrl.length > 0) environment.ANTHROPIC_BASE_URL = options.baseUrl;
+  if (options.authToken.length > 0) environment.ANTHROPIC_AUTH_TOKEN = options.authToken;
+  environment.CLAUDE_CONFIG_DIR = options.configDir ?? join(homedir(), ".alfacode", "claude");
+  environment.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
   if (options.defaultModelId !== undefined) {
     environment.ANTHROPIC_MODEL = options.defaultModelId;
     environment.ANTHROPIC_DEFAULT_OPUS_MODEL = options.defaultModelId;
@@ -163,11 +170,16 @@ export function buildClaudeEnvironment(options: ClaudeLaunchOptions): NodeJS.Pro
 }
 
 export async function launchClaude(options: ClaudeLaunchOptions): Promise<number> {
-  const configDirectory = options.configDir ?? join(homedir(), ".alfacode", "claude");
   if (options.contextWindowTokens !== undefined && (!Number.isSafeInteger(options.contextWindowTokens) || options.contextWindowTokens <= 0)) {
     throw new Error("contextWindowTokens must be a positive integer");
   }
-  await ensurePrivateDirectory(configDirectory);
+  // Passthrough mode (no gateway) never uses an isolated config directory, so
+  // there is nothing here to create or harden — see buildClaudeEnvironment.
+  const isPassthrough = options.baseUrl.length === 0 && options.authToken.length === 0;
+  if (!isPassthrough) {
+    const configDirectory = options.configDir ?? join(homedir(), ".alfacode", "claude");
+    await ensurePrivateDirectory(configDirectory);
+  }
   return (options.spawner ?? systemClaudeSpawner)({ command: options.claudePath ?? "claude", args: options.claudeArgs, env: buildClaudeEnvironment(options) });
 }
 

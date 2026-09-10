@@ -2,7 +2,7 @@ import type { AlfaCodeConfig } from "./config.js";
 import type { ModelsDevCatalog, ModelsDevModel, ModelsDevProvider } from "./models-dev-catalog.js";
 import { CAPABILITIES, type CapabilitySet, type WireProtocol } from "./providers/foundation/types.js";
 import type { DynamicModelMetadataResolver } from "./runtime.js";
-import { sanitizeTerminalText } from "./ui/markdown.js";
+import { sanitizeTerminalText } from "./terminal-ui.js";
 
 /** Enriches account-scoped discovery without treating catalog order or model names as policy. */
 export function createModelsDevMetadataResolver(catalog: ModelsDevCatalog, config: AlfaCodeConfig): DynamicModelMetadataResolver {

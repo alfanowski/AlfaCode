@@ -13,17 +13,15 @@ import type {
   ProviderRequestContext,
   TokenCount,
 } from "./provider-contract.js";
-import { UsageLedger } from "./usage-ledger.js";
 import type { AlfaCodeConfig, ProviderRecord } from "./config.js";
 import { SecretResolver } from "./secrets.js";
 import { GoogleProvider } from "./providers/google/provider.js";
+import { OLLAMA_LOCAL_BASE_URL } from "./ollama-local.js";
 import { AnthropicMessagesAdapter } from "./providers/anthropic/messages.js";
 import { OpenAIChatAdapter, OpenAIResponsesAdapter } from "./providers/openai/index.js";
 import { CompositeProvider } from "./providers/composite.js";
 import { discoverZenModels } from "./providers/zen/catalog.js";
 import { CAPABILITIES, type ModelDescriptor, type WireProtocol } from "./providers/foundation/types.js";
-import { AutomaticModelSelector, LedgerModelUsageHistory } from "./model-selection.js";
-import { FileModelSelectionStateStore } from "./model-selection-state.js";
 import type {
   AnthropicRequest as GoogleRequest,
   CanonicalStreamEvent as GoogleEvent,
@@ -33,29 +31,25 @@ import type {
 export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
-  readonly defaultModelId?: string;
   readonly modelCandidates: readonly ModelDescriptor[];
-  readonly contextWindowTokens?: number;
+  /** Count of models actually wired into a Provider's `models` array (availability "available" + tool support) — the raw modelCandidates count includes unroutable models and must not be used to decide whether the gateway is useful. */
+  readonly routableModelCount: number;
   readonly secretEnvironmentNames?: readonly string[];
   readonly warnings?: readonly string[];
   close(): Promise<void>;
 }
 
 export interface StartRuntimeInput {
-  readonly provider: ProviderRecord;
   readonly config: AlfaCodeConfig;
-  readonly purpose?: "launch" | "discovery";
 }
 
 export interface RuntimeDependencies {
   readonly secrets?: SecretResolver;
   readonly homeDirectory?: string;
   readonly createGoogle?: (options: ConstructorParameters<typeof GoogleProvider>[0]) => GoogleProvider;
-  readonly usageLedger?: UsageLedger;
   readonly fetch?: typeof fetch;
   /** Optional account-independent catalog evidence (for example models.dev). */
   readonly modelMetadata?: DynamicModelMetadataResolver;
-  readonly modelSelector?: AutomaticModelSelector;
 }
 
 export interface DynamicModelMetadataResolver {
@@ -123,6 +117,11 @@ export async function createConfiguredProvider(record: ProviderRecord, apiKey: s
     if (baseUrl === undefined) throw new Error(`Provider '${record.id}' requires options.baseUrl`);
     const descriptors = await discoverConfiguredModels(record, apiKey, "openai-chat", baseUrl, dependencies);
     return { provider: createWireProvider({ id: record.id, apiKey, baseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
+  }
+  if (record.type === "ollama-local") {
+    const localBaseUrl = baseUrl ?? OLLAMA_LOCAL_BASE_URL;
+    const descriptors = await discoverConfiguredModels(record, apiKey, "openai-chat", localBaseUrl, dependencies);
+    return { provider: createWireProvider({ id: record.id, apiKey, baseUrl: localBaseUrl, wireProtocol: "openai-chat", models: descriptors }, dependencies, homeDirectory), descriptors };
   }
   if (record.type === "opencode-zen" || record.type === "zen") {
     const zenBase = baseUrl ?? "https://opencode.ai/zen/v1";
@@ -292,7 +291,6 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
   const secrets = dependencies.secrets ?? new SecretResolver();
   const homeDirectory = dependencies.homeDirectory ?? homedir();
   const providers: Provider[] = [];
-  const ledger = dependencies.usageLedger ?? await UsageLedger.open(join(homeDirectory, ".alfacode", "usage"));
 
   try {
     const candidates: ModelDescriptor[] = [];
@@ -300,8 +298,9 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
     for (const record of input.config.providers) {
       try {
         const anonymousZen = (record.type === "opencode-zen" || record.type === "zen") && record.apiKey === undefined;
-        if (record.apiKey === undefined && !anonymousZen) throw new Error("no API key reference");
-        const apiKey = anonymousZen ? "public" : await secrets.resolve(record.apiKey!);
+        const anonymousLocal = record.type === "ollama-local" && record.apiKey === undefined;
+        if (record.apiKey === undefined && !anonymousZen && !anonymousLocal) throw new Error("no API key reference");
+        const apiKey = anonymousZen ? "public" : anonymousLocal ? "ollama" : await secrets.resolve(record.apiKey!);
         if (apiKey === undefined || apiKey.length === 0) throw new Error("API key unavailable");
         const built = await createConfiguredProvider(record, apiKey, dependencies, homeDirectory);
         providers.push(built.provider);
@@ -311,62 +310,29 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       }
     }
 
-    const pinnedModel = typeof input.provider.options?.defaultModel === "string"
-      ? candidates.find((model) => model.providerId === input.provider.id && model.id === input.provider.options?.defaultModel
-        && model.availability === "available" && model.capabilities.tools)
-      : undefined;
-    let selectedModel: ModelDescriptor | undefined;
-    let activeSelector: AutomaticModelSelector | undefined;
-    if (input.purpose !== "discovery") {
-      const selector = dependencies.modelSelector ?? new AutomaticModelSelector({
-        usageHistory: new LedgerModelUsageHistory(ledger),
-        stateStore: new FileModelSelectionStateStore(join(homeDirectory, ".alfacode", "state", "model-selection.json")),
-      });
-      activeSelector = selector;
-      selectedModel = pinnedModel ?? (await selector.select(candidates, { streaming: true, tools: true })).selected;
-      if (selectedModel === undefined) throw new Error(`No dynamically discovered model is currently available with verified tool support${warnings.length === 0 ? "" : `. ${warnings.join("; ")}`}`);
-    }
+    // Each Provider.models is already filtered down to what's routable (createConfiguredProvider /
+    // createWireProvider only keep availability:"available" models with tool support); sum across
+    // every configured provider to get the count of models the gateway can actually serve.
+    const routableModelCount = providers.reduce((total, provider) => total + provider.models.length, 0);
 
     const authToken = randomBytes(32).toString("base64url");
-    for (const provider of providers) {
-      for (const model of provider.models) {
-        await ledger.registerModel(provider.id, encodeModelId(provider.id, model.id), model);
-      }
-    }
-    const gateway = await listenLocalGateway({
-      token: authToken,
-      providers,
-      usageLedger: ledger,
-      ...(activeSelector === undefined ? {} : {
-        onProviderOutcome: (outcome: { providerId: string; modelId: string; statusCode: number; retryAfter?: string | number }) => activeSelector.recordOutcome(outcome),
-        selectFallback: async () => {
-          const fallback = (await activeSelector.select(candidates, { streaming: true, tools: true })).selected;
-          if (fallback === undefined) return undefined;
-          const provider = providers.find((item) => item.id === fallback.providerId);
-          const model = provider?.models.find((item) => item.id === fallback.id);
-          return provider === undefined || model === undefined ? undefined : { provider, model };
-        },
-      }),
-    });
+    const gateway = await listenLocalGateway({ token: authToken, providers });
     let closed = false;
     return {
       baseUrl: gateway.address,
       authToken,
-      ...(selectedModel === undefined ? {} : { defaultModelId: encodeModelId(selectedModel.providerId, selectedModel.id) }),
       modelCandidates: candidates,
+      routableModelCount,
       ...(warnings.length === 0 ? {} : { warnings }),
-      ...(selectedModel?.contextWindow === undefined ? {} : { contextWindowTokens: selectedModel.contextWindow }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => {
         if (closed) return;
         closed = true;
         await gateway.app.close();
-        await ledger.close();
       },
     };
   } catch (error) {
     await Promise.allSettled(providers.map(async (provider) => provider.close()));
-    await ledger.close();
     throw error;
   }
 }
