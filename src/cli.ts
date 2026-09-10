@@ -19,6 +19,8 @@ export interface RuntimeHandle {
   readonly authToken: string;
   readonly secretEnvironmentNames?: readonly string[];
   readonly modelCandidates?: readonly ModelDescriptor[];
+  /** Count of models actually wired into the gateway (not just discovered) — see runtime.ts. */
+  readonly routableModelCount?: number;
   readonly warnings?: readonly string[];
   close(): Promise<void>;
 }
@@ -128,12 +130,14 @@ export function createCli(options: CreateCliOptions = {}): Command {
     }
     if (runtimeStarter === undefined) throw new Error("Gateway runtime is not configured yet");
     const runtime = await runtimeStarter({ config });
-    // A configured provider that resolved zero usable models (auth expired, no
-    // model pulled yet, etc.) leaves the gateway empty and useless to claude
-    // (nothing in /model, every request 404s) — fall back to plain claude
-    // exactly like the zero-provider case, instead of handing the user a
-    // gateway that cannot do anything.
-    if ((runtime.modelCandidates ?? []).length === 0) {
+    // A configured provider that resolved zero *routable* models (auth expired, no
+    // model pulled yet, discovered models unverified for tool-calling, etc.) leaves
+    // the gateway empty and useless to claude (nothing in /model, every request
+    // 400s) — fall back to plain claude exactly like the zero-provider case, instead
+    // of handing the user a gateway that cannot do anything. This must check
+    // routableModelCount, not modelCandidates.length: modelCandidates is the raw
+    // discovery list and can be non-empty while every candidate is unroutable.
+    if ((runtime.routableModelCount ?? 0) === 0) {
       for (const warning of runtime.warnings ?? []) ui.write(`Warning: ${warning}`);
       await runtime.close();
       process.exitCode = await passthroughLaunch(args);

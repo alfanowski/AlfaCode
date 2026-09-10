@@ -102,4 +102,23 @@ describe("runtime provider factory", () => {
       expect(runtime).not.toHaveProperty("contextWindowTokens");
     } finally { await runtime.close(); await rm(home, { recursive: true, force: true }); }
   });
+
+  it("reports zero routable models when every discovered candidate fails the availability/tools filter", async () => {
+    // Reproduces a real local Ollama daemon: models.dev has no verified tool-calling entry for the
+    // pulled tags, so discovery returns non-empty raw candidates that are all availability:"unknown"
+    // (or "deprecated") and therefore never make it into a Provider's routable `models` list.
+    const home = await mkdtemp(join(tmpdir(), "alfacode-runtime-unroutable-"));
+    const record: ProviderRecord = { id: "ollama-local", type: "ollama-local" };
+    const fetchMock = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/models")) return Response.json({ data: [{ id: "llama3.2:3b" }, { id: "qwen2.5-coder:7b" }] });
+      return Response.json({ id: "unused" });
+    };
+    const runtime = await startRuntime({ config: { version: 1, providers: [record] } }, { homeDirectory: home, fetch: fetchMock });
+    try {
+      expect(runtime.modelCandidates.length).toBeGreaterThan(0);
+      expect(runtime.modelCandidates.every((model) => model.availability !== "available")).toBe(true);
+      expect(runtime.routableModelCount).toBe(0);
+    } finally { await runtime.close(); await rm(home, { recursive: true, force: true }); }
+  });
 });

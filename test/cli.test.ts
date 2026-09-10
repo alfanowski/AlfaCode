@@ -115,6 +115,7 @@ describe("createCli", () => {
           availability: "available",
           support: "contract-tested",
         }],
+        routableModelCount: 1,
         secretEnvironmentNames: ["CUSTOM_KEY"],
         close: async () => { closed = true; },
       }),
@@ -211,11 +212,14 @@ describe("createCli", () => {
     expect(seenConfigs[0]?.providers[0]).toMatchObject({ id: "ollama-local", type: "openai-compatible" });
   });
 
-  it("falls back to plain claude when the gateway resolves zero usable models", async () => {
-    // Ollama daemon reachable but no model pulled yet (discoverAccountModels throws), or an expired
-    // key: startRuntime still succeeds but reports zero modelCandidates. The gateway would then be
-    // empty and useless to claude (nothing in /model, every request 404s) — this should behave like
-    // the zero-provider passthrough case instead.
+  it("falls back to plain claude when the gateway resolves zero routable models", async () => {
+    // Real-world repro: a local Ollama daemon with pulled models that aren't in models.dev's
+    // catalog reports non-empty *raw* modelCandidates (every tag the API listed), but none of them
+    // pass the availability/tools filter that decides what actually gets wired into the gateway, so
+    // routableModelCount is 0. The gateway would then be empty and useless to claude (nothing in
+    // /model, every request 400s) — this should behave like the zero-provider passthrough case
+    // instead. (Checking raw modelCandidates.length here was the bug: it doesn't reflect what's
+    // actually routable.)
     const home = await mkdtemp(join(tmpdir(), "alfacode-cli-no-models-"));
     directories.push(home);
     const configStore = new ConfigStore({ homeDirectory: home });
@@ -226,13 +230,29 @@ describe("createCli", () => {
     const cli = createCli({
       configStore,
       probeOllamaLocal: async () => false,
-      startRuntime: async () => ({ baseUrl: "http://gateway", authToken: "token", modelCandidates: [], warnings: ["Provider 'ollama-local' unavailable: model discovery returned no valid models"], close: async () => { closed = true; } }),
+      startRuntime: async () => ({
+        baseUrl: "http://gateway",
+        authToken: "token",
+        modelCandidates: [{
+          providerId: "ollama-local",
+          id: "llama3.2:3b",
+          displayName: "llama3.2:3b",
+          wireProtocol: "openai-chat",
+          capabilities: { streaming: true, tools: false, parallelTools: false, forcedToolChoice: false, vision: false, reasoningState: "none", nativeTokenCounting: false, jsonSchema: "subset" },
+          availability: "unknown",
+          unavailableReason: "Tool capability is unverified",
+          support: "best-effort",
+        }],
+        routableModelCount: 0,
+        warnings: ["Provider 'ollama-local' unavailable: no discovered model passed the tool-calling availability filter"],
+        close: async () => { closed = true; },
+      }),
       launch: async (options) => { launched.push(options); return 0; },
       ui: fakeUi({ write: (message) => { written.push(message); } }),
     });
 
     await cli.parseAsync(["node", "alfacode", "--", "--print", "hi"], { from: "node" });
-    expect(written).toContain("Warning: Provider 'ollama-local' unavailable: model discovery returned no valid models");
+    expect(written).toContain("Warning: Provider 'ollama-local' unavailable: no discovered model passed the tool-calling availability filter");
     expect(launched).toEqual([{ claudeArgs: ["--print", "hi"], baseUrl: "", authToken: "" }]);
     expect(closed).toBe(true);
   });

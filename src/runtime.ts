@@ -32,6 +32,8 @@ export interface RuntimeHandle {
   readonly baseUrl: string;
   readonly authToken: string;
   readonly modelCandidates: readonly ModelDescriptor[];
+  /** Count of models actually wired into a Provider's `models` array (availability "available" + tool support) — the raw modelCandidates count includes unroutable models and must not be used to decide whether the gateway is useful. */
+  readonly routableModelCount: number;
   readonly secretEnvironmentNames?: readonly string[];
   readonly warnings?: readonly string[];
   close(): Promise<void>;
@@ -308,6 +310,11 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       }
     }
 
+    // Each Provider.models is already filtered down to what's routable (createConfiguredProvider /
+    // createWireProvider only keep availability:"available" models with tool support); sum across
+    // every configured provider to get the count of models the gateway can actually serve.
+    const routableModelCount = providers.reduce((total, provider) => total + provider.models.length, 0);
+
     const authToken = randomBytes(32).toString("base64url");
     const gateway = await listenLocalGateway({ token: authToken, providers });
     let closed = false;
@@ -315,6 +322,7 @@ export async function startRuntime(input: StartRuntimeInput, dependencies: Runti
       baseUrl: gateway.address,
       authToken,
       modelCandidates: candidates,
+      routableModelCount,
       ...(warnings.length === 0 ? {} : { warnings }),
       secretEnvironmentNames: input.config.providers.flatMap((record) => record.apiKey?.kind === "env" ? [record.apiKey.name] : []),
       close: async () => {
